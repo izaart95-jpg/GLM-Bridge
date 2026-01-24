@@ -7,8 +7,8 @@
     "start": "node server.js"
   },
   "keywords": ["z-ai", "ai", "proxy", "chatbot", "automation", "openai"],
-  "author": "",
-  "license": "ISC",
+  "author": "Me",
+  "license": "",
   "dependencies": {
     "express": "^5.0.0",
     "ws": "^8.14.0"
