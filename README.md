@@ -12,6 +12,9 @@ OpenAI-compatible API proxy for Z.AI (chat.z.ai) with browser automation, client
 - **Session Management** - Fresh session support with `X-Fresh-Session` header
 - **Search & DeepThink** - Toggle Z.AI search and deep thinking features
 
+## IMPORTANT
+Keep The Browser Open In Background While Using The Tool 
+
 ## Quick Start
 
 ### 1. Clone the Repository
