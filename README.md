@@ -45,7 +45,7 @@ npm install
 No browser needed. Authenticates as a guest and calls Z.AI's internal API directly.
 
 ```bash
-node server-direct.js
+node main.js
 ```
 
 Server starts on `http://localhost:3001`.
@@ -292,7 +292,7 @@ In settings, configure:
 
 ## Architecture
 
-### Direct HTTP Mode (`server-direct.js`)
+### Direct HTTP Mode (`main.js`)
 
 ```
 ┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
@@ -318,7 +318,7 @@ In settings, configure:
 | File | Description |
 |------|-------------|
 | `main.js` | Direct HTTP server — no browser required |
-| `browser.js` | Browser automation server (renamed from `server.js`) |
+| `browser.js` | Browser automation server  |
 | `config.js` | Shared configuration |
 | `src/pool.js` | Browser client pool *(Browser mode only)* |
 | `src/injection.js` | Browser injection script *(Browser mode only)* |
