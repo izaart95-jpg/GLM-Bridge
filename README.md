@@ -11,7 +11,7 @@ OpenAI-compatible API proxy for Z.AI (chat.z.ai) with two operating modes: a **D
 | **Direct HTTP** ⚡ | `main.js` | Calls Z.AI's REST API directly using HMAC signatures. No browser required. |
 | **Browser Automation** 🌐 | `browser.js` | Connects to a live browser tab via WebSocket injection. Requires browser open. |
 
-**Recommended: use `main.js`** — it's faster, more stable, and requires no browser setup. If You Are Facing ISsues Switch to browser.js
+**Recommended: use `main.js`** — it's faster, more stable, and requires no browser setup. If you are facing issues switch to browser.js
 
 ---
 
