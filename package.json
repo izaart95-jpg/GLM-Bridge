@@ -4,7 +4,7 @@
   "description": "Proxy-based Z.AI chatbot automation with OpenAI-compatible API",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node main.js"
   },
   "keywords": ["z-ai", "ai", "proxy", "chatbot", "automation", "openai"],
   "author": "Me",
