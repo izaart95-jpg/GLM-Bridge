@@ -8,7 +8,7 @@ module.exports = {
     host: process.env.HOST || '0.0.0.0',
   },
 
-  // Authentication
+  // Authentication Dont HardCore it
   auth: {
     enabled: true,
     token: process.env.AUTH_TOKEN || 'Waguri',
@@ -32,16 +32,16 @@ module.exports = {
     maxSize: parseInt(process.env.QUEUE_MAX_SIZE) || 100,
 
     // Maximum time a request can wait in queue (milliseconds)
-    maxWaitTime: parseInt(process.env.QUEUE_MAX_WAIT) || 60000,
+    maxWaitTime: parseInt(process.env.QUEUE_MAX_WAIT) || 240000,
   },
 
   // Timeout settings (milliseconds)
   timeouts: {
     // Default request timeout
-    default: parseInt(process.env.TIMEOUT) || 120000,
+    default: parseInt(process.env.TIMEOUT) || 300000,
 
     // Streaming chunk timeout (how long to wait for next chunk)
-    streamingChunk: parseInt(process.env.STREAMING_CHUNK_TIMEOUT) || 30000,
+    streamingChunk: parseInt(process.env.STREAMING_CHUNK_TIMEOUT) || 120000,
   },
 
   // Streaming settings
