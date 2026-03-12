@@ -668,6 +668,18 @@ async function* sendToZAI(prompt, options = {}) {
     background_tasks: { title_generation: true, tags_generation: true }
   });
 
+  // ── DIAGNOSTIC: log what we're sending to Z.AI ──
+  const parsedBody = JSON.parse(body);
+  console.log("\n========== SENDING TO Z.AI ==========");
+  console.log(`[ZAI] model=${parsedBody.model} thinking=${parsedBody.features?.enable_thinking}`);
+  console.log(`[ZAI] messages count: ${parsedBody.messages?.length}`);
+  parsedBody.messages?.forEach((m, i) => {
+    const preview = typeof m.content === "string" ? m.content.slice(0, 100) : JSON.stringify(m.content).slice(0, 100);
+    console.log(`  [${i}] role=${m.role} "${preview}"`);
+  });
+  console.log("=====================================\n");
+  // ── END DIAGNOSTIC ──
+
   let res;
   try {
     res = await fetch(url, { method: "POST", headers, body, signal: AbortSignal.timeout(90000) });
@@ -685,7 +697,8 @@ async function* sendToZAI(prompt, options = {}) {
 
   if (!res.ok) {
     const errText = await res.text().catch(() => "");
-    throw new Error(`Z.AI error ${res.status}: ${errText}`);
+    console.error(`[ZAI] Full error response (${res.status}):`, errText.slice(0, 500));
+    throw new Error(`Z.AI error ${res.status}: ${errText || "Internal Server Error"}`);
   }
 
   // SSE streaming parse
@@ -965,6 +978,24 @@ app.get("/models", authMiddleware, (req, res) => {
 
 app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
   const { model = "glm-4.7", messages, stream = false, deepThink, search, webSearch } = req.body;
+
+  // ── DIAGNOSTIC LOGGING ── remove once issue is identified ──
+  console.log("\n========== INCOMING REQUEST ==========");
+  console.log(`[Req] model=${model} stream=${stream}`);
+  console.log(`[Req] body keys: ${Object.keys(req.body).join(", ")}`);
+  if (Array.isArray(messages)) {
+    console.log(`[Req] messages count: ${messages.length}`);
+    messages.forEach((m, i) => {
+      const preview = typeof m.content === "string"
+        ? m.content.slice(0, 120)
+        : JSON.stringify(m.content).slice(0, 120);
+      console.log(`  [${i}] role=${m.role} content="${preview}"`);
+      if (m.tool_calls) console.log(`       tool_calls: ${JSON.stringify(m.tool_calls).slice(0, 200)}`);
+      if (m.tool_call_id) console.log(`       tool_call_id: ${m.tool_call_id}`);
+    });
+  }
+  console.log("======================================\n");
+  // ── END DIAGNOSTIC ──
 
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json(formatOpenAIError("messages is required and must be an array", "invalid_request_error"));
