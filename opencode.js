@@ -144,28 +144,70 @@ function messagesToPrompt(messages, includeToolInstructions = true) {
 }
 
 /**
- * Sanitize messages array for Z.AI — it only supports 'user' and 'assistant' roles.
- * Convert tool/system messages to user turns and strip assistant tool_calls metadata.
+ * Sanitize messages array for Z.AI:
+ *  - Only 'user' and 'assistant' roles allowed
+ *  - System prompt is prepended into the first user message (not a separate message)
+ *  - tool results become user messages
+ *  - Consecutive same-role messages are merged (Z.AI requires strict alternation)
+ *  - Must start with 'user'
  */
 function sanitizeMessagesForZAI(messages) {
-  const sanitized = [];
+  // Step 1: collect system prompt and flatten to user/assistant only
+  let systemPrompt = "";
+  const flat = [];
+
   for (const msg of messages) {
     const content = getMessageContent(msg.content);
     if (msg.role === "system") {
-      // Fold system into first user message or prepend
-      sanitized.push({ role: "user", content: `[System]: ${content}` });
+      systemPrompt += (systemPrompt ? "\n\n" : "") + content;
     } else if (msg.role === "tool") {
       const toolName = msg.name || msg.tool_call_id || "tool";
-      sanitized.push({ role: "user", content: `[Tool Result for ${toolName}]: ${content}` });
+      flat.push({ role: "user", content: "[Tool Result for " + toolName + "]: " + content });
     } else if (msg.role === "assistant") {
-      // Keep assistant messages but strip tool_calls — only keep text content
-      if (content) sanitized.push({ role: "assistant", content });
+      // Serialize tool_calls as readable text so context is preserved
+      let text = content;
+      if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+        const tcText = msg.tool_calls.map(tc =>
+          "[Called: " + (tc.function && tc.function.name) + "(" + (tc.function && tc.function.arguments || "") + ")]"
+        ).join("\n");
+        text = [text, tcText].filter(Boolean).join("\n");
+      }
+      if (text.trim()) flat.push({ role: "assistant", content: text });
     } else if (msg.role === "user") {
-      if (content) sanitized.push({ role: "user", content });
+      if (content.trim()) flat.push({ role: "user", content });
     }
-    // Drop any other unknown roles
   }
-  return sanitized;
+
+  // Step 2: prepend system prompt into first user message (not as separate message)
+  if (systemPrompt) {
+    const firstUser = flat.findIndex(m => m.role === "user");
+    if (firstUser >= 0) {
+      flat[firstUser] = {
+        role: "user",
+        content: "[System Instructions]:\n" + systemPrompt + "\n\n---\n\n" + flat[firstUser].content
+      };
+    } else {
+      flat.unshift({ role: "user", content: "[System Instructions]:\n" + systemPrompt });
+    }
+  }
+
+  // Step 3: merge consecutive same-role messages (Z.AI requires strict user/assistant alternation)
+  const merged = [];
+  for (const msg of flat) {
+    const last = merged[merged.length - 1];
+    if (last && last.role === msg.role) {
+      last.content += "\n\n" + msg.content;
+    } else {
+      merged.push({ role: msg.role, content: msg.content });
+    }
+  }
+
+  // Step 4: must start with user
+  if (merged.length > 0 && merged[0].role === "assistant") {
+    merged.shift();
+  }
+
+  return merged;
 }
 
 function parseToolCalls(content) {
