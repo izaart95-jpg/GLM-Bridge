@@ -28,7 +28,7 @@ const session = {
   features: {
     webSearch: false,
     autoWebSearch: false,
-    thinking: true,
+    thinking: false,
     imageGen: false,
     previewMode: false,
   },
