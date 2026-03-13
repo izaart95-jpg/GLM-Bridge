@@ -899,7 +899,7 @@ app.get("/status", (req, res) => {
 
 // ============== OPENAI-COMPATIBLE API ==============
 
-const knownModels = ["glm-4.7", "z1", "z1-mini"];
+const knownModels = ["glm-4.7", "glm-4.5", "z1", "z1-mini"];
 
 app.get("/v1/models", authMiddleware, (req, res) => {
   res.json({
