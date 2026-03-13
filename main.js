@@ -12,6 +12,7 @@ const server = http.createServer(app);
 // ============== Z.AI DIRECT CONFIG ==============
 
 const BASE_URL = "https://chat.z.ai";
+const INCLUDE_CORE_INSTRUCTIONS = false; // set to false to disable
 const SALT_KEY = "key-@@@@)))()((9))-xxxx&&&%%%%%";
 const DEFAULT_FE_VERSION = "prod-fe-1.0.185";
 
@@ -115,7 +116,7 @@ function messagesToPrompt(messages, includeToolInstructions = true) {
   }
 
   let prompt = "";
-  if (includeToolInstructions) prompt += `${CORE_INSTRUCTIONS}\n\n`;
+  if (includeToolInstructions && INCLUDE_CORE_INSTRUCTIONS) prompt += `${CORE_INSTRUCTIONS}\n\n`;
   if (systemMsg) prompt += `System: ${systemMsg}\n\n`;
 
   for (const msg of conversation) {
