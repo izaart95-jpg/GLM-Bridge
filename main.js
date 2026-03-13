@@ -899,7 +899,7 @@ app.get("/status", (req, res) => {
 
 // ============== OPENAI-COMPATIBLE API ==============
 
-const knownModels = ["glm-4.7", "glm-4.5", "z1", "z1-mini"];
+const knownModels = ["glm-4.7", "glm-5", "z1", "z1-mini"];
 
 app.get("/v1/models", authMiddleware, (req, res) => {
   res.json({
@@ -916,7 +916,7 @@ app.get("/models", authMiddleware, (req, res) => {
 });
 
 app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
-  const { model = "glm-4.7", messages, stream = false, deepThink, search, webSearch } = req.body;
+  const { model = "glm-4.7", messages, stream = true, deepThink, search, webSearch } = req.body;
 
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json(formatOpenAIError("messages is required and must be an array", "invalid_request_error"));
