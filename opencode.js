@@ -666,7 +666,20 @@ async function* sendToZAI(prompt, options = {}) {
 
   if (!session.initialized) await initializeSession();
 
-  const { signature, urlParams } = generateZaSignature(prompt, session.token, session.userId);
+  // Build sanitized message list first so we can use the real last user text for signing
+  const lastMsg = messages[messages.length - 1];
+  const promptAlreadyInMessages = lastMsg &&
+    lastMsg.role === "user" &&
+    getMessageContent(lastMsg.content).trim() !== "";
+
+  const msgList = promptAlreadyInMessages
+    ? sanitizeMessagesForZAI(messages)
+    : sanitizeMessagesForZAI([...messages, { role: "user", content: prompt }]);
+
+  // signature_prompt must be the actual last user message — Z.AI validates this against the HMAC
+  const lastUserContent = msgList.filter(m => m.role === "user").pop()?.content || prompt;
+
+  const { signature, urlParams } = generateZaSignature(lastUserContent, session.token, session.userId);
   const url = `${BASE_URL}/api/v2/chat/completions?${urlParams}`;
 
   const headers = {
@@ -678,23 +691,11 @@ async function* sendToZAI(prompt, options = {}) {
     "Content-Type": "application/json"
   };
 
-  // If the caller passed the raw OpenAI messages array (from /v1/chat/completions),
-  // sanitize and use them directly — the last message IS the user prompt.
-  // If messages is empty or just session history without the current prompt, append it.
-  const lastMsg = messages[messages.length - 1];
-  const promptAlreadyInMessages = lastMsg &&
-    lastMsg.role === "user" &&
-    getMessageContent(lastMsg.content).trim() !== "";
-
-  const msgList = promptAlreadyInMessages
-    ? sanitizeMessagesForZAI(messages)
-    : sanitizeMessagesForZAI([...messages, { role: "user", content: prompt }]);
-
   const body = JSON.stringify({
     model,
     chat_id: chatId,
     messages: msgList,
-    signature_prompt: prompt,
+    signature_prompt: lastUserContent,
     stream: true,
     params: {},
     extra: {},
@@ -1046,8 +1047,11 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
   const freshSession = req.headers["x-fresh-session"] === "true";
   const requestId = generateId();
 
-  // Extract last user prompt and keep the rest in session messages
-  const prompt = messagesToPrompt(messages);
+  // The "prompt" used for HMAC signature must be just the last user message text.
+  // messagesToPrompt() is kept for legacy /prompt endpoint only.
+  // For /v1/chat/completions we extract the last user message directly.
+  const lastUserMsg = [...messages].reverse().find(m => m.role === "user");
+  const prompt = lastUserMsg ? getMessageContent(lastUserMsg.content) : messagesToPrompt(messages);
 
   // Handle fresh session
   if (freshSession) {
