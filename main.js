@@ -3,7 +3,6 @@
 const express = require("express");
 const http = require("http");
 const crypto = require("crypto");
-const https = require("https");
 const config = require("./config");
 
 const app = express();
@@ -12,6 +11,7 @@ const server = http.createServer(app);
 // ============== Z.AI DIRECT CONFIG ==============
 
 const BASE_URL = "https://chat.z.ai";
+const INCLUDE_CORE_INSTRUCTIONS = false;
 const SALT_KEY = "key-@@@@)))()((9))-xxxx&&&%%%%%";
 const DEFAULT_FE_VERSION = "prod-fe-1.0.185";
 
@@ -28,7 +28,7 @@ const session = {
   features: {
     webSearch: false,
     autoWebSearch: false,
-    thinking: true,
+    thinking: false,
     imageGen: false,
     previewMode: false,
   },
@@ -36,21 +36,17 @@ const session = {
   initializing: false,
 };
 
-// Streaming buffers for tool call detection (requestId -> accumulated content)
-const streamingBuffers = new Map();
-
-// Core instructions to inject at the start of every conversation (for Roo/Kilo Code compatibility)
 const CORE_INSTRUCTIONS = `CRITICAL INSTRUCTIONS (ALWAYS FOLLOW):
 1. When using tools, ALWAYS output tool calls in XML format like: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
    NEVER use JSON or markdown code blocks for tool calls.
-2. Follow every instruction in the prompt deeply and thoroughly. Execute tasks completely. 
-3. Also One  rule  only applies if my prompt includes this string  "You are Roo" if it does then  when changing modes with function switch_mode funtion toolcall dont ever forget parameter mode_slug or else it will likely fail and heres the tool usage for  making todo list use it when doing complex task etc
+2. Follow every instruction in the prompt deeply and thoroughly. Execute tasks completely.
+3. Also One rule only applies if my prompt includes this string "You are Roo" if it does then when changing modes with function switch_mode function toolcall dont ever forget parameter mode_slug or else it will likely fail and heres the tool usage for making todo list use it when doing complex task etc
  <update_todo_list>
 <todos>
 - [ ] Create a .test file with content "im good"
 - [ ] Read C:\\key.txt and display its contents
 </todos>
-</update_todo_list> this is only a example of tool usage   if my Prompt doesnt includes You are Roo then ignore This rule 
+</update_todo_list> this is only a example of tool usage if my Prompt doesnt includes You are Roo then ignore This rule
 4. When using attempt_completion, ALWAYS use <parameter=result> - NEVER use <parameter=message> or <parameter=summary>. The parameter MUST be named "result".`;
 
 // ============== MIDDLEWARE ==============
@@ -58,7 +54,7 @@ const CORE_INSTRUCTIONS = `CRITICAL INSTRUCTIONS (ALWAYS FOLLOW):
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id, X-Fresh-Session");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id, X-Fresh-Session, anthropic-version, anthropic-beta");
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
@@ -68,10 +64,14 @@ app.use(express.json({ limit: "50mb" }));
 function authMiddleware(req, res, next) {
   if (!config.auth.enabled) return next();
   const authHeader = req.headers.authorization;
-  const token = authHeader?.replace(/^Bearer\s+/i, "");
-  if (token !== config.auth.token) {
+  const token = authHeader?.replace(/^Bearer\s+/i, "").replace(/^x-api-key\s+/i, "");
+  // Also accept x-api-key header (Anthropic SDK style)
+  const apiKey = req.headers["x-api-key"];
+  const provided = token || apiKey;
+  if (provided !== config.auth.token) {
     return res.status(401).json({
-      error: { message: "Invalid or missing authentication token", type: "authentication_error", code: "invalid_api_key" }
+      type: "error",
+      error: { type: "authentication_error", message: "Invalid or missing authentication token" }
     });
   }
   next();
@@ -93,13 +93,83 @@ function getMessageContent(content) {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content
-      .filter(part => part.type === "text" || typeof part === "string")
-      .map(part => (typeof part === "string" ? part : part.text || ""))
+      .filter(part => part.type === "text" || part.type === "tool_result" || typeof part === "string")
+      .map(part => {
+        if (typeof part === "string") return part;
+        if (part.type === "tool_result") {
+          const inner = Array.isArray(part.content)
+            ? part.content.map(c => c.text || "").join("\n")
+            : (part.content || "");
+          return `Tool Result (${part.tool_use_id}): ${inner}`;
+        }
+        return part.text || "";
+      })
       .join("\n");
   }
   return String(content);
 }
 
+// ── Convert Anthropic messages format → flat prompt string ──
+function anthropicMessagesToPrompt(messages, systemPrompt, includeToolInstructions = true) {
+  let prompt = "";
+
+  if (includeToolInstructions && INCLUDE_CORE_INSTRUCTIONS) {
+    prompt += `${CORE_INSTRUCTIONS}\n\n`;
+  }
+
+  if (systemPrompt) {
+    const sysText = typeof systemPrompt === "string"
+      ? systemPrompt
+      : Array.isArray(systemPrompt)
+        ? systemPrompt.map(b => b.text || "").join("\n")
+        : String(systemPrompt);
+    prompt += `System: ${sysText}\n\n`;
+  }
+
+  for (const msg of messages) {
+    const role = msg.role || "user";
+    const content = msg.content;
+
+    if (role === "user") {
+      // Handle array content (may include tool_result blocks)
+      if (Array.isArray(content)) {
+        const textParts = [];
+        for (const part of content) {
+          if (part.type === "text") {
+            textParts.push(part.text);
+          } else if (part.type === "tool_result") {
+            const inner = Array.isArray(part.content)
+              ? part.content.map(c => c.text || "").join("\n")
+              : (part.content || "");
+            textParts.push(`[Tool Result for ${part.tool_use_id}]: ${inner}`);
+          }
+        }
+        prompt += `User: ${textParts.join("\n")}\n\n`;
+      } else {
+        prompt += `User: ${getMessageContent(content)}\n\n`;
+      }
+    } else if (role === "assistant") {
+      // Handle array content (may include tool_use blocks)
+      if (Array.isArray(content)) {
+        const textParts = [];
+        for (const part of content) {
+          if (part.type === "text") {
+            textParts.push(part.text);
+          } else if (part.type === "tool_use") {
+            textParts.push(`[Tool Call: ${part.name}(${JSON.stringify(part.input)})]`);
+          }
+        }
+        prompt += `Assistant: ${textParts.join("\n")}\n\n`;
+      } else {
+        prompt += `Assistant: ${getMessageContent(content)}\n\n`;
+      }
+    }
+  }
+
+  return prompt.trim();
+}
+
+// Legacy OpenAI format → prompt (kept for /v1/chat/completions)
 function messagesToPrompt(messages, includeToolInstructions = true) {
   if (!Array.isArray(messages)) return messages;
 
@@ -115,7 +185,7 @@ function messagesToPrompt(messages, includeToolInstructions = true) {
   }
 
   let prompt = "";
-  if (includeToolInstructions) prompt += `${CORE_INSTRUCTIONS}\n\n`;
+  if (includeToolInstructions && INCLUDE_CORE_INSTRUCTIONS) prompt += `${CORE_INSTRUCTIONS}\n\n`;
   if (systemMsg) prompt += `System: ${systemMsg}\n\n`;
 
   for (const msg of conversation) {
@@ -129,11 +199,11 @@ function messagesToPrompt(messages, includeToolInstructions = true) {
   return prompt.trim();
 }
 
+// ── Tool call parsers (unchanged from original) ──
+
 function parseToolCalls(content) {
   const toolCalls = [];
-
   content = content.replace(/<tool_call>([a-zA-Z_][a-zA-Z0-9_]*)>/gi, "<$1>");
-
   const markdownJsonPattern = /```(?:json)?\s*\n?\s*(\{[\s\S]*?\})\s*\n?```/gi;
   let match;
 
@@ -229,12 +299,10 @@ function parseToolCalls(content) {
       while ((paramMatch = paramPattern.exec(innerContent)) !== null) {
         params[paramMatch[1]] = paramMatch[2];
       }
-
       if (toolName === "attempt_completion" && !params.result) {
         const textContent = innerContent.replace(/<[^>]*>/g, "").trim();
         params.result = textContent || "Task completed successfully.";
       }
-
       const toolNameLower = toolName.toLowerCase();
       for (const t of ["write","read","edit"]) {
         if (toolNameLower === t) {
@@ -247,7 +315,6 @@ function parseToolCalls(content) {
       if (toolNameLower === "todowrite" && params.todos && typeof params.todos === "string") {
         try { params.todos = JSON.parse(params.todos); } catch (e) {}
       }
-
       if (Object.keys(params).length > 0 || ["list_files"].includes(toolName)) {
         toolCalls.push({
           id: `call_${generateId().substring(0, 24)}`,
@@ -352,6 +419,156 @@ function hasIncompleteToolCall(content) {
   return false;
 }
 
+// ============================================================
+// ── FORMAT HELPERS ──────────────────────────────────────────
+// ============================================================
+
+// ── Anthropic /v1/messages format ──
+
+/**
+ * Convert parsed tool calls (OpenAI style) → Anthropic tool_use content blocks
+ */
+function toolCallsToAnthropicBlocks(toolCalls) {
+  return toolCalls.map(tc => ({
+    type: "tool_use",
+    id: tc.id || `toolu_${generateId().substring(0, 24)}`,
+    name: tc.function.name,
+    input: (() => {
+      try { return JSON.parse(tc.function.arguments); }
+      catch (e) { return { raw: tc.function.arguments }; }
+    })()
+  }));
+}
+
+/**
+ * Build a full non-streaming Anthropic response object
+ */
+function formatAnthropicResponse(fullContent, model, requestId) {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const msgId = `msg_${requestId}`;
+  const toolCalls = parseToolCalls(fullContent);
+  const cleanText = toolCalls.length > 0 ? removeToolCallsFromContent(fullContent) : fullContent;
+
+  const contentBlocks = [];
+
+  if (cleanText && cleanText.trim()) {
+    contentBlocks.push({ type: "text", text: cleanText });
+  }
+
+  if (toolCalls.length > 0) {
+    contentBlocks.push(...toolCallsToAnthropicBlocks(toolCalls));
+  }
+
+  if (contentBlocks.length === 0) {
+    contentBlocks.push({ type: "text", text: "" });
+  }
+
+  return {
+    id: msgId,
+    type: "message",
+    role: "assistant",
+    model: model || "claude-sonnet-4-6",
+    content: contentBlocks,
+    stop_reason: toolCalls.length > 0 ? "tool_use" : "end_turn",
+    stop_sequence: null,
+    usage: {
+      input_tokens: estimateTokens(fullContent),
+      output_tokens: estimateTokens(fullContent),
+    }
+  };
+}
+
+/**
+ * Build SSE event string
+ */
+function sseEvent(event, data) {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+/**
+ * Stream Anthropic SSE events for a given full content string (called once at end)
+ * For true streaming, we send deltas as they arrive — see the route handler.
+ */
+function buildAnthropicStreamEvents(fullContent, model, requestId, inputTokens) {
+  const msgId = `msg_${requestId}`;
+  const toolCalls = parseToolCalls(fullContent);
+  const cleanText = toolCalls.length > 0 ? removeToolCallsFromContent(fullContent) : fullContent;
+
+  const events = [];
+
+  // message_start
+  events.push(sseEvent("message_start", {
+    type: "message_start",
+    message: {
+      id: msgId,
+      type: "message",
+      role: "assistant",
+      model: model || "claude-sonnet-4-6",
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: inputTokens, output_tokens: 0 }
+    }
+  }));
+
+  let blockIndex = 0;
+
+  // Text block
+  if (cleanText && cleanText.trim()) {
+    events.push(sseEvent("content_block_start", {
+      type: "content_block_start",
+      index: blockIndex,
+      content_block: { type: "text", text: "" }
+    }));
+    events.push(sseEvent("content_block_delta", {
+      type: "content_block_delta",
+      index: blockIndex,
+      delta: { type: "text_delta", text: cleanText }
+    }));
+    events.push(sseEvent("content_block_stop", {
+      type: "content_block_stop",
+      index: blockIndex
+    }));
+    blockIndex++;
+  }
+
+  // Tool use blocks
+  for (const tc of toolCallsToAnthropicBlocks(toolCalls)) {
+    const inputJson = JSON.stringify(tc.input);
+    events.push(sseEvent("content_block_start", {
+      type: "content_block_start",
+      index: blockIndex,
+      content_block: { type: "tool_use", id: tc.id, name: tc.name, input: {} }
+    }));
+    events.push(sseEvent("content_block_delta", {
+      type: "content_block_delta",
+      index: blockIndex,
+      delta: { type: "input_json_delta", partial_json: inputJson }
+    }));
+    events.push(sseEvent("content_block_stop", {
+      type: "content_block_stop",
+      index: blockIndex
+    }));
+    blockIndex++;
+  }
+
+  const outputTokens = estimateTokens(fullContent);
+  const stopReason = toolCalls.length > 0 ? "tool_use" : "end_turn";
+
+  events.push(sseEvent("message_delta", {
+    type: "message_delta",
+    delta: { stop_reason: stopReason, stop_sequence: null },
+    usage: { output_tokens: outputTokens }
+  }));
+
+  events.push(sseEvent("message_stop", { type: "message_stop" }));
+  events.push(`data: [DONE]\n\n`);
+
+  return events;
+}
+
+// ── OpenAI /v1/chat/completions format (unchanged) ──
+
 function formatOpenAIResponse(result, model, requestId, stream = false, fullContent = null) {
   const timestamp = Math.floor(Date.now() / 1000);
   const rawContent = result.content || result.text || "";
@@ -427,6 +644,10 @@ function formatOpenAIError(message, type = "api_error", code = null) {
   return { error: { message, type, code, param: null } };
 }
 
+function formatAnthropicError(message, type = "api_error") {
+  return { type: "error", error: { type, message } };
+}
+
 // ============== Z.AI DIRECT HTTP FUNCTIONS ==============
 
 async function scrapeConfig() {
@@ -479,7 +700,6 @@ function generateZaSignature(prompt, token, userId) {
 
 async function initializeSession() {
   if (session.initializing) {
-    // Wait for ongoing init
     await new Promise(resolve => {
       const check = setInterval(() => {
         if (!session.initializing) { clearInterval(check); resolve(); }
@@ -500,12 +720,10 @@ async function initializeSession() {
       "Content-Type": "application/json"
     };
 
-    // Guest auth
     await fetch(`${BASE_URL}/api/v1/auths/guest`, {
       method: "POST", headers, body: "{}", signal: AbortSignal.timeout(15000)
     });
 
-    // Get token
     const authRes = await fetch(`${BASE_URL}/api/v1/auths/`, {
       headers, signal: AbortSignal.timeout(15000)
     });
@@ -567,10 +785,6 @@ function getContextVars() {
   };
 }
 
-/**
- * Send prompt to Z.AI, returns an async generator yielding text chunks.
- * Handles 401 by re-initializing session once.
- */
 async function* sendToZAI(prompt, options = {}) {
   const {
     model = "glm-4.7",
@@ -580,7 +794,6 @@ async function* sendToZAI(prompt, options = {}) {
     previewMode = session.features.previewMode,
     chatId = session.chatId,
     messages = session.messages,
-    freshSession = false,
   } = options;
 
   if (!session.initialized) await initializeSession();
@@ -628,7 +841,6 @@ async function* sendToZAI(prompt, options = {}) {
   }
 
   if (res.status === 401) {
-    // Re-init session and retry once
     session.initialized = false;
     await initializeSession();
     yield* sendToZAI(prompt, options);
@@ -640,14 +852,13 @@ async function* sendToZAI(prompt, options = {}) {
     throw new Error(`Z.AI error ${res.status}: ${errText}`);
   }
 
-  // SSE streaming parse
   const decoder = new TextDecoder();
   let buffer = "";
 
   for await (const chunk of res.body) {
     buffer += decoder.decode(chunk, { stream: true });
     const lines = buffer.split("\n");
-    buffer = lines.pop(); // keep incomplete line
+    buffer = lines.pop();
 
     for (const line of lines) {
       const trimmed = line.trim();
@@ -664,7 +875,6 @@ async function* sendToZAI(prompt, options = {}) {
     }
   }
 
-  // Flush remaining buffer
   if (buffer.trim().startsWith("data: ")) {
     const dataStr = buffer.trim().slice(6);
     if (dataStr !== "[DONE]") {
@@ -707,11 +917,14 @@ const getDashboardHTML = (host) => `<!DOCTYPE html>
       margin-bottom: 10px;
     }
     .header p { color: #888; font-size: 1.1rem; }
+    .badges { display: flex; gap: 8px; justify-content: center; margin-top: 12px; flex-wrap: wrap; }
     .badge {
-      display: inline-block; background: #22c55e; color: #000;
-      padding: 4px 12px; border-radius: 12px; font-size: 0.8rem; font-weight: 700;
-      margin-top: 8px;
+      display: inline-block; padding: 4px 12px; border-radius: 12px;
+      font-size: 0.8rem; font-weight: 700;
     }
+    .badge-green { background: #22c55e; color: #000; }
+    .badge-blue  { background: #3b82f6; color: #fff; }
+    .badge-purple{ background: #a855f7; color: #fff; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
     .card {
       background: rgba(255,255,255,0.05); border-radius: 12px;
@@ -722,9 +935,6 @@ const getDashboardHTML = (host) => `<!DOCTYPE html>
     .stat { background: rgba(0,0,0,0.2); padding: 12px; border-radius: 8px; }
     .stat .label { color: #888; font-size: 0.85rem; }
     .stat .value { color: #60a5fa; font-weight: 600; font-size: 1.5rem; margin-top: 4px; }
-    .status-dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; margin-right: 8px; }
-    .status-dot.ok { background: #22c55e; }
-    .status-dot.err { background: #ef4444; }
     .code-block {
       background: #0d1117; border-radius: 8px; padding: 16px; overflow-x: auto;
       font-family: 'Monaco', 'Menlo', monospace; font-size: 0.85rem;
@@ -740,6 +950,10 @@ const getDashboardHTML = (host) => `<!DOCTYPE html>
     .method.post { background: #3b82f6; color: #fff; }
     .path { font-family: monospace; color: #e0e0e0; }
     .desc { color: #888; font-size: 0.85rem; margin-top: 4px; }
+    .section-label {
+      font-size: 0.75rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.1em; color: #a855f7; margin: 16px 0 8px;
+    }
   </style>
 </head>
 <body>
@@ -747,7 +961,11 @@ const getDashboardHTML = (host) => `<!DOCTYPE html>
     <div class="header">
       <h1>Z.AI Direct Bridge</h1>
       <p>HTTP-only mode — No browser required</p>
-      <span class="badge">⚡ Direct Mode</span>
+      <div class="badges">
+        <span class="badge badge-green">⚡ Direct Mode</span>
+        <span class="badge badge-blue">OpenAI Compatible</span>
+        <span class="badge badge-purple">Anthropic Compatible</span>
+      </div>
     </div>
 
     <div class="grid">
@@ -776,81 +994,85 @@ const getDashboardHTML = (host) => `<!DOCTYPE html>
       <div class="card">
         <h2>Features</h2>
         <div class="stat-grid">
-          <div class="stat">
-            <div class="label">Web Search</div>
-            <div class="value" id="featSearch">-</div>
-          </div>
-          <div class="stat">
-            <div class="label">Thinking</div>
-            <div class="value" id="featThink">-</div>
-          </div>
-          <div class="stat">
-            <div class="label">Image Gen</div>
-            <div class="value" id="featImage">-</div>
-          </div>
-          <div class="stat">
-            <div class="label">Preview</div>
-            <div class="value" id="featPreview">-</div>
-          </div>
+          <div class="stat"><div class="label">Web Search</div><div class="value" id="featSearch">-</div></div>
+          <div class="stat"><div class="label">Thinking</div><div class="value" id="featThink">-</div></div>
+          <div class="stat"><div class="label">Image Gen</div><div class="value" id="featImage">-</div></div>
+          <div class="stat"><div class="label">Preview</div><div class="value" id="featPreview">-</div></div>
         </div>
       </div>
 
       <div class="card" style="grid-column: span 2;">
         <h2>API Endpoints</h2>
+
+        <div class="section-label">Anthropic-Compatible (for Claude Code)</div>
         <div class="endpoint">
           <span class="method post">POST</span>
-          <span class="path">/v1/chat/completions</span>
-          <div class="desc">OpenAI-compatible chat endpoint. Supports streaming with stream: true</div>
+          <span class="path">/v1/messages</span>
+          <div class="desc">Native Anthropic Messages API — streaming SSE + tool_use blocks. Use ANTHROPIC_BASE_URL=http://${host}</div>
         </div>
         <div class="endpoint">
           <span class="method get">GET</span>
           <span class="path">/v1/models</span>
-          <div class="desc">List available models (OpenAI format)</div>
+          <div class="desc">Model list (returns Anthropic-style model IDs)</div>
         </div>
+
+        <div class="section-label">OpenAI-Compatible</div>
         <div class="endpoint">
           <span class="method post">POST</span>
-          <span class="path">/prompt</span>
-          <div class="desc">Legacy prompt endpoint</div>
+          <span class="path">/v1/chat/completions</span>
+          <div class="desc">OpenAI-compatible chat endpoint. Supports streaming.</div>
         </div>
+
+        <div class="section-label">Management</div>
         <div class="endpoint">
           <span class="method post">POST</span>
           <span class="path">/features</span>
-          <div class="desc">Update session features (webSearch, thinking, imageGen, previewMode)</div>
+          <div class="desc">Toggle webSearch, thinking, imageGen, previewMode</div>
         </div>
         <div class="endpoint">
           <span class="method post">POST</span>
           <span class="path">/admin/session/clear</span>
-          <div class="desc">Clear conversation history and start new chat</div>
+          <div class="desc">Clear conversation history</div>
         </div>
       </div>
 
       <div class="card" style="grid-column: span 2;">
-        <h2>Example Usage</h2>
+        <h2>Claude Code Setup (no LiteLLM needed)</h2>
         <div class="code-block">
-          <code># Basic chat (non-streaming)
-curl -X POST http://${host}/v1/chat/completions \\
+          <code># Windows PowerShell
+$env:ANTHROPIC_BASE_URL="http://localhost:${config.server.port}"
+$env:ANTHROPIC_API_KEY="${config.auth.token}"
+claude
+
+# Windows CMD
+set ANTHROPIC_BASE_URL=http://localhost:${config.server.port}
+set ANTHROPIC_API_KEY=${config.auth.token}
+claude
+
+# Permanent — add to ~/.claude/settings.json:
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:${config.server.port}",
+    "ANTHROPIC_API_KEY": "${config.auth.token}"
+  }
+}</code>
+        </div>
+
+        <h2 style="margin-top:20px">Test the Anthropic endpoint</h2>
+        <div class="code-block">
+          <code># Non-streaming
+curl -X POST http://${host}/v1/messages \\
   -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer ${config.auth.token}" \\
-  -d '{"model":"glm-4.7","messages":[{"role":"user","content":"Hello!"}],"stream":false}'
+  -H "x-api-key: ${config.auth.token}" \\
+  -H "anthropic-version: 2023-06-01" \\
+  -d '{"model":"claude-sonnet-4-6","max_tokens":100,"messages":[{"role":"user","content":"Hello!"}]}'
 
 # Streaming
-curl -X POST http://${host}/v1/chat/completions \\
+curl -X POST http://${host}/v1/messages \\
   -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer ${config.auth.token}" \\
-  -d '{"model":"glm-4.7","messages":[{"role":"user","content":"Tell me a story"}],"stream":true}'
-
-# Fresh session (resets context)
-curl -X POST http://${host}/v1/chat/completions \\
-  -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer ${config.auth.token}" \\
-  -H "X-Fresh-Session: true" \\
-  -d '{"model":"z1","messages":[{"role":"user","content":"New topic"}]}'
-
-# Enable web search
-curl -X POST http://${host}/features \\
-  -H "Authorization: Bearer ${config.auth.token}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"webSearch":true}'</code>
+  -H "x-api-key: ${config.auth.token}" \\
+  -H "anthropic-version: 2023-06-01" \\
+  -d '{"model":"claude-sonnet-4-6","max_tokens":500,"stream":true,"messages":[{"role":"user","content":"Say hi"}]}'</code>
         </div>
       </div>
     </div>
@@ -897,16 +1119,241 @@ app.get("/status", (req, res) => {
   });
 });
 
-// ============== OPENAI-COMPATIBLE API ==============
+// ============================================================
+// ── ANTHROPIC-COMPATIBLE /v1/messages ───────────────────────
+// ============================================================
 
-const knownModels = ["glm-4.7", "z1", "z1-mini"];
+app.post("/v1/messages", authMiddleware, async (req, res) => {
+  const {
+    model = "claude-sonnet-4-6",
+    messages,
+    system,
+    stream = false,
+    max_tokens,
+    tools,          // accepted but not forwarded (Z.AI handles via prompt)
+    tool_choice,    // accepted, ignored
+    temperature,    // accepted, ignored
+    metadata,       // accepted, ignored
+  } = req.body;
+
+  if (!messages || !Array.isArray(messages)) {
+    return res.status(400).json(formatAnthropicError("messages is required and must be an array", "invalid_request_error"));
+  }
+
+  const freshSession = req.headers["x-fresh-session"] === "true";
+  const requestId = generateId();
+
+  // Build flat prompt from Anthropic messages + system
+  const prompt = anthropicMessagesToPrompt(messages, system);
+  const inputTokens = estimateTokens(prompt);
+
+  if (freshSession) {
+    session.messages = [];
+    session.chatId = crypto.randomUUID();
+    console.log(`[Session] Fresh session started. New chatId: ${session.chatId}`);
+  }
+
+  // Map claude-* model names to a Z.AI model
+  // glm-4.7 is the default capable model; glm-5 for "opus"-level requests
+  const zaiModel = (() => {
+    const m = (model || "").toLowerCase();
+    if (m.includes("opus"))   return "glm-5";
+    if (m.includes("haiku"))  return "glm-4.7";
+    return "glm-5"; // sonnet and everything else
+  })();
+
+  const opts = {
+    model: zaiModel,
+    webSearch: session.features.webSearch,
+    thinking: session.features.thinking,
+    imageGen: session.features.imageGen,
+    previewMode: session.features.previewMode,
+    chatId: session.chatId,
+    messages: session.messages,
+  };
+
+  // ── STREAMING ──
+  if (stream) {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+
+    const msgId = `msg_${requestId}`;
+
+    // Send message_start immediately
+    res.write(sseEvent("message_start", {
+      type: "message_start",
+      message: {
+        id: msgId,
+        type: "message",
+        role: "assistant",
+        model: model,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: inputTokens, output_tokens: 0 }
+      }
+    }));
+
+    // Ping to keep connection alive
+    const keepAlive = setInterval(() => {
+      try { res.write(": ping\n\n"); } catch (e) { clearInterval(keepAlive); }
+    }, 5000);
+
+    let fullContent = "";
+    let sentContent = "";
+    let textBlockOpen = false;
+    let textBlockIndex = 0;
+
+    try {
+      for await (const chunk of sendToZAI(prompt, opts)) {
+        fullContent += chunk;
+
+        // Buffer while a tool call is still being built
+        if (hasIncompleteToolCall(fullContent)) continue;
+
+        const delta = fullContent.substring(sentContent.length);
+        if (delta) {
+          // Open text block on first real delta
+          if (!textBlockOpen) {
+            res.write(sseEvent("content_block_start", {
+              type: "content_block_start",
+              index: textBlockIndex,
+              content_block: { type: "text", text: "" }
+            }));
+            textBlockOpen = true;
+          }
+
+          res.write(sseEvent("content_block_delta", {
+            type: "content_block_delta",
+            index: textBlockIndex,
+            delta: { type: "text_delta", text: delta }
+          }));
+          sentContent = fullContent;
+        }
+      }
+
+      // Flush any remaining buffered content
+      const remaining = fullContent.substring(sentContent.length);
+      if (remaining) {
+        if (!textBlockOpen) {
+          res.write(sseEvent("content_block_start", {
+            type: "content_block_start",
+            index: textBlockIndex,
+            content_block: { type: "text", text: "" }
+          }));
+          textBlockOpen = true;
+        }
+        res.write(sseEvent("content_block_delta", {
+          type: "content_block_delta",
+          index: textBlockIndex,
+          delta: { type: "text_delta", text: remaining }
+        }));
+      }
+
+      // Close text block if open
+      if (textBlockOpen) {
+        res.write(sseEvent("content_block_stop", {
+          type: "content_block_stop",
+          index: textBlockIndex
+        }));
+        textBlockOpen = false;
+      }
+
+      // Parse tool calls from complete content and emit as tool_use blocks
+      const toolCalls = parseToolCalls(fullContent);
+      let blockIdx = textBlockIndex + 1;
+
+      for (const tc of toolCallsToAnthropicBlocks(toolCalls)) {
+        const inputJson = JSON.stringify(tc.input);
+        res.write(sseEvent("content_block_start", {
+          type: "content_block_start",
+          index: blockIdx,
+          content_block: { type: "tool_use", id: tc.id, name: tc.name, input: {} }
+        }));
+        res.write(sseEvent("content_block_delta", {
+          type: "content_block_delta",
+          index: blockIdx,
+          delta: { type: "input_json_delta", partial_json: inputJson }
+        }));
+        res.write(sseEvent("content_block_stop", {
+          type: "content_block_stop",
+          index: blockIdx
+        }));
+        blockIdx++;
+      }
+
+      const outputTokens = estimateTokens(fullContent);
+      const stopReason = toolCalls.length > 0 ? "tool_use" : "end_turn";
+
+      res.write(sseEvent("message_delta", {
+        type: "message_delta",
+        delta: { stop_reason: stopReason, stop_sequence: null },
+        usage: { output_tokens: outputTokens }
+      }));
+
+      res.write(sseEvent("message_stop", { type: "message_stop" }));
+      res.write(`data: [DONE]\n\n`);
+
+      // Update session history
+      session.messages.push({ role: "user", content: prompt });
+      if (fullContent) session.messages.push({ role: "assistant", content: fullContent });
+
+    } catch (e) {
+      console.error("[Anthropic Stream] Error:", e.message);
+      res.write(sseEvent("error", { type: "error", error: { type: "api_error", message: e.message } }));
+      res.write(`data: [DONE]\n\n`);
+    } finally {
+      clearInterval(keepAlive);
+      res.end();
+    }
+
+  // ── NON-STREAMING ──
+  } else {
+    try {
+      let fullContent = "";
+      for await (const chunk of sendToZAI(prompt, opts)) {
+        fullContent += chunk;
+      }
+
+      session.messages.push({ role: "user", content: prompt });
+      if (fullContent) session.messages.push({ role: "assistant", content: fullContent });
+
+      res.json(formatAnthropicResponse(fullContent, model, requestId));
+    } catch (e) {
+      console.error("[Anthropic API] Error:", e.message);
+      const statusCode = e.message.includes("401") ? 401 : 500;
+      res.status(statusCode).json(formatAnthropicError(e.message));
+    }
+  }
+});
+
+// ============================================================
+// ── OPENAI-COMPATIBLE /v1/chat/completions (unchanged) ──────
+// ============================================================
+
+const knownModels = [
+  "glm-4.7", "glm-5", "z1", "z1-mini",
+  // Also advertise Anthropic model names so Claude Code's model probe passes
+  "claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001",
+];
 
 app.get("/v1/models", authMiddleware, (req, res) => {
+  // Detect whether caller wants Anthropic or OpenAI format
+  const wantsAnthropic = req.headers["anthropic-version"] ||
+                         req.headers["x-api-key"] ||
+                         (req.headers.authorization || "").includes(config.auth.token);
+
   res.json({
     object: "list",
     data: knownModels.map(m => ({
-      id: m, object: "model", created: Math.floor(Date.now() / 1000),
-      owned_by: "z-ai", permission: [], root: m, parent: null
+      id: m,
+      object: "model",
+      created: Math.floor(Date.now() / 1000),
+      owned_by: m.startsWith("claude") ? "anthropic" : "z-ai",
+      display_name: m,
     }))
   });
 });
@@ -916,7 +1363,7 @@ app.get("/models", authMiddleware, (req, res) => {
 });
 
 app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
-  const { model = "glm-4.7", messages, stream = false, deepThink, search, webSearch } = req.body;
+  const { model = "glm-4.7", messages, stream = true, deepThink, search, webSearch } = req.body;
 
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json(formatOpenAIError("messages is required and must be an array", "invalid_request_error"));
@@ -924,15 +1371,11 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
 
   const freshSession = req.headers["x-fresh-session"] === "true";
   const requestId = generateId();
-
-  // Extract last user prompt and keep the rest in session messages
   const prompt = messagesToPrompt(messages);
 
-  // Handle fresh session
   if (freshSession) {
     session.messages = [];
     session.chatId = crypto.randomUUID();
-    console.log(`[Session] Fresh session started. New chatId: ${session.chatId}`);
   }
 
   const opts = {
@@ -952,7 +1395,6 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
     res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders();
 
-    // Initial empty chunk
     const initChunk = formatOpenAIResponse({ content: "", finish_reason: null }, model, requestId, true);
     res.write(`data: ${JSON.stringify(initChunk)}\n\n`);
 
@@ -969,9 +1411,7 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
     try {
       for await (const chunk of sendToZAI(prompt, opts)) {
         fullContent += chunk;
-
-        if (hasIncompleteToolCall(fullContent)) continue; // buffer
-
+        if (hasIncompleteToolCall(fullContent)) continue;
         const delta = fullContent.substring(sentContent.length);
         if (delta) {
           sentContent = fullContent;
@@ -980,19 +1420,16 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
         }
       }
 
-      // Send any remaining buffered content
       const remaining = fullContent.substring(sentContent.length);
       if (remaining) {
         const c = formatOpenAIResponse({ content: remaining, finish_reason: null }, model, requestId, true);
         res.write(`data: ${JSON.stringify(c)}\n\n`);
       }
 
-      // Final stop chunk (checks full content for tool calls)
       const finalChunk = formatOpenAIResponse({ content: "", finish_reason: "stop" }, model, requestId, true, fullContent);
       res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
       res.write("data: [DONE]\n\n");
 
-      // Update session history
       session.messages.push({ role: "user", content: prompt });
       if (fullContent) session.messages.push({ role: "assistant", content: fullContent });
 
@@ -1006,17 +1443,13 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
     }
 
   } else {
-    // Non-streaming
     try {
       let fullContent = "";
       for await (const chunk of sendToZAI(prompt, opts)) {
         fullContent += chunk;
       }
-
-      // Update session history
       session.messages.push({ role: "user", content: prompt });
       if (fullContent) session.messages.push({ role: "assistant", content: fullContent });
-
       res.json(formatOpenAIResponse({ content: fullContent }, model, requestId));
     } catch (e) {
       console.error("[API] Error:", e.message);
@@ -1026,26 +1459,21 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
   }
 });
 
-// ============== LEGACY API ==============
+// ============== LEGACY + ADMIN ROUTES ==============
 
 app.post("/prompt", authMiddleware, async (req, res) => {
   const { prompt, search, deepThink, webSearch } = req.body;
   if (!prompt) return res.status(400).json({ error: "Prompt is required" });
-
   const freshSession = req.headers["x-fresh-session"] === "true";
   if (freshSession) { session.messages = []; session.chatId = crypto.randomUUID(); }
-
   try {
     let fullContent = "";
     for await (const chunk of sendToZAI(prompt, {
       webSearch: webSearch ?? search ?? session.features.webSearch,
       thinking: deepThink ?? session.features.thinking,
-    })) {
-      fullContent += chunk;
-    }
+    })) { fullContent += chunk; }
     session.messages.push({ role: "user", content: prompt });
     if (fullContent) session.messages.push({ role: "assistant", content: fullContent });
-
     res.json({ success: true, response: fullContent });
   } catch (e) {
     console.error("[Prompt] Error:", e.message);
@@ -1053,63 +1481,33 @@ app.post("/prompt", authMiddleware, async (req, res) => {
   }
 });
 
-// Features toggle
 app.post("/features", authMiddleware, (req, res) => {
   const { webSearch, thinking, imageGen, previewMode } = req.body;
-  if (webSearch !== undefined) { session.features.webSearch = !!webSearch; session.features.autoWebSearch = !!webSearch; }
-  if (thinking !== undefined) session.features.thinking = !!thinking;
-  if (imageGen !== undefined) session.features.imageGen = !!imageGen;
-  if (previewMode !== undefined) session.features.previewMode = !!previewMode;
+  if (webSearch  !== undefined) { session.features.webSearch = !!webSearch; session.features.autoWebSearch = !!webSearch; }
+  if (thinking   !== undefined) session.features.thinking   = !!thinking;
+  if (imageGen   !== undefined) session.features.imageGen   = !!imageGen;
+  if (previewMode!== undefined) session.features.previewMode= !!previewMode;
   console.log("[Features] Updated:", session.features);
   res.json({ success: true, features: session.features });
 });
-
-// ============== ADMIN ENDPOINTS ==============
 
 app.get("/admin/stats", (req, res) => {
   res.json({
     mode: "direct",
     totalClients: session.initialized ? 1 : 0,
-    idleClients: session.initialized ? 1 : 0,
-    busyClients: 0,
-    queueLength: 0,
-    clients: session.initialized ? [{
-      id: session.userId?.substring(0, 8) || "session",
-      status: "idle",
-      currentModel: "glm-4.7",
-      requestCount: session.messages.length / 2
-    }] : [],
-    stats: {
-      totalRequests: Math.floor(session.messages.length / 2),
-      successfulRequests: Math.floor(session.messages.length / 2),
-      rateLimitHits: 0,
-      averageLatency: 0
-    }
+    stats: { totalRequests: Math.floor(session.messages.length / 2) }
   });
 });
 
 app.get("/admin/health", (req, res) => {
   const healthy = session.initialized;
-  res.status(healthy ? 200 : 503).json({
-    healthy, mode: "direct",
-    session: { initialized: session.initialized, messageCount: session.messages.length }
-  });
+  res.status(healthy ? 200 : 503).json({ healthy, mode: "direct" });
 });
 
 app.get("/admin/clients", (req, res) => {
-  res.json({
-    clients: session.initialized ? [{
-      id: session.userId?.substring(0, 8) || "session",
-      status: "idle",
-      userName: session.userName,
-      messageCount: session.messages.length,
-      chatId: session.chatId,
-      features: session.features
-    }] : []
-  });
+  res.json({ clients: session.initialized ? [{ id: "session", status: "idle" }] : [] });
 });
 
-// Clear session history (replaces /admin/clients/:id/clear)
 app.post("/admin/session/clear", authMiddleware, (req, res) => {
   session.messages = [];
   session.chatId = crypto.randomUUID();
@@ -1117,21 +1515,18 @@ app.post("/admin/session/clear", authMiddleware, (req, res) => {
   res.json({ success: true, message: "Session history cleared", chatId: session.chatId });
 });
 
-// Compat route for old /admin/clients/:id/clear
 app.post("/admin/clients/:id/clear", authMiddleware, (req, res) => {
   session.messages = [];
   session.chatId = crypto.randomUUID();
   res.json({ success: true, message: "History cleared" });
 });
 
-// No-op inject.js (direct mode doesn't need browser injection)
 app.get("/inject.js", (req, res) => {
-  res.type("application/json").send(JSON.stringify({ message: "Direct mode - no injection needed" }));
+  res.type("application/json").send(JSON.stringify({ message: "Direct mode" }));
 });
 
 app.post("/stop", authMiddleware, (req, res) => {
-  // In direct mode, no streaming abort support yet; just ack
-  res.json({ success: true, message: "Stop acknowledged (direct mode)" });
+  res.json({ success: true, message: "Stop acknowledged" });
 });
 
 // ============== START SERVER ==============
@@ -1143,24 +1538,19 @@ server.listen(config.server.port, config.server.host, async () => {
 ╠═══════════════════════════════════════════════════════════════╣
 ║  Mode:          DIRECT HTTP (no browser needed)               ║
 ║  Dashboard:     http://localhost:${config.server.port}                      ║
+╠═══════════════════════════════════════════════════════════════╣
+║  Anthropic API: http://localhost:${config.server.port}/v1/messages          ║
 ║  OpenAI API:    http://localhost:${config.server.port}/v1/chat/completions  ║
 ╠═══════════════════════════════════════════════════════════════╣
-║  Auth Token:    ${config.auth.token}                            ║
+║  Auth Token:    ${config.auth.token.padEnd(44)}║
 ╠═══════════════════════════════════════════════════════════════╣
-║  Features:                                                    ║
-║  ✓ Direct HTTPS to chat.z.ai (HMAC-signed)                   ║
-║  ✓ Auto guest session init + JWT decode                       ║
-║  ✓ OpenAI-compatible /v1/chat/completions                     ║
-║  ✓ SSE Streaming support                                      ║
-║  ✓ Tool call parsing (XML, JSON, Roo/Cline, OpenCode)         ║
-║  ✓ Fresh session support (X-Fresh-Session header)             ║
-║  ✓ Feature toggles (webSearch, thinking, imageGen, preview)   ║
-║  ✓ Auto session re-init on 401                                ║
-║  ✓ Conversation history tracking                              ║
+║  Claude Code (no LiteLLM needed):                             ║
+║  set ANTHROPIC_BASE_URL=http://localhost:${config.server.port}              ║
+║  set ANTHROPIC_API_KEY=${config.auth.token.padEnd(39)}║
+║  claude                                                       ║
 ╚═══════════════════════════════════════════════════════════════╝
 `);
 
-  // Initialize session at startup
   try {
     await initializeSession();
   } catch (e) {
