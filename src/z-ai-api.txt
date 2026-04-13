@@ -1,0 +1,39 @@
+// Delete the second workspace
+fetch("https://chat.z.ai/api/v1/web-dev/workspaces/d3cd3d22-bdfb-444d-b712-b6d0f7e90137", {
+  "headers": {
+    "accept": "*/*",
+    "accept-language": "en-US,en;q=0.9,ur-IN;q=0.8,ur-PK;q=0.7,ur;q=0.6",
+    "authorization": "Bearer ",
+    "content-type": "application/json",
+    "sec-ch-ua": "\"Chromium\";v=\"145\", \"Not:A-Brand\";v=\"99\"",
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": "\"Linux\"",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin"
+  },
+  "body": null,
+  "method": "DELETE",
+  "mode": "cors",
+  "credentials": "include"
+});
+
+// Delete the third workspace
+fetch("https://chat.z.ai/api/v1/web-dev/workspaces/63ce7828-2c1c-40fe-957b-00bf8b598802", {
+  "headers": {
+    "accept": "*/*",
+    "accept-language": "en-US,en;q=0.9,ur-IN;q=0.8,ur-PK;q=0.7,ur;q=0.6",
+    "authorization": "Bearer ",
+    "content-type": "application/json",
+    "sec-ch-ua": "\"Chromium\";v=\"145\", \"Not:A-Brand\";v=\"99\"",
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": "\"Linux\"",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin"
+  },
+  "body": null,
+  "method": "DELETE",
+  "mode": "cors",
+  "credentials": "include"
+});

@@ -19,7 +19,7 @@
 
 ## What's New
 
-- **GLM 5V Turbo** model added
+- **GLM 5.1** model added
 - **Anthropic API** (`/v1/messages`) support added — native SSE streaming.
 - **Claude Code** integration added (no LiteLLM required)
 - **Tool call parse toggle** — choose between parsed `tool_use` blocks or raw passthrough
