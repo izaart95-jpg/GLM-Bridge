@@ -1,4 +1,4 @@
-// Delete the second workspace
+// Delete the  workspace
 fetch("https://chat.z.ai/api/v1/web-dev/workspaces/d3cd3d22-bdfb-444d-b712-b6d0f7e90137", {
   "headers": {
     "accept": "*/*",
@@ -18,7 +18,7 @@ fetch("https://chat.z.ai/api/v1/web-dev/workspaces/d3cd3d22-bdfb-444d-b712-b6d0f
   "credentials": "include"
 });
 
-// Delete the third workspace
+// Delete the workspace
 fetch("https://chat.z.ai/api/v1/web-dev/workspaces/63ce7828-2c1c-40fe-957b-00bf8b598802", {
   "headers": {
     "accept": "*/*",
@@ -37,3 +37,9 @@ fetch("https://chat.z.ai/api/v1/web-dev/workspaces/63ce7828-2c1c-40fe-957b-00bf8
   "mode": "cors",
   "credentials": "include"
 });
+
+
+Fetch Guest session
+GET https://chat.z.ai/api/v1/auths/
+validate token
+GET https://chat.z.ai/api/v1/auths/ -H "Authorization: Bearer token"

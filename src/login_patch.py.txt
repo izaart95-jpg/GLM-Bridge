@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""
+patch_main.py — Adds ZAI_TOKEN fast-path to initializeSession() in main.js
+
+Usage:
+    python patch_main.py              # patches main.js in current directory
+    python patch_main.py server.js    # patches a different file
+"""
+
+import sys
+import shutil
+from pathlib import Path
+
+# ── The exact string to find (start of initializeSession body) ──
+OLD = '''async function initializeSession() {
+  if (session.initializing) {
+    await new Promise(resolve => {
+      const check = setInterval(() => {
+        if (!session.initializing) { clearInterval(check); resolve(); }
+      }, 100);
+    });
+    return;
+  }
+
+  session.initializing = true;
+  console.log("[Session] Initializing Z.AI session...");'''
+
+# ── Replacement: same block + hardcoded-token fast path inserted after the lock ──
+NEW = '''async function initializeSession() {
+  if (session.initializing) {
+    await new Promise(resolve => {
+      const check = setInterval(() => {
+        if (!session.initializing) { clearInterval(check); resolve(); }
+      }, 100);
+    });
+    return;
+  }
+
+  session.initializing = true;
+
+  // ── Fast path: use hardcoded ZAI_TOKEN, skip guest flow ──
+  if (config.zaiToken) {
+    console.log("[Session] Using hardcoded ZAI_TOKEN, skipping guest init.");
+    session.token = config.zaiToken;
+    try {
+      const parts = session.token.split(".");
+      const padded = parts[1] + "==";
+      const payload = JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
+      session.userId = payload.id || "";
+      session.userName = (payload.email || "User").split("@")[0];
+      console.log(`[Session] Token user: ${session.userId.substring(0, 8)}... (${session.userName})`);
+    } catch (e) {
+      console.warn("[Session] Token decode failed, continuing with raw token.");
+      session.userId = "";
+      session.userName = "User";
+    }
+    session.initialized = true;
+    session.initializing = false;
+    return;
+  }
+
+  console.log("[Session] Initializing Z.AI session...");'''
+
+
+def patch(filepath: Path) -> None:
+    original = filepath.read_text(encoding="utf-8")
+
+    if OLD not in original:
+        print(f"✗  Target block not found in {filepath}.")
+        print("   The file may already be patched or has unexpected whitespace.")
+        sys.exit(1)
+
+    if "config.zaiToken" in original:
+        print(f"⚠  {filepath} already contains 'config.zaiToken' — looks already patched. Aborting.")
+        sys.exit(0)
+
+    # Backup
+    backup = filepath.with_suffix(filepath.suffix + ".bak")
+    shutil.copy2(filepath, backup)
+    print(f"✓  Backup saved → {backup}")
+
+    patched = original.replace(OLD, NEW, 1)
+    filepath.write_text(patched, encoding="utf-8")
+    print(f"✓  Patched    → {filepath}")
+    print()
+    print("Next steps:")
+    print("  1. Add  zaiToken  to config.js:")
+    print("       zaiToken: process.env.ZAI_TOKEN || '',")
+    print("  2. Set the env variable before starting:")
+    print("       set ZAI_TOKEN=<your_jwt>   (Windows CMD)")
+    print("       $env:ZAI_TOKEN='<your_jwt>' (PowerShell)")
+    print("       export ZAI_TOKEN='<your_jwt>' (Linux/macOS)")
+
+
+if __name__ == "__main__":
+    target = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("main.js")
+
+    if not target.exists():
+        print(f"✗  File not found: {target}")
+        sys.exit(1)
+
+    patch(target)
+
+
+
+================================================================================
+PATCHER IMPLEMENTATION REPORT
+================================================================================
+File: py script (patch_main.py)
+Purpose: Add ZAI_TOKEN fast-path to initializeSession() in main.js
+
+================================================================================
+1. SCRIPT OVERVIEW
+================================================================================
+
+The patcher modifies the initializeSession() function in main.js to add a
+fast-path that uses a hardcoded ZAI_TOKEN, bypassing the guest initialization
+flow. This allows direct authentication using a JWT token instead of the
+standard guest session creation process.
+
+--------------------------------------------------------------------------------
+File Information:
+- Name: patch_main.py
+- Type: Python 3 script
+- Dependencies: sys, shutil, pathlib
+- Executable: Yes (#!/usr/bin/env python3)
+
+================================================================================
+2. USAGE INSTRUCTIONS
+================================================================================
+
+Basic Usage:
+  python patch_main.py              # Patches main.js in current directory
+  python patch_main.py server.js    # Patches a different file
+
+Examples:
+  # Patch default file (main.js)
+  $ python patch_main.py
+  
+  # Patch custom file
+  $ python patch_main.py app/main.js
+  
+  # Patch with absolute path
+  $ python patch_main.py /path/to/main.js
+
+================================================================================
+3. PATCH DETAILS
+================================================================================
+
+3.1 Target Function Block (OLD Code)
+------------------------------------
+The script searches for the exact start of the initializeSession() function:
+
+```javascript
+async function initializeSession() {
+  if (session.initializing) {
+    await new Promise(resolve => {
+      const check = setInterval(() => {
+        if (!session.initializing) { clearInterval(check); resolve(); }
+      }, 100);
+    });
+    return;
+  }
+
+  session.initializing = true;
+  console.log("[Session] Initializing Z.AI session...");
+
+
+

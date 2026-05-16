@@ -65,20 +65,7 @@ setInterval(() => {
   for (const [id, s] of sessions) {
     if (now - s.lastUsed > SESSION_TTL) sessions.delete(id);
   }
-}, 5 * 60 * 1000); // check every 5 minutes
-
-const CORE_INSTRUCTIONS = `CRITICAL INSTRUCTIONS (ALWAYS FOLLOW):
-1. When using tools, ALWAYS output tool calls in XML format like: <tool_call<function=name><parameter=key>value</parameter></function></tool_call
-   NEVER use JSON or markdown code blocks for tool calls.
-2. Follow every instruction in the prompt deeply and thoroughly. Execute tasks completely.
-3. Also One rule only applies if my prompt includes this string "You are Roo" if it does then when changing modes with function switch_mode function toolcall dont ever forget parameter mode_slug or else it will likely fail and heres the tool usage for making todo list use it when doing complex task etc
- <update_todo_list>
-<todos>
-- [ ] Create a .test file with content "im good"
-- [ ] Read C:\\key.txt and display its contents
-</todos>
-</update_todo_list> this is only a example of tool usage if my Prompt doesnt includes You are Roo then ignore This rule
-4. When using attempt_completion, ALWAYS use <parameter=result> - NEVER use <parameter=message> or <parameter=summary>. The parameter MUST be named "result".`;
+}, 5 * 60 * 1000);
 
 // ============== MIDDLEWARE ==============
 
@@ -96,7 +83,6 @@ function authMiddleware(req, res, next) {
   if (!config.auth.enabled) return next();
   const authHeader = req.headers.authorization;
   const token = authHeader?.replace(/^Bearer\s+/i, "").replace(/^x-api-key\s+/i, "");
-  // Also accept x-api-key header (Anthropic SDK style)
   const apiKey = req.headers["x-api-key"];
   const provided = token || apiKey;
   if (provided !== config.auth.token) {
@@ -108,7 +94,212 @@ function authMiddleware(req, res, next) {
   next();
 }
 
-// ============== UTILITY FUNCTIONS ==============
+const CORE_INSTRUCTIONS = `CRITICAL INSTRUCTIONS (ALWAYS FOLLOW):
+1. When using tools, ALWAYS output tool calls in XML format like: <tool_call<function=name><parameter=key>value</parameter></function></tool_call
+   NEVER use JSON or markdown code blocks for tool calls.
+2. Follow every instruction in the prompt deeply and thoroughly. Execute tasks completely.
+3. Also One rule only applies if my prompt includes this string "You are Roo" if it does then when changing modes with function switch_mode function toolcall dont ever forget parameter mode_slug or else it will likely fail and heres the tool usage for making todo list use it when doing complex task etc
+ <update_todo_list>
+<todos>
+- [ ] Create a .test file with content "im good"
+- [ ] Read C:\\key.txt and display its contents
+</todos>
+</update_todo_list> this is only a example of tool usage if my Prompt doesnt includes You are Roo then ignore This rule
+4. When using attempt_completion, ALWAYS use <parameter=result> - NEVER use <parameter=message> or <parameter=summary>. The parameter MUST be named "result".`;
+
+// ============================================================
+// ── TOOL COMPATIBILITY LAYER ─────────────────────────────────
+// Z.AI does not support the tools/tool_choice fields natively.
+// We convert them into a prompt-engineering system message that
+// instructs the model to emit a parseable XML tool-call block
+// when it wants to invoke a function.  The response is then
+// intercepted and re-serialised into proper tool_use blocks
+// before being returned to the caller.
+// ============================================================
+
+/**
+ * Convert an Anthropic-format tool definition array → OAI-format tool array.
+ * Anthropic uses  { name, description, input_schema }
+ * OAI uses        { type:"function", function:{ name, description, parameters } }
+ */
+function anthropicToolsToOAI(tools) {
+  if (!Array.isArray(tools)) return [];
+  return tools.map(t => ({
+    type: "function",
+    function: {
+      name: t.name,
+      description: t.description || "",
+      parameters: t.input_schema || { type: "object", properties: {} },
+    },
+  }));
+}
+
+/**
+ * Build the tool-shim system message that is prepended to the message array
+ * sent to Z.AI.  The model is told to respond with a specific XML envelope
+ * whenever it decides to call a tool so we can parse it back out.
+ *
+ * Format the model must produce:
+ *
+ *   <tool_invoke>
+ *   <tool_name>get_weather</tool_name>
+ *   <tool_input>{"location":"Beijing","unit":"celsius"}</tool_input>
+ *   </tool_invoke>
+ *
+ * Nothing else should appear on that turn when a tool is being called.
+ */
+function buildToolShimMessage(oaiTools, toolChoice) {
+  const toolDefs = oaiTools.map(t => {
+    const fn = t.function;
+    return [
+      `### Tool: ${fn.name}`,
+      `Description: ${fn.description || "(no description)"}`,
+      `Parameters (JSON Schema):`,
+      JSON.stringify(fn.parameters, null, 2),
+    ].join("\n");
+  }).join("\n\n");
+
+  // Resolve tool_choice to a hint string.
+  // Handles all four formats:
+  //   OAI string:   "auto" | "required" | "none"
+  //   OAI object:   { type:"function", function:{ name:"..." } }
+  //   Anthropic:    { type:"auto" } | { type:"any" } | { type:"none" } | { type:"tool", name:"..." }
+  let choiceHint = "";
+  if (toolChoice) {
+    // Normalise to a simple string key for easier comparison
+    let tcType = "";
+    let tcName = "";
+
+    if (typeof toolChoice === "string") {
+      tcType = toolChoice.toLowerCase();  // "auto" | "required" | "none"
+    } else if (typeof toolChoice === "object") {
+      tcType = (toolChoice.type || "").toLowerCase();
+      // OAI forced: { type:"function", function:{ name } }
+      // Anthropic forced: { type:"tool", name }
+      tcName = toolChoice.function?.name || toolChoice.name || "";
+    }
+
+    if (tcType === "none") {
+      choiceHint = "\nDo NOT call any tools. Respond in plain text only.";
+    } else if (tcType === "required" || tcType === "any") {
+      // OAI "required" == Anthropic "any" — model MUST call a tool
+      choiceHint = "\nYou MUST call one of the tools above. Do not respond in plain text — only output the <tool_invoke> XML block.";
+    } else if ((tcType === "function" || tcType === "tool") && tcName) {
+      // Forced specific tool
+      choiceHint = `\nYou MUST call the tool named "${tcName}". Do not respond in plain text — only output the <tool_invoke> XML block for that tool.`;
+    }
+    // "auto" / "" → no hint, model decides
+  }
+
+  const shimText = `\
+You have access to the following tools. When you need to call a tool, respond ONLY with the XML block below and nothing else on that turn. Do not include any explanation, preamble, or follow-up text alongside the XML — the caller will send you the result and you can then continue.
+
+TOOL CALL FORMAT (use exactly this XML, no markdown fences):
+<tool_invoke>
+<tool_name>TOOL_NAME_HERE</tool_name>
+<tool_input>{"param1":"value1","param2":"value2"}</tool_input>
+</tool_invoke>
+
+Rules:
+- tool_input MUST be valid JSON.
+- Only call one tool per response.
+- If no tool is needed, respond normally in plain text — do NOT emit the XML block.
+- Never invent tool names. Only use tools listed below.${choiceHint}
+
+AVAILABLE TOOLS:
+${toolDefs}`;
+
+  return { role: "system", content: shimText };
+}
+
+/**
+ * Detect whether a completed response contains a tool invocation shim block.
+ */
+function hasToolInvokeBlock(content) {
+  return /<tool_invoke>[\s\S]*?<\/tool_invoke>/i.test(content);
+}
+
+/**
+ * Parse <tool_invoke> blocks out of a response string.
+ * Returns an array of { name, input } objects (input is a parsed JS object).
+ */
+function parseToolInvokeBlocks(content) {
+  const results = [];
+  const re = /<tool_invoke>([\s\S]*?)<\/tool_invoke>/gi;
+  let m;
+  while ((m = re.exec(content)) !== null) {
+    const inner = m[1];
+    const nameMatch  = /<tool_name>\s*([\s\S]*?)\s*<\/tool_name>/i.exec(inner);
+    const inputMatch = /<tool_input>([\s\S]*?)<\/tool_input>/i.exec(inner);
+    if (!nameMatch) continue;
+    const name = nameMatch[1].trim();
+    let input = {};
+    if (inputMatch) {
+      try { input = JSON.parse(inputMatch[1].trim()); }
+      catch (e) { input = { raw: inputMatch[1].trim() }; }
+    }
+    results.push({ name, input });
+  }
+  return results;
+}
+
+/**
+ * Strip <tool_invoke> blocks from a response string (leaves surrounding text).
+ */
+function removeToolInvokeBlocks(content) {
+  return content.replace(/<tool_invoke>[\s\S]*?<\/tool_invoke>/gi, "").trim();
+}
+
+/**
+ * Convert parsed tool-invoke blocks → Anthropic tool_use content blocks.
+ */
+function toolInvokesToAnthropicBlocks(invocations) {
+  return invocations.map(inv => ({
+    type: "tool_use",
+    id: `toolu_${generateId().substring(0, 24)}`,
+    name: inv.name,
+    input: inv.input,
+  }));
+}
+
+/**
+ * Convert parsed tool-invoke blocks → OAI tool_calls array.
+ */
+function toolInvokesToOAIToolCalls(invocations) {
+  return invocations.map(inv => ({
+    id: `call_${generateId().substring(0, 24)}`,
+    type: "function",
+    function: {
+      name: inv.name,
+      arguments: JSON.stringify(inv.input),
+    },
+  }));
+}
+
+/**
+ * Inject the tool shim into an OAI-format messages array.
+ * The shim is inserted as a system message at position 0
+ * (or merged with an existing system message at position 0).
+ */
+function injectToolShimIntoMessages(messages, oaiTools, toolChoice) {
+  if (!oaiTools || oaiTools.length === 0) return messages;
+  const shimMsg = buildToolShimMessage(oaiTools, toolChoice);
+  const result = [...messages];
+  if (result.length > 0 && result[0].role === "system") {
+    // Merge with existing system message
+    result[0] = {
+      ...result[0],
+      content: shimMsg.content + "\n\n---\n\n" + result[0].content,
+    };
+  } else {
+    result.unshift(shimMsg);
+  }
+  return result;
+}
+
+// ============================================================
+// ── END TOOL COMPATIBILITY LAYER ─────────────────────────────
+// ============================================================
 
 function generateId() {
   return crypto.randomBytes(16).toString("hex");
@@ -140,9 +331,6 @@ function getMessageContent(content) {
   return String(content);
 }
 
-// ── Convert Anthropic messages format → flat prompt string ──
-// Used ONLY for signature_prompt computation (HMAC signing).
-// The actual messages array is forwarded via anthropicToOpenAIMessages().
 function anthropicMessagesToPrompt(messages, systemPrompt, includeToolInstructions = true) {
   let prompt = "";
 
@@ -187,17 +375,9 @@ function anthropicMessagesToPrompt(messages, systemPrompt, includeToolInstructio
   return prompt.trim();
 }
 
-// ── Convert Anthropic messages format → OpenAI messages format ──
-// Preserves ALL structure: roles, tool_use, tool_result, thinking, images, etc.
-// cache_control is the only field intentionally dropped (no OAI equivalent).
-// This is the function used to forward messages to Z.AI without data loss.
 function anthropicToOpenAIMessages(messages, system) {
   const result = [];
 
-  // System prompt → system role message
-  // Anthropic system can be: string | array of {type:"text", text, cache_control?}
-  // OAI equivalent: { role: "system", content: string }
-  // cache_control has no OAI equivalent → dropped (prompt caching is Anthropic-only)
   if (system) {
     const sysText = typeof system === "string"
       ? system
@@ -210,34 +390,25 @@ function anthropicToOpenAIMessages(messages, system) {
   for (const msg of messages) {
     const { role, content } = msg;
 
-    // Simple string content — pass through directly
     if (typeof content === "string") {
       result.push({ role, content });
       continue;
     }
 
-    // Non-array, non-string — coerce
     if (!Array.isArray(content)) {
       result.push({ role, content: String(content ?? "") });
       continue;
     }
 
-    // Structured content blocks — decompose into OpenAI format
     const textParts = [];
-    const imageParts = [];   // OAI image_url content parts
+    const imageParts = [];
     const toolCalls = [];
     const toolResultBlocks = [];
 
     for (const block of content) {
       if (block.type === "text") {
-        // Anthropic: { type: "text", text: "...", cache_control?: {type:"ephemeral"} }
-        // OAI: text joined into content string
-        // cache_control → dropped (no OAI equivalent, prompt caching is Anthropic-only)
         textParts.push(block.text);
       } else if (block.type === "tool_use") {
-        // Anthropic: { type: "tool_use", id: "toolu_...", name: "func", input: {...} }
-        // OAI: { id, type: "function", function: { name, arguments: JSON.stringify(input) } }
-        // Note: Anthropic's input is a parsed object; OAI's arguments is a JSON string
         toolCalls.push({
           id: block.id || `call_${generateId().substring(0, 24)}`,
           type: "function",
@@ -249,10 +420,6 @@ function anthropicToOpenAIMessages(messages, system) {
           }
         });
       } else if (block.type === "tool_result") {
-        // Anthropic: { type: "tool_result", tool_use_id: "toolu_...", content: string|[{type:"text",...}], is_error?: bool }
-        // OAI: separate { role: "tool", tool_call_id, content: string }
-        // is_error → dropped (no OAI equivalent; errors are just in the content text)
-        // content can be string or array of content blocks
         const resultContent = typeof block.content === "string"
           ? block.content
           : Array.isArray(block.content)
@@ -269,16 +436,10 @@ function anthropicToOpenAIMessages(messages, system) {
           content: resultContent,
         });
       } else if (block.type === "thinking") {
-        // Anthropic: { type: "thinking", thinking: "..." }
-        // OAI has no native thinking block. Preserved as tagged text so nothing is lost.
         textParts.push(`[Thinking: ${block.thinking || ""}]`);
       } else if (block.type === "redacted_thinking") {
-        // Anthropic: { type: "redacted_thinking" }
-        // No content to forward — just a marker that thinking was redacted
         textParts.push("[Redacted Thinking]");
       } else if (block.type === "image") {
-        // Anthropic: { type: "image", source: { type: "base64"|"url", media_type, data|url } }
-        // OAI: { type: "image_url", image_url: { url: "data:...;base64,..." | "https://..." } }
         if (block.source?.type === "base64") {
           const dataUrl = `data:${block.source.media_type};base64,${block.source.data}`;
           imageParts.push({ type: "image_url", image_url: { url: dataUrl } });
@@ -288,23 +449,17 @@ function anthropicToOpenAIMessages(messages, system) {
           textParts.push(`[Image: ${block.source?.type || "unknown"}]`);
         }
       } else if (block.type === "document") {
-        // Anthropic: { type: "document", source: { type: "base64", media_type, data }, title?, context? }
-        // OAI has no document block — extract text if available, otherwise base64 reference
         if (block.title) textParts.push(`[Document: ${block.title}]`);
         else textParts.push(`[Document: ${block.source?.media_type || "unknown"}]`);
         if (block.context) textParts.push(block.context);
       } else if (block.text) {
-        // Fallback: unknown block type that has a text field
         textParts.push(block.text);
       }
     }
 
-    // Build the primary message
-    // OAI content can be: string | null | array of content parts (text + image_url)
     const msgObj = { role };
 
     if (imageParts.length > 0) {
-      // Mixed text + image → use OAI content array format
       const contentArr = [];
       if (textParts.length > 0) {
         contentArr.push({ type: "text", text: textParts.join("\n") });
@@ -314,7 +469,7 @@ function anthropicToOpenAIMessages(messages, system) {
     } else if (textParts.length > 0) {
       msgObj.content = textParts.join("\n");
     } else if (toolCalls.length > 0) {
-      msgObj.content = null; // OpenAI convention: null content when only tool_calls
+      msgObj.content = null;
     } else {
       msgObj.content = "";
     }
@@ -325,7 +480,6 @@ function anthropicToOpenAIMessages(messages, system) {
 
     result.push(msgObj);
 
-    // Tool result messages are emitted as separate "tool" role messages
     for (const tr of toolResultBlocks) {
       result.push(tr);
     }
@@ -334,8 +488,6 @@ function anthropicToOpenAIMessages(messages, system) {
   return result;
 }
 
-// Legacy OpenAI format → prompt (kept for signature_prompt ONLY)
-// The actual messages array is forwarded as-is to Z.AI.
 function messagesToPrompt(messages, includeToolInstructions = true) {
   if (!Array.isArray(messages)) return String(messages);
 
@@ -350,7 +502,7 @@ function messagesToPrompt(messages, includeToolInstructions = true) {
   return prompt.trim();
 }
 
-// ── Tool call parsers (unchanged from original) ──
+// ── Tool call parsers (unchanged) ──
 
 function parseToolCalls(content) {
   const toolCalls = [];
@@ -565,6 +717,10 @@ function hasIncompleteToolCall(content) {
     /<TodoWrite>(?![\s\S]*<\/TodoWrite>)/,
     /<AskUserQuestion>(?![\s\S]*<\/AskUserQuestion>)/,
     /<tool_call<[A-Za-z]+>(?![\s\S]*<\/[A-Za-z]+>)/,
+    // Also buffer incomplete tool_invoke blocks (from our shim)
+    /<tool_invoke>(?![\s\S]*<\/tool_invoke>)/i,
+    /<tool_name>(?![\s\S]*<\/tool_name>)/i,
+    /<tool_input>(?![\s\S]*<\/tool_input>)/i,
   ];
   for (const p of patterns) if (p.test(content)) return true;
   return false;
@@ -574,11 +730,6 @@ function hasIncompleteToolCall(content) {
 // ── FORMAT HELPERS ──────────────────────────────────────────
 // ============================================================
 
-// ── Anthropic /v1/messages format ──
-
-/**
- * Convert parsed tool calls (OpenAI style) → Anthropic tool_use content blocks
- */
 function toolCallsToAnthropicBlocks(toolCalls) {
   return toolCalls.map(tc => ({
     type: "tool_use",
@@ -591,25 +742,29 @@ function toolCallsToAnthropicBlocks(toolCalls) {
   }));
 }
 
-/**
- * Build a full non-streaming Anthropic response object
- */
-function formatAnthropicResponse(fullContent, model, requestId) {
-  const timestamp = Math.floor(Date.now() / 1000);
+function formatAnthropicResponse(fullContent, model, requestId, shimToolInvocations = []) {
   const msgId = `msg_${requestId}`;
-  const toolCalls = config.parseTool ? parseToolCalls(fullContent) : [];
-  const cleanText = toolCalls.length > 0 ? removeToolCallsFromContent(fullContent) : fullContent;
+
+  // Prefer shim-parsed tool invocations if present, else fall back to legacy parser
+  let toolBlocks = [];
+  let cleanText = fullContent;
+
+  if (shimToolInvocations.length > 0) {
+    toolBlocks = toolInvokesToAnthropicBlocks(shimToolInvocations);
+    cleanText = removeToolInvokeBlocks(fullContent);
+  } else if (config.parseTool) {
+    const toolCalls = parseToolCalls(fullContent);
+    if (toolCalls.length > 0) {
+      toolBlocks = toolCallsToAnthropicBlocks(toolCalls);
+      cleanText = removeToolCallsFromContent(fullContent);
+    }
+  }
 
   const contentBlocks = [];
-
   if (cleanText && cleanText.trim()) {
     contentBlocks.push({ type: "text", text: cleanText });
   }
-
-  if (toolCalls.length > 0) {
-    contentBlocks.push(...toolCallsToAnthropicBlocks(toolCalls));
-  }
-
+  contentBlocks.push(...toolBlocks);
   if (contentBlocks.length === 0) {
     contentBlocks.push({ type: "text", text: "" });
   }
@@ -620,7 +775,7 @@ function formatAnthropicResponse(fullContent, model, requestId) {
     role: "assistant",
     model: model || "claude-sonnet-4-6",
     content: contentBlocks,
-    stop_reason: toolCalls.length > 0 ? "tool_use" : "end_turn",
+    stop_reason: toolBlocks.length > 0 ? "tool_use" : "end_turn",
     stop_sequence: null,
     usage: {
       input_tokens: estimateTokens(fullContent),
@@ -629,98 +784,11 @@ function formatAnthropicResponse(fullContent, model, requestId) {
   };
 }
 
-/**
- * Build SSE event string
- */
 function sseEvent(event, data) {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
-/**
- * Stream Anthropic SSE events for a given full content string (called once at end)
- * For true streaming, we send deltas as they arrive — see the route handler.
- */
-function buildAnthropicStreamEvents(fullContent, model, requestId, inputTokens) {
-  const msgId = `msg_${requestId}`;
-  const toolCalls = config.parseTool ? parseToolCalls(fullContent) : [];
-  const cleanText = toolCalls.length > 0 ? removeToolCallsFromContent(fullContent) : fullContent;
-
-  const events = [];
-
-  // message_start
-  events.push(sseEvent("message_start", {
-    type: "message_start",
-    message: {
-      id: msgId,
-      type: "message",
-      role: "assistant",
-      model: model || "claude-sonnet-4-6",
-      content: [],
-      stop_reason: null,
-      stop_sequence: null,
-      usage: { input_tokens: inputTokens, output_tokens: 0 }
-    }
-  }));
-
-  let blockIndex = 0;
-
-  // Text block
-  if (cleanText && cleanText.trim()) {
-    events.push(sseEvent("content_block_start", {
-      type: "content_block_start",
-      index: blockIndex,
-      content_block: { type: "text", text: "" }
-    }));
-    events.push(sseEvent("content_block_delta", {
-      type: "content_block_delta",
-      index: blockIndex,
-      delta: { type: "text_delta", text: cleanText }
-    }));
-    events.push(sseEvent("content_block_stop", {
-      type: "content_block_stop",
-      index: blockIndex
-    }));
-    blockIndex++;
-  }
-
-  // Tool use blocks
-  for (const tc of toolCallsToAnthropicBlocks(toolCalls)) {
-    const inputJson = JSON.stringify(tc.input);
-    events.push(sseEvent("content_block_start", {
-      type: "content_block_start",
-      index: blockIndex,
-      content_block: { type: "tool_use", id: tc.id, name: tc.name, input: {} }
-    }));
-    events.push(sseEvent("content_block_delta", {
-      type: "content_block_delta",
-      index: blockIndex,
-      delta: { type: "input_json_delta", partial_json: inputJson }
-    }));
-    events.push(sseEvent("content_block_stop", {
-      type: "content_block_stop",
-      index: blockIndex
-    }));
-    blockIndex++;
-  }
-
-  const outputTokens = estimateTokens(fullContent);
-  const stopReason = toolCalls.length > 0 ? "tool_use" : "end_turn";
-
-  events.push(sseEvent("message_delta", {
-    type: "message_delta",
-    delta: { stop_reason: stopReason, stop_sequence: null },
-    usage: { output_tokens: outputTokens }
-  }));
-
-  events.push(sseEvent("message_stop", { type: "message_stop" }));
-  events.push(`data: [DONE]\n\n`);
-
-  return events;
-}
-
-// ── OpenAI /v1/chat/completions format (unchanged) ──
-
-function formatOpenAIResponse(result, model, requestId, stream = false, fullContent = null) {
+function formatOpenAIResponse(result, model, requestId, stream = false, fullContent = null, shimToolInvocations = []) {
   const timestamp = Math.floor(Date.now() / 1000);
   const rawContent = result.content || result.text || "";
 
@@ -736,7 +804,14 @@ function formatOpenAIResponse(result, model, requestId, stream = false, fullCont
     }
 
     const contentToCheck = fullContent || rawContent;
-    const toolCalls = config.parseTool ? parseToolCalls(contentToCheck) : [];
+
+    // Prefer shim invocations, then legacy parser
+    let toolCalls = [];
+    if (shimToolInvocations && shimToolInvocations.length > 0) {
+      toolCalls = toolInvokesToOAIToolCalls(shimToolInvocations);
+    } else if (config.parseTool) {
+      toolCalls = parseToolCalls(contentToCheck);
+    }
 
     if (toolCalls.length > 0) {
       return {
@@ -766,8 +841,17 @@ function formatOpenAIResponse(result, model, requestId, stream = false, fullCont
     };
   }
 
-  const toolCalls = config.parseTool ? parseToolCalls(rawContent) : [];
-  const cleanContent = toolCalls.length > 0 ? removeToolCallsFromContent(rawContent) : rawContent;
+  // Non-streaming
+  let toolCalls = [];
+  let cleanContent = rawContent;
+
+  if (shimToolInvocations && shimToolInvocations.length > 0) {
+    toolCalls = toolInvokesToOAIToolCalls(shimToolInvocations);
+    cleanContent = removeToolInvokeBlocks(rawContent);
+  } else if (config.parseTool) {
+    toolCalls = parseToolCalls(rawContent);
+    cleanContent = toolCalls.length > 0 ? removeToolCallsFromContent(rawContent) : rawContent;
+  }
 
   return {
     id: `chatcmpl-${requestId}`,
@@ -860,28 +944,6 @@ async function initializeSession() {
   }
 
   session.initializing = true;
-
-  // ── Fast path: use hardcoded ZAI_TOKEN, skip guest flow ──
-  if (config.zaiToken) {
-    console.log("[Session] Using hardcoded ZAI_TOKEN, skipping guest init.");
-    session.token = config.zaiToken;
-    try {
-      const parts = session.token.split(".");
-      const padded = parts[1] + "==";
-      const payload = JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
-      session.userId = payload.id || "";
-      session.userName = (payload.email || "User").split("@")[0];
-      console.log(`[Session] Token user: ${session.userId.substring(0, 8)}... (${session.userName})`);
-    } catch (e) {
-      console.warn("[Session] Token decode failed, continuing with raw token.");
-      session.userId = "";
-      session.userName = "User";
-    }
-    session.initialized = true;
-    session.initializing = false;
-    return;
-  }
-
   console.log("[Session] Initializing Z.AI session...");
 
   try {
@@ -940,7 +1002,23 @@ async function initializeSession() {
   }
 }
 
-
+function getContextVars() {
+  const now = new Date();
+  const pad = n => String(n).padStart(2, "0");
+  const date = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}`;
+  const time = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  const days = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+  return {
+    "{{USER_NAME}}": session.userName,
+    "{{USER_LOCATION}}": "Unknown",
+    "{{CURRENT_DATETIME}}": `${date} ${time}`,
+    "{{CURRENT_DATE}}": date,
+    "{{CURRENT_TIME}}": time,
+    "{{CURRENT_WEEKDAY}}": days[now.getDay()],
+    "{{CURRENT_TIMEZONE}}": "Europe/Paris",
+    "{{USER_LANGUAGE}}": "en-US"
+  };
+}
 
 async function* sendToZAI(prompt, options = {}) {
   const {
@@ -951,14 +1029,13 @@ async function* sendToZAI(prompt, options = {}) {
     previewMode = session.features.previewMode,
     chatId = session.chatId,
     messages = session.messages,
-    clientMessages = null,  // Structured messages from client — forwarded as-is
+    clientMessages = null,
   } = options;
 
   if (!session.initialized) await initializeSession();
 
   const { signature, urlParams } = generateZaSignature(prompt, session.token, session.userId);
-  // const url = `${BASE_URL}/api/v2/chat/completions?${urlParams}`;
-  const url = `${BASE_URL}/api/v2/chat/completions`;
+  const url = `${BASE_URL}/api/v2/chat/completions?${urlParams}`;
 
   const headers = {
     "Origin": BASE_URL,
@@ -969,19 +1046,15 @@ async function* sendToZAI(prompt, options = {}) {
     "Content-Type": "application/json"
   };
 
-  // ── Forward structured messages, NOT flattened prompt ──
-  // When clientMessages are provided (from API routes), use them directly.
-  // Otherwise, fall back to legacy behavior (append flat prompt to session history).
   const forwardedMessages = clientMessages
     ? clientMessages
     : [...messages, { role: "user", content: prompt }];
 
-  // Build the request body — forward all client-provided fields
   const requestBody = {
     model,
     chat_id: chatId,
-    messages: forwardedMessages,       // ← structured messages forwarded as-is
-    signature_prompt: prompt,           // ← flat string still used for HMAC signing (unchanged)
+    messages: forwardedMessages,
+    signature_prompt: prompt,
     stream: true,
     features: {
       image_generation: imageGen,
@@ -990,16 +1063,15 @@ async function* sendToZAI(prompt, options = {}) {
       preview_mode: previewMode,
       flags: [],
       enable_thinking: thinking
-    }
+    },
+    variables: getContextVars(),
+    background_tasks: { title_generation: true, tags_generation: true }
   };
 
   const body = JSON.stringify(requestBody);
 
   if (config.logging.level === "debug") {
-    console.log("[DEBUG] Z.AI url", url);
     console.log("[DEBUG] Z.AI request body:", body);
-    console.log("[DEBUG] Z.AI request headers", JSON.stringify(headers, null, 2));
-    
   }
 
   let res;
@@ -1301,6 +1373,8 @@ app.post("/v1/messages", authMiddleware, async (req, res) => {
     messages,
     system,
     stream = false,
+    tools: anthropicTools,       // Anthropic tool definitions (may be present)
+    tool_choice: toolChoice,     // Anthropic tool_choice (may be present)
   } = req.body;
 
   if (!messages || !Array.isArray(messages)) {
@@ -1310,15 +1384,22 @@ app.post("/v1/messages", authMiddleware, async (req, res) => {
   const reqSession = getOrCreateSession(req);
   const requestId = generateId();
 
-  // ── KEY CHANGE: Forward structured messages, flatten ONLY for signature ──
-  // 1) Convert Anthropic-format messages → OpenAI-format messages (lossless)
-  const openaiMessages = anthropicToOpenAIMessages(messages, system);
+  // ── Tool shim: convert Anthropic tools → OAI, then inject as system message ──
+  const oaiTools = anthropicTools ? anthropicToolsToOAI(anthropicTools) : [];
+  const hasTools = oaiTools.length > 0;
 
-  // 2) Flatten to prompt string ONLY for signature_prompt / HMAC signing (unchanged behavior)
+  // Build OAI messages (lossless conversion)
+  let openaiMessages = anthropicToOpenAIMessages(messages, system);
+
+  // Inject tool shim system message if tools are present
+  if (hasTools) {
+    openaiMessages = injectToolShimIntoMessages(openaiMessages, oaiTools, toolChoice);
+  }
+
+  // Flatten to prompt string for HMAC signing only
   const prompt = anthropicMessagesToPrompt(messages, system);
   const inputTokens = estimateTokens(prompt);
 
-  // Map claude-* model names to a Z.AI model
   const zaiModel = (() => {
     const m = (model || "").toLowerCase();
     if (m.includes("opus"))   return "GLM-5-Turbo";
@@ -1347,7 +1428,6 @@ app.post("/v1/messages", authMiddleware, async (req, res) => {
 
     const msgId = `msg_${requestId}`;
 
-    // Send message_start immediately
     res.write(sseEvent("message_start", {
       type: "message_start",
       message: {
@@ -1362,7 +1442,6 @@ app.post("/v1/messages", authMiddleware, async (req, res) => {
       }
     }));
 
-    // Ping to keep connection alive
     const keepAlive = setInterval(() => {
       try { res.write(": ping\n\n"); } catch (e) { clearInterval(keepAlive); }
     }, 5000);
@@ -1376,12 +1455,12 @@ app.post("/v1/messages", authMiddleware, async (req, res) => {
       for await (const chunk of sendToZAI(prompt, opts)) {
         fullContent += chunk;
 
-        // Buffer while a tool call is still being built
+        // Buffer while any tool call (shim or legacy) is still being assembled
+        if (hasTools && hasIncompleteToolCall(fullContent)) continue;
         if (config.parseTool && hasIncompleteToolCall(fullContent)) continue;
 
         const delta = fullContent.substring(sentContent.length);
         if (delta) {
-          // Open text block on first real delta
           if (!textBlockOpen) {
             res.write(sseEvent("content_block_start", {
               type: "content_block_start",
@@ -1390,7 +1469,6 @@ app.post("/v1/messages", authMiddleware, async (req, res) => {
             }));
             textBlockOpen = true;
           }
-
           res.write(sseEvent("content_block_delta", {
             type: "content_block_delta",
             index: textBlockIndex,
@@ -1400,7 +1478,7 @@ app.post("/v1/messages", authMiddleware, async (req, res) => {
         }
       }
 
-      // Flush any remaining buffered content
+      // Flush remaining
       const remaining = fullContent.substring(sentContent.length);
       if (remaining) {
         if (!textBlockOpen) {
@@ -1418,7 +1496,7 @@ app.post("/v1/messages", authMiddleware, async (req, res) => {
         }));
       }
 
-      // Close text block if open
+      // Close text block
       if (textBlockOpen) {
         res.write(sseEvent("content_block_stop", {
           type: "content_block_stop",
@@ -1427,11 +1505,23 @@ app.post("/v1/messages", authMiddleware, async (req, res) => {
         textBlockOpen = false;
       }
 
-      // Parse tool calls from complete content and emit as tool_use blocks
-      const toolCalls = config.parseTool ? parseToolCalls(fullContent) : [];
-      let blockIdx = textBlockIndex + 1;
+      // ── Resolve tool invocations ──
+      // Prefer shim-format blocks; fall back to legacy parseToolCalls
+      let shimInvocations = [];
+      let legacyToolCalls = [];
 
-      for (const tc of toolCallsToAnthropicBlocks(toolCalls)) {
+      if (hasTools && hasToolInvokeBlock(fullContent)) {
+        shimInvocations = parseToolInvokeBlocks(fullContent);
+      } else if (config.parseTool) {
+        legacyToolCalls = parseToolCalls(fullContent);
+      }
+
+      const anthropicToolBlocks = shimInvocations.length > 0
+        ? toolInvokesToAnthropicBlocks(shimInvocations)
+        : toolCallsToAnthropicBlocks(legacyToolCalls);
+
+      let blockIdx = textBlockIndex + 1;
+      for (const tc of anthropicToolBlocks) {
         const inputJson = JSON.stringify(tc.input);
         res.write(sseEvent("content_block_start", {
           type: "content_block_start",
@@ -1451,7 +1541,7 @@ app.post("/v1/messages", authMiddleware, async (req, res) => {
       }
 
       const outputTokens = estimateTokens(fullContent);
-      const stopReason = toolCalls.length > 0 ? "tool_use" : "end_turn";
+      const stopReason = anthropicToolBlocks.length > 0 ? "tool_use" : "end_turn";
 
       res.write(sseEvent("message_delta", {
         type: "message_delta",
@@ -1462,7 +1552,6 @@ app.post("/v1/messages", authMiddleware, async (req, res) => {
       res.write(sseEvent("message_stop", { type: "message_stop" }));
       res.write(`data: [DONE]\n\n`);
 
-      // ── History persistence (toggle-gated) ──
       if (session.features.persistHistory) {
         reqSession.messages.push({ role: "user", content: prompt });
         if (fullContent) reqSession.messages.push({ role: "assistant", content: fullContent });
@@ -1485,13 +1574,17 @@ app.post("/v1/messages", authMiddleware, async (req, res) => {
         fullContent += chunk;
       }
 
-      // ── History persistence (toggle-gated) ──
       if (session.features.persistHistory) {
         reqSession.messages.push({ role: "user", content: prompt });
         if (fullContent) reqSession.messages.push({ role: "assistant", content: fullContent });
       }
 
-      res.json(formatAnthropicResponse(fullContent, model, requestId));
+      // Resolve tool invocations
+      const shimInvocations = (hasTools && hasToolInvokeBlock(fullContent))
+        ? parseToolInvokeBlocks(fullContent)
+        : [];
+
+      res.json(formatAnthropicResponse(fullContent, model, requestId, shimInvocations));
     } catch (e) {
       console.error("[Anthropic API] Error:", e.message);
       const statusCode = e.message.includes("401") ? 401 : 500;
@@ -1506,7 +1599,6 @@ app.post("/v1/messages", authMiddleware, async (req, res) => {
 
 const knownModels = [
   "glm-4.7", "glm-5", "GLM-5-Turbo", "GLM-5v-Turbo", "GLM-5.1",
-  // Also advertise Anthropic model names so Claude Code's model probe passes
   "claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001",
 ];
 
@@ -1528,7 +1620,16 @@ app.get("/models", authMiddleware, (req, res) => {
 });
 
 app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
-  const { model = "glm-5", messages, stream = true, deepThink, search, webSearch } = req.body;
+  const {
+    model = "glm-5",
+    messages,
+    stream = true,
+    deepThink,
+    search,
+    webSearch,
+    tools: oaiToolsRaw,      // OAI tool definitions (may be present)
+    tool_choice: toolChoice, // OAI tool_choice (may be present)
+  } = req.body;
 
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json(formatOpenAIError("messages is required and must be an array", "invalid_request_error"));
@@ -1537,9 +1638,15 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
   const reqSession = getOrCreateSession(req);
   const requestId = generateId();
 
-  // ── KEY CHANGE: Forward structured messages, flatten ONLY for signature ──
-  // 1) Use client messages array directly (already in OpenAI format)
-  // 2) Flatten to prompt string ONLY for signature_prompt / HMAC signing
+  // ── Tool shim: inject into messages if tools are provided ──
+  const oaiTools = Array.isArray(oaiToolsRaw) ? oaiToolsRaw : [];
+  const hasTools = oaiTools.length > 0;
+
+  // Inject shim into messages if tools present; otherwise forward as-is
+  const clientMessages = hasTools
+    ? injectToolShimIntoMessages(messages, oaiTools, toolChoice)
+    : messages;
+
   const prompt = messagesToPrompt(messages);
 
   const opts = {
@@ -1550,7 +1657,7 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
     previewMode: session.features.previewMode,
     chatId: reqSession.chatId,
     messages: reqSession.messages,
-    clientMessages: messages,  // ← structured messages forwarded as-is
+    clientMessages,
   };
 
   if (stream) {
@@ -1576,7 +1683,8 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
     try {
       for await (const chunk of sendToZAI(prompt, opts)) {
         fullContent += chunk;
-        if (config.parseTool && hasIncompleteToolCall(fullContent)) continue;
+        // Buffer while any tool call block is still being assembled
+        if ((hasTools || config.parseTool) && hasIncompleteToolCall(fullContent)) continue;
         const delta = fullContent.substring(sentContent.length);
         if (delta) {
           sentContent = fullContent;
@@ -1591,11 +1699,18 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
         res.write(`data: ${JSON.stringify(c)}\n\n`);
       }
 
-      const finalChunk = formatOpenAIResponse({ content: "", finish_reason: "stop" }, model, requestId, true, fullContent);
+      // Resolve tool invocations for final chunk
+      const shimInvocations = (hasTools && hasToolInvokeBlock(fullContent))
+        ? parseToolInvokeBlocks(fullContent)
+        : [];
+
+      const finalChunk = formatOpenAIResponse(
+        { content: "", finish_reason: "stop" },
+        model, requestId, true, fullContent, shimInvocations
+      );
       res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
       res.write("data: [DONE]\n\n");
 
-      // ── History persistence (toggle-gated) ──
       if (session.features.persistHistory) {
         reqSession.messages.push({ role: "user", content: prompt });
         if (fullContent) reqSession.messages.push({ role: "assistant", content: fullContent });
@@ -1617,13 +1732,16 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
         fullContent += chunk;
       }
 
-      // ── History persistence (toggle-gated) ──
       if (session.features.persistHistory) {
         reqSession.messages.push({ role: "user", content: prompt });
         if (fullContent) reqSession.messages.push({ role: "assistant", content: fullContent });
       }
 
-      res.json(formatOpenAIResponse({ content: fullContent }, model, requestId));
+      const shimInvocations = (hasTools && hasToolInvokeBlock(fullContent))
+        ? parseToolInvokeBlocks(fullContent)
+        : [];
+
+      res.json(formatOpenAIResponse({ content: fullContent }, model, requestId, false, null, shimInvocations));
     } catch (e) {
       console.error("[API] Error:", e.message);
       const statusCode = e.message.includes("401") ? 401 : 500;
@@ -1645,10 +1763,8 @@ app.post("/prompt", authMiddleware, async (req, res) => {
       thinking: deepThink ?? session.features.thinking,
       chatId: reqSession.chatId,
       messages: reqSession.messages,
-      // NOTE: /prompt route has no structured clientMessages — falls back to legacy behavior
     })) { fullContent += chunk; }
 
-    // ── History persistence (toggle-gated) ──
     if (session.features.persistHistory) {
       reqSession.messages.push({ role: "user", content: prompt });
       if (fullContent) reqSession.messages.push({ role: "assistant", content: fullContent });

@@ -69,6 +69,7 @@ module.exports = {
   },
 
   // Tool call parsing (set PARSE_TOOL=false to disable)
+  zaiToken: process.env.ZAI_TOKEN || '',
   parseTool: process.env.PARSE_TOOL === 'true',
 
   // Logging

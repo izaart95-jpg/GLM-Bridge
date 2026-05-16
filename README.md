@@ -1,48 +1,78 @@
-# Z.AI Proxy API
+# GLM Bridge — Z.AI Proxy API
 
-> OpenAI & Anthropic-compatible API proxy for [chat.z.ai](https://chat.z.ai) — available in two modes.
+An OpenAI- and Anthropic-compatible API proxy for [chat.z.ai](https://chat.z.ai), letting you use Z.AI's models through standard API clients like Claude Code, Roo Code, Kilo Code, and any OpenAI-compatible tool.
 
-> ⚠️ **Warning**: If you are getting error 405, it means Z.ai has blocked your IP Address for abusing the web UI models through unofficial API usage.  
-> **Best practice**: Be chill, stop sending requests, wait, and do not send prompts longer than 60,000 characters.
+---
 
-## Overview
+## ⚠️ Important: Model Access & Authentication
+
+Z.AI enforces model access based on account tier. **Guest sessions are restricted to `glm-4.7` and below.** Attempting to use higher-tier models (`glm-5`, `GLM-5-Turbo`, etc.) without a valid logged-in token will fail silently or return degraded responses.
+
+### Unlocking Higher-Tier Models
+
+To use `glm-5`, `GLM-5-Turbo`, or any advanced model, you must authenticate with your Z.AI account token.
+
+**Step 1 — Log in to Z.AI**
+
+Open [https://chat.z.ai](https://chat.z.ai) in your browser and sign in to your account.
+
+**Step 2 — Retrieve your token**
+
+Open browser DevTools (`F12`) and run this in the **Console** tab:
+
+```javascript
+localStorage.getItem('token')
+```
+
+Alternatively, find it under **Application → Local Storage → `https://chat.z.ai`** (key: `token`). The token is also stored in cookies — both locations contain the same value.
+
+**Step 3 — Set the environment variable**
+
+```bash
+# Windows CMD
+set ZAI_TOKEN=<your_token_here>
+
+# Windows PowerShell
+$env:ZAI_TOKEN = "<your_token_here>"
+
+# Linux / macOS
+export ZAI_TOKEN="<your_token_here>"
+```
+
+**Step 4 — Start the server**
+
+```bash
+# npm install
+node main.js
+```
+
+When `ZAI_TOKEN` is set, the server skips guest initialization entirely and uses your account token directly, granting access to all models available on your plan.
+
+> **Security note:** Treat this token like a password. Do not commit it to version control. Use a `.env` file (excluded via `.gitignore`) or your system's secret manager.
+
+---
+
+## ⚠️ Known Limitations
+
+- **Tool / function calling** is not natively supported by Z.AI. The bridge parses XML-format tool calls from model output and converts them to structured blocks, but results may vary for complex agentic workflows.
+- **HTTP 429 errors** indicate your IP has been rate-limited or blocked by Z.AI for excessive API usage. To avoid this, keep prompts under 60,000 characters and avoid sending rapid bursts of requests.
+
+---
+
+## Modes
 
 | Mode | File | Description | Status |
 |------|------|-------------|--------|
-| ⚡ **Direct HTTP** | `main.js` | Calls Z.AI's REST API directly using HMAC signatures. No browser required. | ✅ Recommended |
-| 🌐 **Browser Automation** | `browser.js` | Connects to a live browser tab via WebSocket injection. Requires browser open. | ⚠️ Deprecated |
+| ⚡ Direct HTTP | `main.js` | Calls Z.AI's REST API directly via HMAC-signed requests. No browser required. | ✅ Recommended |
+| 🌐 Browser Automation | `browser.js` | Connects to a live browser tab via WebSocket injection. Requires an open browser session. | ⚠️ Deprecated |
 
-> **Recommendation:** Use `main.js`. It's faster, more stable, and requires no browser setup.  
-> `browser.js` is deprecated and will not receive further updates. Switch to it only as a fallback if you encounter issues with `main.js`.
-
----
-
-## What's New
-
-- **GLM 5.1** model added
-- **Anthropic API** (`/v1/messages`) support added — native SSE streaming.
-- **Claude Code** integration added (no LiteLLM required)
-- **Tool call parse toggle** — choose between parsed `tool_use` blocks or raw passthrough
-- **Core instructions toggle** — optionally inject Roo/Cline XML tool format hints into every prompt
-- **Debug mode added** - log exact request body sent to z.ai through proxy
-
----
-
-## Features
-
-- **OpenAI-Compatible API** — Drop-in replacement for the OpenAI API
-- **Anthropic-Compatible API** — Native `/v1/messages` endpoint for Claude Code and Anthropic SDK
-- **Streaming Support** — Real-time SSE streaming responses (both formats)
-- **Tool Call Parsing** — Full support for Roo Code / Kilo Code XML tool format
-- **Session Management** — Fresh session support via `X-Fresh-Session` header
-- **Feature Toggles** — Web search, deep thinking, image generation, preview mode
-- **Auto Session Recovery** — Re-authenticates automatically on token expiry *(Direct mode)*
+Use `main.js`. It is faster, more stable, and requires no browser. `browser.js` is deprecated and will not receive further updates.
 
 ---
 
 ## Quick Start
 
-### 1. Clone and Install
+### 1. Install
 
 ```bash
 git clone https://github.com/izaart95-jpg/GLM-Bridge.git
@@ -50,54 +80,34 @@ cd GLM-Bridge
 npm install
 ```
 
----
+### 2. Configure (optional but recommended)
 
-### Mode A — Direct HTTP (Recommended)
+Set `ZAI_TOKEN` to unlock higher-tier models (see above). Without it, only `glm-4.7` and below are accessible.
 
-No browser needed. Authenticates as a guest and calls Z.AI's internal API directly.
+### 3. Start
 
 ```bash
 node main.js
 ```
 
-Server starts on `http://localhost:3001`.
+Server starts at `http://localhost:3001`. Open that URL in a browser for the status dashboard.
 
 ---
 
-### Mode B — Browser Automation (Legacy)
+## Claude Code Integration
 
-**Requires** a browser tab open at `https://chat.z.ai`.
+The server exposes a native Anthropic-compatible `/v1/messages` endpoint. Point Claude Code directly at it — no LiteLLM required.
 
-```bash
-node browser.js
-```
-
-Then open the browser console on `https://chat.z.ai` and run:
-
-```javascript
-const script = document.createElement('script');
-script.src = 'http://localhost:3001/inject.js';
-document.head.appendChild(script);
-```
-
-> ⚠️ **Important:** Keep the browser tab open and in the foreground while using this mode.
-
----
-
-## Claude Code Integration (No LiteLLM Required)
-
-The server exposes a native Anthropic-compatible `/v1/messages` endpoint. Point Claude Code directly at it.
-
-### Windows PowerShell
+**Windows PowerShell**
 
 ```powershell
-$env:ANTHROPIC_BASE_URL = "http://localhost:3001"
+$env:ANTHROPIC_BASE_URL  = "http://localhost:3001"
 $env:ANTHROPIC_AUTH_TOKEN = "Waguri"
-$env:ANTHROPIC_API_KEY = ""
+$env:ANTHROPIC_API_KEY   = ""
 claude
 ```
 
-### Windows CMD
+**Windows CMD**
 
 ```cmd
 set ANTHROPIC_BASE_URL=http://localhost:3001
@@ -106,7 +116,7 @@ set ANTHROPIC_API_KEY=
 claude
 ```
 
-### Permanent — `~/.claude/settings.json`
+**Persistent — `~/.claude/settings.json`**
 
 ```json
 {
@@ -118,26 +128,74 @@ claude
 }
 ```
 
-Claude model names are mapped to Z.AI models automatically:
+### Model Mapping
 
-| Claude Model | Z.AI Model Used |
-|---|---|
-| `claude-opus-*` | `GLM-5-Turbo` |
-| `claude-sonnet-*` | `glm-5` |
-| `claude-haiku-*` | `glm-5` |
+Claude model names are automatically mapped to their Z.AI equivalents:
+
+| Claude Model | Z.AI Model | Requires Login |
+|---|---|---|
+| `claude-opus-*` | `GLM-5-Turbo` | ✅ Yes |
+| `claude-sonnet-*` | `glm-5` | ✅ Yes |
+| `claude-haiku-*` | `glm-5` | ✅ Yes |
+
+All Claude model aliases resolve to `glm-5` or `GLM-5-Turbo`, both of which require an authenticated token. Set `ZAI_TOKEN` before starting the server or Claude Code requests will fail.
+
+---
+
+## Configuration
+
+All settings are in `config.js` and can be overridden with environment variables.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `3001` | Server port |
+| `HOST` | `0.0.0.0` | Bind address |
+| `AUTH_TOKEN` | `Waguri` | Token required by API clients to authenticate with this bridge |
+| `ZAI_TOKEN` | *(unset)* | Your Z.AI account JWT. Required for `glm-5` and higher. |
+| `PARSE_TOOL` | `false` | Set to `true` to parse XML/JSON tool calls into structured blocks |
+| `LOG_LEVEL` | `info` | Logging verbosity: `debug`, `info`, `warn`, `error` |
+| `TIMEOUT` | `300000` | Request timeout in milliseconds |
+
+### Behavior Toggles (top of `main.js`)
+
+```js
+const INCLUDE_CORE_INSTRUCTIONS = false;  // Prepend Roo/Cline XML format hints to every prompt
+```
+
+| Toggle | Default | Effect |
+|--------|---------|--------|
+| `PARSE_TOOL` (env) | `false` | Parse tool calls from model output into `tool_use` / `tool_calls` blocks |
+| `INCLUDE_CORE_INSTRUCTIONS` | `false` | Inject XML formatting hints for Roo/Cline tool call format into every prompt |
+
+---
+
+## Available Models
+
+| Model | Description | Guest Access |
+|-------|-------------|:---:|
+| `glm-4.7` | Fast, lightweight — suited for simple tasks | ✅ |
+| `glm-5` | Default capable model | ❌ Login required |
+| `GLM-5-Turbo` | Best for complex and long-context tasks | ❌ Login required |
+| `GLM-5v-Turbo` | Vision-capable variant | ❌ Login required |
+| `GLM-5.1` | Latest generation | ❌ Login required |
+| `claude-sonnet-*` | Alias → `glm-5` | ❌ Login required |
+| `claude-opus-*` | Alias → `GLM-5-Turbo` | ❌ Login required |
+| `claude-haiku-*` | Alias → `glm-5` | ❌ Login required |
 
 ---
 
 ## API Reference
 
-### Anthropic-Compatible Endpoints
+### Anthropic-Compatible
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/v1/messages` | `POST` | Native Anthropic Messages API — streaming SSE + `tool_use` blocks |
-| `/v1/models` | `GET` | List models (returns Anthropic-style model IDs) |
+| `/v1/messages` | `POST` | Native Anthropic Messages API — streaming SSE and `tool_use` blocks |
+| `/v1/models` | `GET` | Model list (Anthropic-style IDs) |
 
-#### Example — Non-Streaming
+**Non-streaming**
 
 ```bash
 curl -X POST http://localhost:3001/v1/messages \
@@ -151,7 +209,7 @@ curl -X POST http://localhost:3001/v1/messages \
   }'
 ```
 
-#### Example — Streaming
+**Streaming**
 
 ```bash
 curl -X POST http://localhost:3001/v1/messages \
@@ -166,163 +224,77 @@ curl -X POST http://localhost:3001/v1/messages \
   }'
 ```
 
-#### Supported Request Fields
+**Supported request fields**
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `model` | string | Any Claude model name (mapped to GLM internally) |
-| `messages` | array | Anthropic messages format — `user` / `assistant` turns |
-| `system` | string \| array | System prompt (string or content block array) |
+| Field | Type | Notes |
+|-------|------|-------|
+| `model` | string | Any Claude model name — mapped to GLM internally |
+| `messages` | array | Standard Anthropic format (`user` / `assistant` turns) |
+| `system` | string \| array | System prompt — string or content block array |
 | `stream` | boolean | Enable SSE streaming |
 | `max_tokens` | number | Accepted, not forwarded |
-| `tools` | array | Accepted — tool definitions are injected into the prompt |
+| `tools` | array | Tool definitions injected into the prompt |
 | `tool_choice` | object | Accepted, ignored |
 | `temperature` | number | Accepted, ignored |
 
-#### Response Format
-
-Non-streaming returns a standard Anthropic message object with `content` blocks of type `text` and (when detected) `tool_use`. The `stop_reason` is `"tool_use"` when tool calls are present, otherwise `"end_turn"`.
-
 ---
 
-### OpenAI-Compatible Endpoints
+### OpenAI-Compatible
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
+| `/v1/chat/completions` | `POST` | Chat completions — streaming and non-streaming |
 | `/v1/models` | `GET` | List available models |
-| `/v1/chat/completions` | `POST` | Chat completion (streaming / non-streaming) |
 
-### Legacy Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/prompt` | `POST` | Simple prompt endpoint |
-| `/models` | `GET` | List models (legacy format) |
-| `/features` | `POST` | Toggle `webSearch`, `thinking`, `imageGen`, `previewMode` |
-
-### Admin Endpoints
-
-| Endpoint | Method | Description | Mode |
-|----------|--------|-------------|------|
-| `/status` | `GET` | Session / pool status | Both |
-| `/admin/health` | `GET` | Health check | Both |
-| `/admin/stats` | `GET` | Statistics | Both |
-| `/admin/clients` | `GET` | List clients / session info | Both |
-| `/admin/session/clear` | `POST` | Clear conversation history and generate new `chatId` | Direct |
-| `/admin/clients/:id/clear` | `POST` | Clear client chat history | Both |
-| `/stop` | `POST` | Stop current generation | Both |
-| `/inject.js` | `GET` | Browser injection script | Browser |
-
----
-
-## Configuration
-
-Configure via environment variables or `config.js`.
-
-### Server & Auth
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `3001` | Server port |
-| `HOST` | `0.0.0.0` | Server host |
-| `AUTH_TOKEN` | `Waguri` | API authentication token |
-| `TIMEOUT` | `120000` | Default request timeout (ms) |
-
-### Behavior Toggles (in `main.js`)
-
-These are constants at the top of `main.js` you can flip before starting the server:
-
-```js
-// ============== Z.AI DIRECT CONFIG ==============
-
-const PARSE_TOOL_CALLS     = true;   // true  → parse XML/JSON tool calls into tool_use blocks
-                                      // false → pass raw model output through unchanged
-
-const INCLUDE_CORE_INSTRUCTIONS = false; // true  → prepend Roo/Cline XML tool format hints to every prompt
-                                          // false → send prompts as-is (default)
-```
-
-#### `PARSE_TOOL_CALLS`
-
-| Value | Behavior |
-|-------|----------|
-| `true` (default) | XML / JSON tool call syntax in the model's response is detected, parsed, and returned as proper `tool_use` content blocks (Anthropic format) or `tool_calls` (OpenAI format). Raw tool syntax is stripped from the `text` block. |
-| `false` | The model's raw output is returned as-is inside a single `text` block. Useful if you want to handle tool call parsing yourself, or if the model's native output format is preferred. |
-
-#### `INCLUDE_CORE_INSTRUCTIONS`
-
-| Value | Behavior |
-|-------|----------|
-| `false` (default) | Prompts are forwarded to Z.AI without modification. |
-| `true` | A block of critical instructions is prepended to every prompt, telling the model to emit tool calls in the XML format expected by Roo Code / Kilo Code. Enable this if tool calls are not being emitted correctly. |
-
----
-
-### Timeout Handling
-
-If you experience timeout issues, increase these values:
-
-```bash
-export TIMEOUT=300000                  # 5 minutes
-export STREAMING_CHUNK_TIMEOUT=120000  # 2 minutes
-```
-
----
-
-## Usage Examples
-
-### Basic Chat Completion (OpenAI)
+**Basic request**
 
 ```bash
 curl http://localhost:3001/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer Waguri" \
   -d '{
-    "model": "glm-4.7",
+    "model": "glm-5",
     "messages": [{"role": "user", "content": "What is 2+2?"}]
   }'
 ```
 
-### Streaming Response (OpenAI)
+**With web search**
 
 ```bash
 curl http://localhost:3001/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer Waguri" \
   -d '{
-    "model": "glm-4.7",
-    "stream": true,
-    "messages": [{"role": "user", "content": "Write a haiku"}]
-  }'
-```
-
-### With Web Search Enabled
-
-```bash
-curl http://localhost:3001/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer Waguri" \
-  -d '{
-    "model": "glm-4.7",
+    "model": "glm-5",
     "webSearch": true,
-    "messages": [{"role": "user", "content": "What is the latest news?"}]
+    "messages": [{"role": "user", "content": "Latest AI news"}]
   }'
 ```
 
-### Fresh Session (Clear History)
+**Fresh session** (clears context for this request)
 
 ```bash
 curl http://localhost:3001/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer Waguri" \
   -H "X-Fresh-Session: true" \
-  -d '{
-    "model": "glm-4.7",
-    "messages": [{"role": "user", "content": "Start fresh"}]
-  }'
+  -d '{"model": "glm-5", "messages": [{"role": "user", "content": "Start fresh"}]}'
 ```
 
-### Toggle Features (Direct Mode)
+---
+
+### Management & Admin
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/features` | `POST` | Toggle `webSearch`, `thinking`, `imageGen`, `previewMode`, `persistHistory` |
+| `/status` | `GET` | Session status and feature flags |
+| `/admin/health` | `GET` | Health check (`200` healthy, `503` not ready) |
+| `/admin/stats` | `GET` | Usage statistics |
+| `/admin/session/clear` | `POST` | Clear all conversation history |
+| `/prompt` | `POST` | Legacy single-prompt endpoint |
+
+**Toggle features**
 
 ```bash
 curl -X POST http://localhost:3001/features \
@@ -331,117 +303,87 @@ curl -X POST http://localhost:3001/features \
   -d '{"webSearch": true, "thinking": true}'
 ```
 
-### Clear Session History (Direct Mode)
+**Clear session history**
 
 ```bash
 curl -X POST http://localhost:3001/admin/session/clear \
   -H "Authorization: Bearer Waguri"
 ```
 
-### Legacy Prompt Endpoint
-
-```bash
-curl http://localhost:3001/prompt \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer Waguri" \
-  -d '{
-    "prompt": "Hello, how are you?",
-    "search": true,
-    "deepThink": false
-  }'
-```
-
 ---
 
 ## Tool Call Support
 
-Roo Code / Kilo Code XML tool calls are parsed automatically when `PARSE_TOOL_CALLS = true` (default). Works in both OpenAI and Anthropic endpoint modes.
+When `PARSE_TOOL=true`, the bridge detects and parses XML tool calls emitted by the model and converts them to structured `tool_use` (Anthropic) or `tool_calls` (OpenAI) blocks. Raw tool syntax is stripped from the text block.
 
-### Supported Formats
+**Supported formats**
 
-**XML Format (Recommended)**
+Generic XML:
 
 ```xml
 <tool_call>
 <function=write_to_file>
-<parameter=path>test.txt</parameter>
+<parameter=path>output.txt</parameter>
 <parameter=content>Hello World</parameter>
 </function>
 </tool_call>
 ```
 
-**Roo / Cline Style**
+Roo / Cline style:
 
 ```xml
 <write_to_file>
-<path>test.txt</path>
+<path>output.txt</path>
 <content>Hello World</content>
 </write_to_file>
 ```
 
-### Supported Tools
+**Supported tool categories**
 
 | Category | Tools |
 |----------|-------|
-| **File Write** | `write_file`, `write_to_file`, `create_file` |
-| **File Read** | `read_file`, `read_from_file`, `read_multiple_files` |
-| **File Edit** | `edit_file`, `replace_in_file`, `apply_diff` |
-| **File Management** | `delete_file`, `move_file`, `copy_file`, `rename_file` |
-| **Directory** | `list_files`, `list_directory`, `find_files` |
-| **Search** | `search_files`, `search_code`, `grep_search` |
-| **Shell** | `execute_command`, `run_command`, `execute_shell` |
-| **Task Flow** | `attempt_completion`, `complete_task`, `finish_task` |
-| **Interaction** | `ask_followup_question`, `ask_question` |
-| **Misc** | `browser_action`, `update_todo_list`, `switch_mode`, `new_task`, `fetch_instructions` |
-| **OpenCode** | `write`, `read`, `edit`, `bash`, `glob`, `grep`, `task`, `webfetch`, `todowrite`, `todoread` |
+| File write | `write_file`, `write_to_file`, `create_file` |
+| File read | `read_file`, `read_from_file`, `read_multiple_files` |
+| File edit | `edit_file`, `replace_in_file`, `apply_diff` |
+| File management | `delete_file`, `move_file`, `copy_file`, `rename_file` |
+| Directory | `list_files`, `list_directory`, `find_files` |
+| Search | `search_files`, `search_code`, `grep_search` |
+| Shell | `execute_command`, `run_command`, `execute_shell` |
+| Task flow | `attempt_completion`, `complete_task`, `finish_task` |
+| Interaction | `ask_followup_question`, `ask_question` |
+| OpenCode | `write`, `read`, `edit`, `bash`, `glob`, `grep`, `task`, `webfetch`, `todowrite`, `todoread` |
 
 ---
 
-## Roo Code / Kilo Code Integration
-
-In your Roo Code or Kilo Code settings, configure:
+## Roo Code / Kilo Code Setup
 
 | Setting | Value |
 |---------|-------|
-| **API Base URL** | `http://localhost:3001/v1` |
-| **API Key** | `Waguri` |
-| **Model** | `glm-4.7`, `glm-5`, or `GLM-5-Turbo` |
-
----
-
-## Models
-
-| Model | Description |
-|-------|-------------|
-| `glm-5` | Default model (Direct mode) |
-| `GLM-5-Turbo` | GLM 5 Turbo for complex tasks |
-| `GLM-5v-Turbo` | GLM 5V Turbo (vision) |
-| `glm-4.7` | GLM 4.7 — good for fast tasks |
-| `claude-sonnet-4-6` | Alias → `glm-5` (for Claude Code) |
-| `claude-opus-4-6` | Alias → `GLM-5-Turbo` (for Claude Code) |
-| `claude-haiku-4-5-*` | Alias → `glm-5` (for Claude Code) |
+| API Base URL | `http://localhost:3001/v1` |
+| API Key | `Waguri` |
+| Model | `glm-5` or `GLM-5-Turbo` (requires `ZAI_TOKEN`) |
 
 ---
 
 ## Architecture
 
-### Direct HTTP Mode (`main.js`)
+**Direct HTTP mode (`main.js`)**
 
 ```
-┌─────────────────┐     ┌──────────────────────┐     ┌─────────────────┐
-│  API Client     │────▶│  main.js             │────▶│  chat.z.ai      │
-│  (Claude Code,  │     │  HMAC-signed HTTP    │     │  REST API       │
-│   Roo, curl)    │     │  OpenAI + Anthropic  │     │                 │
-└─────────────────┘     └──────────────────────┘     └─────────────────┘
+┌──────────────────┐     ┌────────────────────────┐     ┌────────────────┐
+│  API Client      │────▶│  main.js               │────▶│  chat.z.ai     │
+│  Claude Code /   │     │  HMAC-signed HTTP       │     │  REST API      │
+│  Roo / curl      │◀────│  OpenAI + Anthropic     │◀────│                │
+└──────────────────┘     └────────────────────────┘     └────────────────┘
 ```
 
-### Browser Automation Mode (`browser.js`)
+**Browser Automation mode (`browser.js`) — deprecated**
 
 ```
-┌─────────────┐     ┌──────────────────────┐  WS  ┌─────────────────┐
-│  API Client │────▶│  browser.js          │◀────▶│  Browser Tab    │
-│  (Roo/curl) │     │  WebSocket pool      │      │  (chat.z.ai)    │
-└─────────────┘     └──────────────────────┘      └─────────────────┘
+┌──────────────┐     ┌────────────────────────┐  WS  ┌──────────────────┐
+│  API Client  │────▶│  browser.js            │◀────▶│  Browser Tab     │
+│              │◀────│  WebSocket pool         │      │  (chat.z.ai)     │
+└──────────────┘     └────────────────────────┘      └──────────────────┘
 ```
 
 ---
@@ -450,8 +392,8 @@ In your Roo Code or Kilo Code settings, configure:
 
 | File | Description |
 |------|-------------|
-| `main.js` | Direct HTTP server — no browser required |
+| `main.js` | Direct HTTP server — primary entrypoint |
 | `browser.js` | Browser automation server *(deprecated)* |
-| `config.js` | Shared configuration |
+| `config.js` | Shared configuration and environment variable mappings |
 | `src/pool.js` | Browser client pool *(Browser mode only)* |
-| `src/injection.js` | Browser injection script *(Browser mode only)* |
+| `src/injection.js` | Browser-side injection script *(Browser mode only)* |
