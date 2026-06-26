@@ -1,0 +1,6 @@
+Fetch Guest session
+GET https://chat.z.ai/api/v1/auths/
+Validate token
+GET https://chat.z.ai/api/v1/auths/ -H "Authorization: Bearer token"
+Config
+https://chat.z.ai/api/config

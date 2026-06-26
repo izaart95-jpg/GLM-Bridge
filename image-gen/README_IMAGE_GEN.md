@@ -22,7 +22,7 @@ No `npm install` needed. Just download the script and run it.
 
 ```bash
 # Clone or download
-curl -O https://raw.githubusercontent.com/izaart95-jpg/GLM-Free-API/refs/heads/main/image-gen.js
+curl -O https://raw.githubusercontent.com/izaart95-jpg/GLM-Free-API/refs/heads/main/image-gen/image-gen.js
 
 # Make it executable (macOS / Linux)
 chmod +x image-gen.js
