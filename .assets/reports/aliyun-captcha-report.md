@@ -1563,6 +1563,7 @@ Different calls inside `tr` handle decryption, XHR, device token generation, and
 - `tr(35)` returns `true`
 - `tr(9, 'FqJB6iRNVYdEGpwb', '7JLsB18MnA7GX3d6LxErT1sGT68xcVuOAoxz0b7vVzY=')` returns `'LTAI5tSEBwYMwVKAQGpxmvTd'` (AccessKeyId)
 - `tr(9, 'FqJB6iRNVYdEGpwb', 'n9jH0yACW8YrgOBcM0v7u45+/bfozcSz8ZpvzGBXg3E=')` returns `'YSKfst7GaVkXwZYvVihJsKF9r89koz'` (Secret)
+- `tr(20, '6iL4denBvY')` returns the encoded `deviceToken` (`SG_WEB#...`)
 - `tr(36, '6iL4denBvY')` returns the encoded `deviceToken` (`SG_WEB#...`)
 - `tr(26, trackJson)` returns the encrypted payload `data` field.
 - `tr(30, hash+json)` converts string to `Uint8Array`.
@@ -2259,6 +2260,9 @@ m[y] = k + (~s ? s : 8)(22, 44)
 // k = nx.c(s, 10, 11))
 // s(10,11) = rxy2kxiu
 // s(22,44) = '8g52k8hy'
+// Resolves: m[y] = 'rxy2kxiu8g52k8hy'
+
+// Case 4:
 ```
 
 **R constant Pool**
