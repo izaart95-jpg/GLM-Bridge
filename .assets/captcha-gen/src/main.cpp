@@ -52,7 +52,7 @@ static const std::string SECRET_KEY  = "YSKfst7GaVkXwZYvVihJsKF9r89koz";
 static const std::string SCENE_ID    = "didk33e0";
 static std::string       DB_PATH     = "tokens.sqlite";
 static const std::string PIPE_NAME   = "captcha_pipe";
-static const int  MAX_TOKEN_RETRIES  = 20;
+static const int  MAX_TOKEN_RETRIES  = 2;
 
 static std::atomic<bool> g_running{true};
 static std::mutex        g_db_mutex;

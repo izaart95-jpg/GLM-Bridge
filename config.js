@@ -26,7 +26,7 @@ module.exports = {
   // Logging
   logging: {
     // Log level: 'debug', 'info', 'warn', 'error'
-    level: process.env.LOG_LEVEL || 'info',
+    level: process.env.LOG_LEVEL || 'debug',
 
     // Log format: 'text', 'json'
     format: process.env.LOG_FORMAT || 'text',
