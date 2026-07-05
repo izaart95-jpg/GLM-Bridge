@@ -1,34 +1,68 @@
+// main.go
+// Merged: Z.AI Direct Bridge + In-Memory Captcha Verification
+//
+// Combines:
+//   1. Aliyun captcha verification parameter generator (previously FIFO-based server)
+//   2. Z.AI Direct Bridge HTTP server
+//
+// The captcha_verify_param is now computed in-memory via direct function calls,
+// eliminating FIFO/named pipe overhead for maximum speed.
+//
+// compile using: go build -trimpath -ldflags="-s -w" -gcflags="all=-l=4" -o zai-bridge .
+
 package main
 
 import (
     "bufio"
     "bytes"
+    "compress/zlib"
     "context"
     "crypto/hmac"
     "crypto/rand"
+    "crypto/sha1"
     "crypto/sha256"
+    "database/sql"
     "encoding/base64"
     "encoding/hex"
     "encoding/json"
     "errors"
+    "flag"
     "fmt"
     "io"
     "log"
     "net/http"
     "net/url"
     "os"
-    "os/exec"
-    "path/filepath"
     "regexp"
-    "runtime"
     "sort"
     "strconv"
     "strings"
     "sync"
+    "sync/atomic"
     "time"
+
+    _ "modernc.org/sqlite"
 )
 
-// ============== CONFIG ==============
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+const (
+    // Aliyun captcha credentials
+    accessKey       = "LTAI5tSEBwYMwVKAQGpxmvTd"
+    secretKey       = "YSKfst7GaVkXwZYvVihJsKF9r89koz"
+    sceneID         = "didk33e0"
+    pipeName        = "captcha_pipe" // kept for reference; no longer used
+    maxTokenRetries = 2
+
+    // Z.AI direct config
+    BASE_URL           = "https://chat.z.ai"
+    SALT_KEY           = "key-@@@@)))()((9))-xxxx&&&%%%%%"
+    DEFAULT_FE_VERSION = "prod-fe-1.0.185"
+)
+
+// ---------- Config struct (Z.AI) ----------
 
 type Config struct {
     Server struct {
@@ -92,15 +126,11 @@ func loadConfig() *Config {
 
 var config = loadConfig()
 
-// ============== Z.AI DIRECT CONFIG ==============
+// ============================================================================
+// TYPE DEFINITIONS
+// ============================================================================
 
-const (
-    BASE_URL            = "https://chat.z.ai"
-    SALT_KEY            = "key-@@@@)))()((9))-xxxx&&&%%%%%"
-    DEFAULT_FE_VERSION  = "prod-fe-1.0.185"
-)
-
-// ============== TYPES ==============
+// ---------- Z.AI types ----------
 
 type Features struct {
     WebSearch      bool `json:"webSearch"`
@@ -136,10 +166,13 @@ type ClientSession struct {
     LastUsed time.Time
 }
 
+
 type ZAIResult struct {
-    Chunk string
-    Err   error
+    Chunk    string
+    FullText string
+    Err      error
 }
+
 
 type SendOptions struct {
     Model             string
@@ -159,7 +192,70 @@ type ResponseResult struct {
     FinishReason string
 }
 
-// ============== GLOBAL STATE ==============
+// ---------- Captcha JSON struct types ----------
+
+type InitCaptchaResponse struct {
+    CertifyID string `json:"CertifyId"`
+}
+
+type CVP struct {
+    CertifyID   string `json:"certifyId"`
+    Data        string `json:"data"`
+    DeviceToken string `json:"deviceToken"`
+    SceneID     string `json:"sceneId"`
+}
+
+type VerifyCaptchaResponse struct {
+    Success bool `json:"Success"`
+    Result  struct {
+        VerifyResult  bool   `json:"VerifyResult"`
+        SecurityToken string `json:"securityToken"`
+        CertifyID     string `json:"certifyId"`
+    } `json:"Result"`
+}
+
+type FinalPayload struct {
+    CertifyID     string `json:"certifyId"`
+    IsSign        bool   `json:"isSign"`
+    SceneID       string `json:"sceneId"`
+    SecurityToken string `json:"securityToken"`
+}
+
+type TrackList struct {
+    FI        string `json:"fi"`
+    KS        string `json:"ks"`
+    MC        string `json:"mc"`
+    MP        string `json:"mp"`
+    MU        string `json:"mu"`
+    StartTime int64  `json:"startTime"`
+    TC        string `json:"tc"`
+    TE        string `json:"te"`
+    TMV       string `json:"tmv"`
+}
+
+type Track struct {
+    TrackList      TrackList `json:"TrackList"`
+    TrackStartTime int64     `json:"TrackStartTime"`
+    VerifyTime     int64     `json:"VerifyTime"`
+    Arg            string    `json:"arg"`
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+// ---------- Captcha globals ----------
+
+var (
+    dbPath   string
+    verbose  bool
+    gRunning atomic.Bool
+    dbMu     sync.Mutex
+    logMu    sync.Mutex
+    globalDB *sql.DB
+)
+
+// ---------- Z.AI globals ----------
 
 var session = &SessionState{
     ChatID:    randomUUID(),
@@ -175,40 +271,27 @@ var (
 
 const SESSION_TTL = 30 * 60 * 1000 * time.Millisecond
 
-var (
-    isWin           = runtime.GOOS == "windows"
-    tmpDir          = os.TempDir()
-    CAPTCHA_REQ_PIPE  string
-    CAPTCHA_RESP_PIPE string
-)
-
 var knownModels = []string{
     "glm-4.7", "glm-5", "GLM-5-Turbo", "GLM-5v-Turbo", "GLM-5.1",
 }
 
 var feVersionRe = regexp.MustCompile(`prod-fe-\d+\.\d+\.\d+`)
 
-var httpClient = &http.Client{}
-
-// ============== INIT ==============
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
 
 func init() {
-    if isWin {
-        CAPTCHA_REQ_PIPE = `\\.\pipe\captcha_pipe.req`
-        CAPTCHA_RESP_PIPE = `\\.\pipe\captcha_pipe.resp`
-    } else {
-        if t := os.Getenv("TEMPDIR"); t != "" {
-            tmpDir = t
-        }
-        CAPTCHA_REQ_PIPE = filepath.Join(tmpDir, "captcha_pipe.req")
-        CAPTCHA_RESP_PIPE = filepath.Join(tmpDir, "captcha_pipe.resp")
-        for _, p := range []string{CAPTCHA_REQ_PIPE, CAPTCHA_RESP_PIPE} {
-            if _, err := os.Stat(p); os.IsNotExist(err) {
-                exec.Command("mkfifo", "-m", "666", p).Run()
-            }
+    // Initialise URL safe-character table for custom URL encoder
+    for i := 0; i < 256; i++ {
+        c := byte(i)
+        if (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            c == '-' || c == '_' || c == '.' || c == '~' {
+            baseSafeTable[i] = true
         }
     }
 
+    // Session cleanup ticker
     go func() {
         ticker := time.NewTicker(5 * time.Minute)
         defer ticker.Stop()
@@ -225,7 +308,80 @@ func init() {
     }()
 }
 
-// ============== UTILITY FUNCTIONS ==============
+// ============================================================================
+// LOGGING — silent unless --verbose
+// ============================================================================
+
+func logError(msg string) {
+    if !verbose {
+        return
+    }
+    ts := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+    logMu.Lock()
+    fmt.Fprintf(os.Stderr, "[%s] ERROR: %s\n", ts, msg)
+    logMu.Unlock()
+}
+
+func logInfo(msg string) {
+    if !verbose {
+        return
+    }
+    ts := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+    logMu.Lock()
+    fmt.Fprintf(os.Stderr, "[%s] INFO: %s\n", ts, msg)
+    logMu.Unlock()
+}
+
+// ============================================================================
+// BUFFER POOLS — eliminate GC pressure on hot paths
+// ============================================================================
+
+var bufPool = sync.Pool{
+    New: func() interface{} { return bytes.NewBuffer(make([]byte, 0, 4096)) },
+}
+
+var zlibWriterPool = sync.Pool{
+    New: func() interface{} {
+        w, _ := zlib.NewWriterLevel(io.Discard, zlib.DefaultCompression)
+        return w
+    },
+}
+
+// ============================================================================
+// HTTP CLIENTS — pooled connections, HTTP/2, keep-alive
+// ============================================================================
+
+// Optimised client for Aliyun captcha API calls
+var aliyunHTTPClient = &http.Client{
+    Transport: &http.Transport{
+        MaxIdleConns:          100,
+        MaxIdleConnsPerHost:   20,
+        MaxConnsPerHost:       20,
+        IdleConnTimeout:       90 * time.Second,
+        TLSHandshakeTimeout:   10 * time.Second,
+        ExpectContinueTimeout: 1 * time.Second,
+        ResponseHeaderTimeout: 15 * time.Second,
+        ForceAttemptHTTP2:     true,
+    },
+    Timeout: 30 * time.Second,
+}
+
+// Optimised client for Z.AI API calls (no global timeout — streaming)
+var zaiHTTPClient = &http.Client{
+    Transport: &http.Transport{
+        MaxIdleConns:          100,
+        MaxIdleConnsPerHost:   20,
+        MaxConnsPerHost:       20,
+        IdleConnTimeout:       90 * time.Second,
+        TLSHandshakeTimeout:   10 * time.Second,
+        ExpectContinueTimeout: 1 * time.Second,
+        ForceAttemptHTTP2:     true,
+    },
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
 
 func randomUUID() string {
     b := make([]byte, 16)
@@ -241,12 +397,48 @@ func generateID() string {
     return hex.EncodeToString(b)
 }
 
+// ---------- UUID v4 — manual hex encoding, no fmt.Sprintf ----------
+
+func generateUUID() string {
+    var b [16]byte
+    rand.Read(b[:])
+    b[6] = (b[6] & 0x0F) | 0x40
+    b[8] = (b[8] & 0x3F) | 0x80
+
+    var dst [36]byte
+    j := 0
+    for i := 0; i < 16; i++ {
+        if i == 4 || i == 6 || i == 8 || i == 10 {
+            dst[j] = '-'
+            j++
+        }
+        dst[j] = hexLower[b[i]>>4]
+        dst[j+1] = hexLower[b[i]&0xF]
+        j += 2
+    }
+    return string(dst[:])
+}
+
+// ---------- Timestamp helpers ----------
+
+func getTimestampUTC() string {
+    return time.Now().UTC().Format("2006-01-02T15:04:05Z")
+}
+
+func currentTimeMillis() int64 {
+    return time.Now().UnixMilli()
+}
+
+// ---------- Token estimation ----------
+
 func estimateTokens(text string) int {
     if text == "" {
         return 0
     }
     return (len(text) + 3) / 4
 }
+
+// ---------- Message helpers ----------
 
 func getMessageContent(content json.RawMessage) string {
     if len(content) == 0 {
@@ -313,11 +505,584 @@ func getOrCreateSession(r *http.Request) *ClientSession {
     return s
 }
 
-// ============== CAPTCHA NAMED-PIPE ==============
+// ============================================================================
+// URL ENCODING — custom lookup table, zero allocations for safe chars
+// ============================================================================
+
+const hexUpper = "0123456789ABCDEF"
+const hexLower = "0123456789abcdef"
+
+var baseSafeTable [256]bool
+
+func urlEncode(s string, safe string) string {
+    var safeTable [256]bool
+    safeTable = baseSafeTable
+    for i := 0; i < len(safe); i++ {
+        safeTable[safe[i]] = true
+    }
+
+    var b strings.Builder
+    b.Grow(len(s)*3 + 16)
+    for i := 0; i < len(s); i++ {
+        c := s[i]
+        if safeTable[c] {
+            b.WriteByte(c)
+        } else {
+            b.WriteByte('%')
+            b.WriteByte(hexUpper[c>>4])
+            b.WriteByte(hexUpper[c&0x0F])
+        }
+    }
+    return b.String()
+}
+
+func fromHex(c byte) byte {
+    switch {
+    case c >= '0' && c <= '9':
+        return c - '0'
+    case c >= 'A' && c <= 'F':
+        return c - 'A' + 10
+    case c >= 'a' && c <= 'f':
+        return c - 'a' + 10
+    default:
+        return 0
+    }
+}
+
+// ============================================================================
+// CRYPTO HELPERS
+// ============================================================================
+
+func base64Encode(data []byte) string {
+    return base64.StdEncoding.EncodeToString(data)
+}
+
+func hmacSHA1(key, msg []byte) []byte {
+    h := hmac.New(sha1.New, key)
+    h.Write(msg)
+    return h.Sum(nil)
+}
+
+func base64Decode(s string) ([]byte, error) {
+    if b, err := base64.RawURLEncoding.DecodeString(s); err == nil {
+        return b, nil
+    }
+    if b, err := base64.RawStdEncoding.DecodeString(s); err == nil {
+        return b, nil
+    }
+    if b, err := base64.URLEncoding.DecodeString(s); err == nil {
+        return b, nil
+    }
+    if b, err := base64.StdEncoding.DecodeString(s); err == nil {
+        return b, nil
+    }
+    if b, err := base64.StdEncoding.DecodeString(s + "=="); err == nil {
+        return b, nil
+    }
+    if b, err := base64.URLEncoding.DecodeString(s + "=="); err == nil {
+        return b, nil
+    }
+    return nil, errors.New("base64 decode failed")
+}
+
+// ============================================================================
+// JSON MARSHALING — disables HTML escaping, uses pooled buffer
+// ============================================================================
+
+func jsonMarshal(v interface{}) ([]byte, error) {
+    buf := bufPool.Get().(*bytes.Buffer)
+    buf.Reset()
+    enc := json.NewEncoder(buf)
+    enc.SetEscapeHTML(false)
+    if err := enc.Encode(v); err != nil {
+        bufPool.Put(buf)
+        return nil, err
+    }
+    raw := buf.Bytes()
+    result := make([]byte, len(raw)-1)
+    copy(result, raw)
+    bufPool.Put(buf)
+    return result, nil
+}
+
+// ============================================================================
+// DATABASE — SQLite, pure-Go driver (no CGO)
+// ============================================================================
+
+func initDB() error {
+    var err error
+    globalDB, err = sql.Open("sqlite", dbPath)
+    if err != nil {
+        return err
+    }
+    globalDB.SetMaxOpenConns(1)
+    globalDB.SetMaxIdleConns(1)
+    return nil
+}
+
+func getNextToken() (string, bool) {
+    dbMu.Lock()
+    defer dbMu.Unlock()
+
+    if _, err := os.Stat(dbPath); err != nil {
+        logError("Database file not found: " + dbPath)
+        return "", false
+    }
+
+    var token string
+    err := globalDB.QueryRow("SELECT token FROM tokens ORDER BY id LIMIT 1;").Scan(&token)
+    if err != nil {
+        if errors.Is(err, sql.ErrNoRows) {
+            logError("No device tokens available in table 'tokens'")
+        } else {
+            logError("Failed to query token: " + err.Error())
+        }
+        return "", false
+    }
+    return token, true
+}
+
+func removeToken(token string) {
+    dbMu.Lock()
+    defer dbMu.Unlock()
+
+    _, err := globalDB.Exec("DELETE FROM tokens WHERE token = ?;", token)
+    if err != nil {
+        logError("Failed to delete consumed token: " + err.Error())
+    }
+}
+
+// ============================================================================
+// ALIYUN SIGNATURE
+// ============================================================================
+
+func generateSignature(params map[string]string, secKey string) string {
+    keys := make([]string, 0, len(params)+1)
+    for k := range params {
+        keys = append(keys, k)
+    }
+    sort.Strings(keys)
+
+    var canonical strings.Builder
+    canonical.Grow(512)
+    for i, k := range keys {
+        if i > 0 {
+            canonical.WriteByte('&')
+        }
+        canonical.WriteString(urlEncode(k, ""))
+        canonical.WriteByte('=')
+        canonical.WriteString(urlEncode(params[k], ""))
+    }
+
+    stringToSign := "POST&" + urlEncode("/", "") + "&" + urlEncode(canonical.String(), "")
+    signingKey := secKey + "&"
+    return base64Encode(hmacSHA1([]byte(signingKey), []byte(stringToSign)))
+}
+
+func buildQueryString(params map[string]string) string {
+    keys := make([]string, 0, len(params))
+    for k := range params {
+        keys = append(keys, k)
+    }
+    sort.Strings(keys)
+
+    var b strings.Builder
+    b.Grow(512)
+    for i, k := range keys {
+        if i > 0 {
+            b.WriteByte('&')
+        }
+        b.WriteString(urlEncode(k, ""))
+        b.WriteByte('=')
+        b.WriteString(urlEncode(params[k], ""))
+    }
+    return b.String()
+}
+
+// ============================================================================
+// HTTP POST — pooled buffer for response, connection reuse
+// ============================================================================
+
+func httpPost(targetURL, body string, extraHeaders map[string]string) (string, error) {
+    req, err := http.NewRequest("POST", targetURL, strings.NewReader(body))
+    if err != nil {
+        return "", err
+    }
+    req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+    req.ContentLength = int64(len(body))
+    for k, v := range extraHeaders {
+        req.Header.Set(k, v)
+    }
+
+    resp, err := aliyunHTTPClient.Do(req)
+    if err != nil {
+        return "", err
+    }
+    defer resp.Body.Close()
+
+    buf := bufPool.Get().(*bytes.Buffer)
+    buf.Reset()
+    if _, err := io.Copy(buf, resp.Body); err != nil {
+        bufPool.Put(buf)
+        return "", err
+    }
+    result := buf.String()
+    bufPool.Put(buf)
+    return result, nil
+}
+
+// ============================================================================
+// CAPTCHA GENERATION — PART 1: InitCaptchaV3
+// ============================================================================
+
+func initCaptcha() (string, error) {
+    params := map[string]string{
+        "AccessKeyId":      accessKey,
+        "Action":           "InitCaptchaV3",
+        "Format":           "JSON",
+        "Language":         "en",
+        "Mode":             "popup",
+        "SceneId":          sceneID,
+        "SignatureMethod":  "HMAC-SHA1",
+        "SignatureNonce":   generateUUID(),
+        "SignatureVersion": "1.0",
+        "Timestamp":        getTimestampUTC(),
+        "UpLang":           "true",
+        "Version":          "2023-03-05",
+    }
+    params["Signature"] = generateSignature(params, secretKey)
+
+    body := buildQueryString(params)
+    resp, err := httpPost(
+        "https://no8xfe.captcha-open-southeast.aliyuncs.com/", body, nil)
+    if err != nil {
+        return "", err
+    }
+
+    var result InitCaptchaResponse
+    if err := json.Unmarshal([]byte(resp), &result); err != nil {
+        return "", fmt.Errorf("parse InitCaptchaV3 response: %w", err)
+    }
+    return result.CertifyID, nil
+}
+
+// ============================================================================
+// CAPTCHA GENERATION — PART 2: Generate arg (RC4-like stream cipher)
+// ============================================================================
+
+var argPermTable = [64]int{
+    32, 50, 10, 51, 6, 44, 37, 16, 46, 11, 62, 19, 43, 25, 23, 30,
+    60, 33, 53, 34, 7, 26, 12, 48, 5, 2, 20, 4, 61, 13, 47, 49,
+    18, 29, 27, 22, 1, 17, 39, 56, 41, 38, 55, 31, 15, 58, 52, 40,
+    8, 57, 45, 35, 59, 36, 42, 54, 63, 3, 24, 28, 14, 9, 0, 21,
+}
+
+const argConstant = "4xrihv8zb8tf1mfj"
+
+func generateArg(certifyID string) string {
+    encoded := urlEncode(certifyID, "")
+
+    // URL-decode (identity for already-decoded strings, kept for faithfulness)
+    o := make([]byte, 0, len(encoded))
+    for i := 0; i < len(encoded); {
+        if encoded[i] == '%' && i+2 < len(encoded) {
+            o = append(o, fromHex(encoded[i+1])<<4|fromHex(encoded[i+2]))
+            i += 3
+        } else {
+            o = append(o, encoded[i])
+            i++
+        }
+    }
+
+    // KSA
+    r := argPermTable
+    n := argConstant
+    rlen := 64
+
+    i, j := 0, 0
+    for i < rlen {
+        j = (((i + j + r[i] + r[j]) >> 1) + int(n[i%len(n)])) & (rlen - 1)
+        if i != j {
+            r[i], r[j] = r[j], r[i]
+        }
+        i++
+    }
+
+    // PRGA
+    t := make([]byte, 0, len(o))
+    e, a := 0, 0
+    for idx := 0; idx < len(o); idx++ {
+        a = ((e ^ a) + (r[e] ^ r[a])) & (rlen - 1)
+        if e != a {
+            r[e], r[a] = r[a], r[e]
+        }
+        m := int(o[idx])
+        m = m + e + r[e] - a - r[a]
+        m = m ^ (r[e] + r[a])
+        m = m ^ r[(r[e]+r[a])&(rlen-1)]
+        m = m & 255
+        t = append(t, byte(m))
+        e = (e + 1) & (rlen - 1)
+    }
+    return base64Encode(t)
+}
+
+// ============================================================================
+// CAPTCHA GENERATION — PART 4: ali_hash (custom hash with 16-byte state)
+// ============================================================================
+
+func aliHash(inputStr, saltStr string) string {
+    o := inputStr
+    r := saltStr
+    aLen := len(o)
+    m := len(r)
+
+    var e [16]int
+    for i := 0; i < 16; i++ {
+        e[i] = (i << 4) + (i % 16)
+    }
+    f := 16
+
+    i, j := 0, 0
+    for i < f {
+        j = (((i + j + e[i] + e[j]) >> 1) + int(r[i%m])) & (f - 1)
+        e[i], e[j] = e[j], e[i]
+        i++
+    }
+
+    idx, p, q := 0, 0, 0
+    for idx < aLen {
+        q = ((p ^ q) + (e[p] ^ e[q])) & (f - 1)
+        e[p], e[q] = e[q], e[p]
+        C := int(o[idx])
+        C = (C + p + q) ^ e[p] ^ e[q]
+        C = C & 255
+        e[p] = C
+        p = (p + 1) & (f - 1)
+        idx++
+    }
+
+    for step := 0; step < 2*f; step++ {
+        pos := step % f
+        if pos != 0 {
+            e[pos] ^= e[pos-1]
+        } else {
+            e[0] ^= e[f-1]
+        }
+    }
+
+    var result [32]byte
+    for i, b := range e {
+        result[i*2] = hexLower[(b>>4)&0xF]
+        result[i*2+1] = hexLower[b&0xF]
+    }
+    return string(result[:])
+}
+
+// ============================================================================
+// CAPTCHA GENERATION — PART 7: encrypt (same RC4-like cipher, different key)
+// ============================================================================
+
+const encryptKey = "3e627e1b4c63f913"
+
+func encrypt(plaintext []byte) string {
+    o := plaintext
+    n := encryptKey
+    r := argPermTable
+    rlen := 64
+
+    oKsa, tKsa := 0, 0
+    for oKsa < rlen {
+        tKsa = (((oKsa + tKsa + r[oKsa] + r[tKsa]) >> 1) + int(n[oKsa%len(n)])) & (rlen - 1)
+        if oKsa != tKsa {
+            r[oKsa], r[tKsa] = r[tKsa], r[oKsa]
+        }
+        oKsa++
+    }
+
+    t := make([]byte, 0, len(o))
+    e, a := 0, 0
+    for nPrga := 0; nPrga < len(o); nPrga++ {
+        a = ((e ^ a) + (r[e] ^ r[a])) & (rlen - 1)
+        if e != a {
+            r[e], r[a] = r[a], r[e]
+        }
+        m := int(o[nPrga])
+        m = m + e + r[e] - a - r[a]
+        m = m ^ (r[e] + r[a])
+        m = m ^ r[(r[e]+r[a])&(rlen-1)]
+        m = m & 255
+        t = append(t, byte(m))
+        e = (e + 1) & (rlen - 1)
+    }
+    return base64Encode(t)
+}
+
+// ============================================================================
+// ZLIB COMPRESS — pooled writer, pooled output buffer
+// ============================================================================
+
+func zlibCompress(data []byte) []byte {
+    buf := bufPool.Get().(*bytes.Buffer)
+    buf.Reset()
+    buf.Grow(len(data) + len(data)/2 + 128)
+
+    w := zlibWriterPool.Get().(*zlib.Writer)
+    w.Reset(buf)
+    w.Write(data)
+    w.Close()
+    zlibWriterPool.Put(w)
+
+    result := make([]byte, buf.Len())
+    copy(result, buf.Bytes())
+    bufPool.Put(buf)
+    return result
+}
+
+// ============================================================================
+// CAPTCHA GENERATION — PART 8: VerifyCaptchaV3
+// ============================================================================
+
+func verifyCaptcha(certifyID, dataValue, deviceToken string) (string, error) {
+    cvpJSON, err := jsonMarshal(CVP{
+        CertifyID:   certifyID,
+        Data:        dataValue,
+        DeviceToken: deviceToken,
+        SceneID:     sceneID,
+    })
+    if err != nil {
+        return "", err
+    }
+
+    params := map[string]string{
+        "AccessKeyId":        accessKey,
+        "Action":             "VerifyCaptchaV3",
+        "Format":             "JSON",
+        "SignatureMethod":    "HMAC-SHA1",
+        "SignatureVersion":   "1.0",
+        "Timestamp":          getTimestampUTC(),
+        "Version":            "2023-03-05",
+        "SceneId":            sceneID,
+        "CertifyId":          certifyID,
+        "CaptchaVerifyParam": string(cvpJSON),
+        "SignatureNonce":     generateUUID(),
+    }
+    params["Signature"] = generateSignature(params, secretKey)
+
+    body := buildQueryString(params)
+    resp, err := httpPost(
+        "https://no8xfe-verify.captcha-open-southeast.aliyuncs.com/",
+        body, map[string]string{"Referer": ""})
+    if err != nil {
+        return "", err
+    }
+
+    var respJSON VerifyCaptchaResponse
+    if err := json.Unmarshal([]byte(resp), &respJSON); err != nil {
+        return "", fmt.Errorf("parse VerifyCaptchaV3 response: %w", err)
+    }
+
+    if respJSON.Success && respJSON.Result.VerifyResult {
+        st := respJSON.Result.SecurityToken
+        ci := respJSON.Result.CertifyID
+        if st != "" && ci != "" {
+            fpJSON, err := jsonMarshal(FinalPayload{
+                CertifyID:     ci,
+                IsSign:        true,
+                SceneID:       sceneID,
+                SecurityToken: st,
+            })
+            if err != nil {
+                return "", err
+            }
+            return base64Encode(fpJSON), nil
+        }
+        logError("VerifyCaptchaV3 succeeded but securityToken/certifyId empty for deviceToken=" + deviceToken)
+    } else if respJSON.Success {
+        logError("deviceToken failed verification (VerifyResult=false): " + deviceToken)
+    } else {
+        logError("VerifyCaptchaV3 request unsuccessful for deviceToken=" + deviceToken + " response=" + resp)
+    }
+    return "", nil
+}
+
+// ============================================================================
+// COMPUTE FINAL PAYLOAD — tries tokens until success or exhausted
+// ============================================================================
+
+func computeFinalPayload() string {
+    for attempt := 0; attempt < maxTokenRetries; attempt++ {
+        deviceToken, ok := getNextToken()
+        if !ok {
+            logError(fmt.Sprintf("No device tokens remaining (attempt %d/%d)",
+                attempt+1, maxTokenRetries))
+            return ""
+        }
+        logInfo(fmt.Sprintf("Attempt %d/%d using deviceToken=%s",
+            attempt+1, maxTokenRetries, deviceToken))
+
+        payload, err := tryCompute(deviceToken)
+        if err != nil {
+            logError(fmt.Sprintf("Attempt %d failed for deviceToken=%s: %v",
+                attempt+1, deviceToken, err))
+            continue
+        }
+        if payload != "" {
+            return payload
+        }
+        logError("deviceToken=" + deviceToken + " produced empty payload, retrying")
+    }
+    logError(fmt.Sprintf("All %d token retries exhausted", maxTokenRetries))
+    return ""
+}
+
+func tryCompute(deviceToken string) (string, error) {
+    certifyID, err := initCaptcha()
+    if err != nil {
+        removeToken(deviceToken)
+        return "", fmt.Errorf("initCaptcha: %w", err)
+    }
+
+    argValue := generateArg(certifyID)
+    ct := currentTimeMillis()
+
+    track := Track{
+        TrackList: TrackList{
+            StartTime: ct,
+        },
+        TrackStartTime: ct,
+        VerifyTime:     ct + 300,
+        Arg:            argValue,
+    }
+    jsonBytes, err := jsonMarshal(track)
+    if err != nil {
+        removeToken(deviceToken)
+        return "", err
+    }
+
+    h := aliHash(string(jsonBytes), "0000")
+    combined := h + string(jsonBytes)
+    compressed := zlibCompress([]byte(combined))
+    fb64 := base64Encode(compressed)
+    finalVal := encrypt([]byte(fb64))
+
+    // Always remove token after use — prevents conflicts
+    removeToken(deviceToken)
+
+    payload, err := verifyCaptcha(certifyID, finalVal, deviceToken)
+    if err != nil {
+        return "", fmt.Errorf("verifyCaptcha: %w", err)
+    }
+    return payload, nil
+}
+
+// ============================================================================
+// CAPTCHA VERIFICATION PARAM — IN-MEMORY (no FIFO / named pipe)
+// ============================================================================
 
 func getCaptchaVerifyParam() (string, error) {
     startedAt := time.Now()
-    log.Printf("[Captcha] → trigger %s", CAPTCHA_REQ_PIPE)
+    log.Printf("[Captcha] → computing CaptchaVerifyParam (in-memory IPC)")
 
     type result struct {
         val string
@@ -326,44 +1091,12 @@ func getCaptchaVerifyParam() (string, error) {
     ch := make(chan result, 1)
 
     go func() {
-        // Step 1: write trigger to REQ pipe
-        f, err := os.OpenFile(CAPTCHA_REQ_PIPE, os.O_WRONLY, 0666)
-        if err != nil {
-            ch <- result{"", fmt.Errorf("Captcha req write failed: %s", err.Error())}
+        payload := computeFinalPayload()
+        if payload == "" {
+            ch <- result{"", errors.New("captcha generation returned empty payload")}
             return
         }
-        _, err = f.WriteString("1\n")
-        f.Close()
-        if err != nil {
-            ch <- result{"", fmt.Errorf("Captcha req write failed: %s", err.Error())}
-            return
-        }
-
-        log.Printf("[Captcha] ← awaiting response on %s", CAPTCHA_RESP_PIPE)
-
-        // Step 2: read response from RESP pipe
-        var rf *os.File
-        deadline := time.Now().Add(85 * time.Second)
-        for time.Now().Before(deadline) {
-            rf, err = os.OpenFile(CAPTCHA_RESP_PIPE, os.O_RDONLY, 0666)
-            if err == nil {
-                break
-            }
-            time.Sleep(100 * time.Millisecond)
-        }
-        if err != nil {
-            ch <- result{"", fmt.Errorf("Captcha resp read failed: %s", err.Error())}
-            return
-        }
-        defer rf.Close()
-
-        data, err := io.ReadAll(rf)
-        if err != nil {
-            ch <- result{"", fmt.Errorf("Captcha resp read failed: %s", err.Error())}
-            return
-        }
-
-        ch <- result{strings.TrimSpace(string(data)), nil}
+        ch <- result{payload, nil}
     }()
 
     select {
@@ -375,18 +1108,20 @@ func getCaptchaVerifyParam() (string, error) {
         }
         if r.val == "" {
             log.Printf("[Captcha] ✗ empty response after %.1fs", elapsed)
-            return "", errors.New("Captcha pipe returned empty response")
+            return "", errors.New("captcha generation returned empty response")
         }
         log.Printf("[Captcha] ✓ got %db in %.1fs", len(r.val), elapsed)
         return r.val, nil
     case <-time.After(90 * time.Second):
         elapsed := time.Since(startedAt).Seconds()
         log.Printf("[Captcha] ✗ timeout after %.1fs", elapsed)
-        return "", errors.New("Captcha pipe timeout after 90s")
+        return "", errors.New("captcha generation timeout after 90s")
     }
 }
 
-// ============== SIGNATURE GENERATION ==============
+// ============================================================================
+// Z.AI SIGNATURE GENERATION
+// ============================================================================
 
 func generateZaSignature(prompt, token, userID string) (signature, timestamp, urlParams string) {
     tsMs := time.Now().UnixMilli()
@@ -439,29 +1174,9 @@ func generateZaSignature(prompt, token, userID string) (signature, timestamp, ur
     return
 }
 
-// ============== JWT DECODE ==============
-
-func base64Decode(s string) ([]byte, error) {
-    if b, err := base64.RawURLEncoding.DecodeString(s); err == nil {
-        return b, nil
-    }
-    if b, err := base64.RawStdEncoding.DecodeString(s); err == nil {
-        return b, nil
-    }
-    if b, err := base64.URLEncoding.DecodeString(s); err == nil {
-        return b, nil
-    }
-    if b, err := base64.StdEncoding.DecodeString(s); err == nil {
-        return b, nil
-    }
-    if b, err := base64.StdEncoding.DecodeString(s + "=="); err == nil {
-        return b, nil
-    }
-    if b, err := base64.URLEncoding.DecodeString(s + "=="); err == nil {
-        return b, nil
-    }
-    return nil, errors.New("base64 decode failed")
-}
+// ============================================================================
+// JWT DECODE
+// ============================================================================
 
 func decodeJWT(token string) (id, name string) {
     parts := strings.Split(token, ".")
@@ -485,7 +1200,9 @@ func decodeJWT(token string) (id, name string) {
     return id, name
 }
 
-// ============== SESSION INITIALIZATION ==============
+// ============================================================================
+// Z.AI SESSION INITIALIZATION
+// ============================================================================
 
 func scrapeConfig() {
     ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -495,7 +1212,7 @@ func scrapeConfig() {
         log.Printf("[Config] Scrape error: %s, using default feVersion", err.Error())
         return
     }
-    resp, err := httpClient.Do(req)
+    resp, err := zaiHTTPClient.Do(req)
     if err != nil {
         log.Printf("[Config] Scrape error: %s, using default feVersion", err.Error())
         return
@@ -570,7 +1287,7 @@ func initializeSession() error {
     for k, v := range headers {
         req1.Header.Set(k, v)
     }
-    httpClient.Do(req1)
+    zaiHTTPClient.Do(req1)
 
     // GET /api/v1/auths/
     ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
@@ -579,7 +1296,7 @@ func initializeSession() error {
     for k, v := range headers {
         req2.Header.Set(k, v)
     }
-    resp, err := httpClient.Do(req2)
+    resp, err := zaiHTTPClient.Do(req2)
     if err != nil {
         log.Printf("[Session] Initialization error: %s", err.Error())
         session.Initialized = false
@@ -609,7 +1326,7 @@ func initializeSession() error {
         for k, v := range headers {
             req3.Header.Set(k, v)
         }
-        guestResp, err := httpClient.Do(req3)
+        guestResp, err := zaiHTTPClient.Do(req3)
         if err == nil {
             var gd struct {
                 Token string `json:"token"`
@@ -640,7 +1357,9 @@ func initializeSession() error {
     return errors.New("No token received from Z.AI")
 }
 
-// ============== Z.AI COMMUNICATION ==============
+// ============================================================================
+// Z.AI COMMUNICATION
+// ============================================================================
 
 func sendToZAI(prompt string, opts SendOptions) (<-chan ZAIResult, error) {
     session.mu.Lock()
@@ -686,11 +1405,11 @@ func sendToZAI(prompt string, opts SendOptions) (<-chan ZAIResult, error) {
     }
 
     resolvedOpts := struct {
-        Model, ChatID           string
-        WebSearch, Thinking     bool
-        ImageGen, PreviewMode   bool
-        Messages                []Message
-        ClientMessagesRaw       json.RawMessage
+        Model, ChatID         string
+        WebSearch, Thinking   bool
+        ImageGen, PreviewMode bool
+        Messages              []Message
+        ClientMessagesRaw     json.RawMessage
     }{
         Model: model, ChatID: chatID,
         WebSearch: webSearch, Thinking: thinking,
@@ -711,11 +1430,11 @@ func sendToZAI(prompt string, opts SendOptions) (<-chan ZAIResult, error) {
 }
 
 func sendToZAIStream(prompt string, opts struct {
-    Model, ChatID           string
-    WebSearch, Thinking     bool
-    ImageGen, PreviewMode   bool
-    Messages                []Message
-    ClientMessagesRaw       json.RawMessage
+    Model, ChatID         string
+    WebSearch, Thinking   bool
+    ImageGen, PreviewMode bool
+    Messages              []Message
+    ClientMessagesRaw     json.RawMessage
 }, ch chan<- ZAIResult) error {
 
     for attempt := 0; attempt < 2; attempt++ {
@@ -745,11 +1464,11 @@ func sendToZAIStream(prompt string, opts struct {
         }
 
         requestBody := map[string]interface{}{
-            "model":               opts.Model,
-            "chat_id":             opts.ChatID,
-            "messages":            messagesField,
-            "signature_prompt":    prompt,
-            "stream":              true,
+            "model":                opts.Model,
+            "chat_id":              opts.ChatID,
+            "messages":             messagesField,
+            "signature_prompt":     prompt,
+            "stream":               true,
             "captcha_verify_param": captchaParam,
             "features": map[string]interface{}{
                 "image_generation": opts.ImageGen,
@@ -789,7 +1508,7 @@ func sendToZAIStream(prompt string, opts struct {
         req.Header.Set("x-region", "overseas")
         req.Header.Set("x-signature", signature)
 
-        resp, err := httpClient.Do(req)
+        resp, err := zaiHTTPClient.Do(req)
         if err != nil {
             cancel()
             return fmt.Errorf("Z.AI connection error: %s", err.Error())
@@ -863,10 +1582,21 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
             continue
         }
 
+        
+        if data, ok := j["data"].(map[string]interface{}); ok {
+            if phase, ok := data["phase"].(string); ok && phase == "done" {
+                return nil
+            }
+        }
+
         chunk := ""
         if data, ok := j["data"].(map[string]interface{}); ok {
-            if dc, ok := data["delta_content"].(string); ok {
+            if ec, ok := data["edit_content"].(string); ok && ec != "" {
+                chunk = ec
+            } else if dc, ok := data["delta_content"].(string); ok && dc != "" {
                 chunk = dc
+            } else if tc, ok := data["content"].(string); ok && tc != "" {
+                chunk = tc
             }
         }
         if chunk == "" {
@@ -881,14 +1611,17 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
             }
         }
         if chunk != "" {
-            ch <- ZAIResult{Chunk: chunk}
+            ch <- ZAIResult{Chunk: chunk, FullText: chunk}
         }
+
     }
 
     return scanner.Err()
 }
 
-// ============== FORMAT HELPERS ==============
+// ============================================================================
+// FORMAT HELPERS
+// ============================================================================
 
 func formatOpenAIResponse(result ResponseResult, model, requestId string, stream bool) interface{} {
     timestamp := time.Now().Unix()
@@ -976,7 +1709,9 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
     json.NewEncoder(w).Encode(v)
 }
 
-// ============== DASHBOARD HTML ==============
+// ============================================================================
+// DASHBOARD HTML
+// ============================================================================
 
 func getDashboardHTML(host string) string {
     html := `<!DOCTYPE html>
@@ -1160,7 +1895,9 @@ curl -X POST http://__HOST__/v1/chat/completions \
     return html
 }
 
-// ============== MIDDLEWARE ==============
+// ============================================================================
+// MIDDLEWARE
+// ============================================================================
 
 func corsMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1209,7 +1946,9 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
     }
 }
 
-// ============== ROUTES ==============
+// ============================================================================
+// HTTP HANDLERS
+// ============================================================================
 
 func dashboardHandler(w http.ResponseWriter, r *http.Request) {
     if r.URL.Path != "/" {
@@ -1272,7 +2011,7 @@ func modelsHandler(w http.ResponseWriter, r *http.Request) {
 
 func modelsHandler2(w http.ResponseWriter, r *http.Request) {
     writeJSON(w, 200, map[string]interface{}{
-        "models":      knownModels,
+        "models":       knownModels,
         "currentModel": "glm-5",
     })
 }
@@ -1406,10 +2145,16 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                     errored = true
                     break
                 }
-                fullContent += result.Chunk
+                
+                if result.FullText != "" {
+                    fullContent = result.FullText
+                } else {
+                    fullContent += result.Chunk
+                }
                 if len(fullContent) > len(sentContent) {
                     delta := fullContent[len(sentContent):]
                     sentContent = fullContent
+
                     c := formatOpenAIResponse(ResponseResult{Content: delta}, model, requestId, true)
                     writeSSE(toJSON(c))
                 }
@@ -1455,11 +2200,17 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                 if strings.Contains(result.Err.Error(), "401") {
                     statusCode = 401
                 }
+                
                 writeJSON(w, statusCode, formatOpenAIError(result.Err.Error(), "api_error", nil))
                 return
             }
-            fullContent += result.Chunk
+            if result.FullText != "" {
+                fullContent = result.FullText
+            } else {
+                fullContent += result.Chunk
+            }
         }
+
 
         session.mu.Lock()
         if session.Features.PersistHistory {
@@ -1531,11 +2282,17 @@ func promptHandler(w http.ResponseWriter, r *http.Request) {
     for result := range ch {
         if result.Err != nil {
             log.Printf("[Prompt] Error: %s", result.Err.Error())
+            
             writeJSON(w, 500, map[string]interface{}{"success": false, "error": result.Err.Error()})
             return
         }
-        fullContent += result.Chunk
+        if result.FullText != "" {
+            fullContent = result.FullText
+        } else {
+            fullContent += result.Chunk
+        }
     }
+
 
     session.mu.Lock()
     if session.Features.PersistHistory {
@@ -1697,9 +2454,26 @@ func stopHandler(w http.ResponseWriter, r *http.Request) {
     })
 }
 
-// ============== MAIN ==============
+// ============================================================================
+// MAIN
+// ============================================================================
 
 func main() {
+    flag.StringVar(&dbPath, "db-path", "tokens.sqlite", "Path to SQLite database")
+    flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging")
+    flag.Parse()
+
+    logInfo("Starting with db-path='" + dbPath + "' verbose=true")
+
+    if err := initDB(); err != nil {
+        fmt.Fprintf(os.Stderr, "Failed to open database: %v\n", err)
+        os.Exit(1)
+    }
+    defer globalDB.Close()
+
+    gRunning.Store(true)
+
+    // HTTP server setup
     mux := http.NewServeMux()
 
     mux.HandleFunc("/", dashboardHandler)
@@ -1727,6 +2501,7 @@ func main() {
 ║           Z.AI Direct Bridge Server Started                   ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║  Mode:          DIRECT HTTP (no browser needed)               ║
+║  Captcha IPC:   IN-MEMORY (no FIFO / named pipe)             ║
 ║  Dashboard:     http://localhost:%d                      ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║  OpenAI API:    http://localhost:%d/v1/chat/completions  ║
