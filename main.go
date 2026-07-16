@@ -271,11 +271,146 @@ var (
 
 const SESSION_TTL = 30 * 60 * 1000 * time.Millisecond
 
-var knownModels = []string{
-    "glm-4.7", "glm-5", "GLM-5-Turbo", "GLM-5v-Turbo", "GLM-5.1",
+type ModelInfo struct {
+    ID           string
+    Name         string
+    Description  string
+    Capabilities map[string]interface{}
+}
+
+var (
+    modelsCache     []ModelInfo
+    modelsCacheTime time.Time
+    modelsCacheMu   sync.Mutex
+)
+
+const modelsCacheTTL = 5 * time.Minute
+
+// Fallback if Z.AI API is unreachable and cache is empty
+var fallbackModels = []ModelInfo{
+    {ID: "glm-5.2", Name: "GLM-5.2", Description: "Flagship model, excels at coding and long-horizon tasks"},
+    {ID: "GLM-5.1", Name: "GLM-5.1", Description: "Previous flagship model"},
+    {ID: "GLM-5-Turbo", Name: "GLM-5-Turbo", Description: "New model for chat, coding, and agentic task"},
+    {ID: "GLM-5v-Turbo", Name: "GLM-5V-Turbo", Description: "Vision model with evolved intelligence"},
+    {ID: "glm-4.7", Name: "GLM-4.7", Description: "Classic high-performance model"},
 }
 
 var feVersionRe = regexp.MustCompile(`prod-fe-\d+\.\d+\.\d+`)
+
+// ---------- Per-model feature state (dynamic, model-aware) ----------
+
+// ModelFeatureState tracks per-model feature configuration.
+// IncludeAll: when true, ALL server capabilities are sent to /completions.
+// Overrides: user-supplied per-model feature overrides (snake_case keys).
+type ModelFeatureState struct {
+    IncludeAll bool
+    Overrides  map[string]interface{}
+}
+
+var (
+    modelFeatureStates   = make(map[string]*ModelFeatureState)
+    modelFeatureStatesMu sync.Mutex
+)
+
+// featureKeyMap maps client-facing key names to server capability keys.
+var featureKeyMap = map[string]string{
+    "webSearch":          "web_search",
+    "web_search":         "web_search",
+    "thinking":           "think",
+    "think":              "think",
+    "deepThink":          "think",
+    "imageGen":           "image_generation",
+    "image_gen":          "image_generation",
+    "image_generation":   "image_generation",
+    "previewMode":        "preview_mode",
+    "preview_mode":       "preview_mode",
+    "persistHistory":     "persist_history",
+    "persist_history":    "persist_history",
+}
+
+// normalizeFeatureKey converts a client key to the server capability key name.
+func normalizeFeatureKey(k string) string {
+    if mapped, ok := featureKeyMap[k]; ok {
+        return mapped
+    }
+    var sb strings.Builder
+    for i, r := range k {
+        if i > 0 && r >= 'A' && r <= 'Z' {
+            sb.WriteByte('_')
+        }
+        if r >= 'A' && r <= 'Z' {
+            sb.WriteRune(r + 32)
+        } else {
+            sb.WriteRune(r)
+        }
+    }
+    return sb.String()
+}
+
+// getModelFeatureState returns the per-model state, creating it if necessary.
+func getModelFeatureState(modelID string) *ModelFeatureState {
+    modelFeatureStatesMu.Lock()
+    defer modelFeatureStatesMu.Unlock()
+    if s, ok := modelFeatureStates[modelID]; ok {
+        return s
+    }
+    s := &ModelFeatureState{
+        IncludeAll: false,
+        Overrides:  make(map[string]interface{}),
+    }
+    modelFeatureStates[modelID] = s
+    return s
+}
+
+// resolveFeaturesForModel computes the final feature map for /completions.
+//
+// Rules:
+//   - Default: include ONLY web_search, think, preview_mode from server caps.
+//   - IncludeAll: include ALL server capabilities.
+//   - User overrides always take precedence over server defaults.
+//   - image_generation is ALWAYS forced to false.
+func resolveFeaturesForModel(modelID string) map[string]interface{} {
+    caps := getModelCapabilities(modelID)
+    modelFeatureStatesMu.Lock()
+    state, ok := modelFeatureStates[modelID]
+    modelFeatureStatesMu.Unlock()
+    if !ok {
+        state = &ModelFeatureState{
+            IncludeAll: false,
+            Overrides:  make(map[string]interface{}),
+        }
+    }
+    return resolveFeaturesWithState(caps, state)
+}
+
+// resolveFeaturesWithState does the actual resolution given caps + state.
+func resolveFeaturesWithState(caps map[string]interface{}, state *ModelFeatureState) map[string]interface{} {
+    result := make(map[string]interface{})
+
+    if state.IncludeAll {
+        // Include ALL server capabilities
+        for k, v := range caps {
+            result[k] = v
+        }
+    } else {
+        // Include ONLY these three features by default
+        for _, k := range []string{"web_search", "think", "preview_mode"} {
+            if v, ok := caps[k]; ok {
+                result[k] = v
+            }
+        }
+    }
+
+    // Apply user overrides (per-model stored overrides take precedence)
+    for k, v := range state.Overrides {
+        result[k] = v
+    }
+
+    // ALWAYS exclude image_generation
+    result["image_generation"] = false
+
+    return result
+}
 
 // ============================================================================
 // INITIALIZATION
@@ -1363,7 +1498,6 @@ func initializeSession() error {
 
 func sendToZAI(prompt string, opts SendOptions) (<-chan ZAIResult, error) {
     session.mu.Lock()
-    features := session.Features
     defaultChatID := session.ChatID
     defaultMessages := session.Messages
     initialized := session.Initialized
@@ -1373,22 +1507,30 @@ func sendToZAI(prompt string, opts SendOptions) (<-chan ZAIResult, error) {
     if model == "" {
         model = "glm-5"
     }
-    webSearch := features.WebSearch
+
+    // Resolve features dynamically from per-model state
+    // (server defaults + stored user overrides)
+    featuresMap := resolveFeaturesForModel(model)
+
+    // Apply per-request overrides (highest precedence)
     if opts.WebSearch != nil {
-        webSearch = *opts.WebSearch
+        featuresMap["web_search"] = *opts.WebSearch
+        featuresMap["auto_web_search"] = *opts.WebSearch
     }
-    thinking := features.Thinking
     if opts.Thinking != nil {
-        thinking = *opts.Thinking
+        featuresMap["think"] = *opts.Thinking
+        featuresMap["enable_thinking"] = *opts.Thinking
     }
-    imageGen := features.ImageGen
     if opts.ImageGen != nil {
-        imageGen = *opts.ImageGen
+        featuresMap["image_generation"] = *opts.ImageGen
     }
-    previewMode := features.PreviewMode
     if opts.PreviewMode != nil {
-        previewMode = *opts.PreviewMode
+        featuresMap["preview_mode"] = *opts.PreviewMode
     }
+
+    // ALWAYS force image_generation to false
+    featuresMap["image_generation"] = false
+
     chatID := opts.ChatID
     if chatID == "" {
         chatID = defaultChatID
@@ -1405,15 +1547,14 @@ func sendToZAI(prompt string, opts SendOptions) (<-chan ZAIResult, error) {
     }
 
     resolvedOpts := struct {
-        Model, ChatID         string
-        WebSearch, Thinking   bool
-        ImageGen, PreviewMode bool
-        Messages              []Message
-        ClientMessagesRaw     json.RawMessage
+        Model, ChatID     string
+        FeaturesMap       map[string]interface{}
+        Messages          []Message
+        ClientMessagesRaw json.RawMessage
     }{
-        Model: model, ChatID: chatID,
-        WebSearch: webSearch, Thinking: thinking,
-        ImageGen: imageGen, PreviewMode: previewMode,
+        Model:             model,
+        ChatID:            chatID,
+        FeaturesMap:       featuresMap,
         Messages:          messages,
         ClientMessagesRaw: opts.ClientMessagesRaw,
     }
@@ -1430,11 +1571,10 @@ func sendToZAI(prompt string, opts SendOptions) (<-chan ZAIResult, error) {
 }
 
 func sendToZAIStream(prompt string, opts struct {
-    Model, ChatID         string
-    WebSearch, Thinking   bool
-    ImageGen, PreviewMode bool
-    Messages              []Message
-    ClientMessagesRaw     json.RawMessage
+    Model, ChatID     string
+    FeaturesMap       map[string]interface{}
+    Messages          []Message
+    ClientMessagesRaw json.RawMessage
 }, ch chan<- ZAIResult) error {
 
     for attempt := 0; attempt < 2; attempt++ {
@@ -1463,6 +1603,22 @@ func sendToZAIStream(prompt string, opts struct {
             return err
         }
 
+        // Build features payload from dynamically resolved per-model features
+        featuresPayload := make(map[string]interface{})
+        for k, v := range opts.FeaturesMap {
+            featuresPayload[k] = v
+        }
+        // Set API-compatible aliases
+        if v, ok := featuresPayload["think"].(bool); ok {
+            featuresPayload["enable_thinking"] = v
+        }
+        if v, ok := featuresPayload["web_search"].(bool); ok {
+            featuresPayload["auto_web_search"] = v
+        }
+        featuresPayload["flags"] = []interface{}{}
+        // image_generation is ALWAYS false
+        featuresPayload["image_generation"] = false
+
         requestBody := map[string]interface{}{
             "model":                opts.Model,
             "chat_id":              opts.ChatID,
@@ -1470,14 +1626,7 @@ func sendToZAIStream(prompt string, opts struct {
             "signature_prompt":     prompt,
             "stream":               true,
             "captcha_verify_param": captchaParam,
-            "features": map[string]interface{}{
-                "image_generation": opts.ImageGen,
-                "web_search":       opts.WebSearch,
-                "auto_web_search":  opts.WebSearch,
-                "preview_mode":     opts.PreviewMode,
-                "flags":            []interface{}{},
-                "enable_thinking":  opts.Thinking,
-            },
+            "features":             featuresPayload,
         }
 
         bodyBytes, _ := json.Marshal(requestBody)
@@ -1554,9 +1703,93 @@ func sendToZAIStream(prompt string, opts struct {
     return errors.New("Max retries exceeded")
 }
 
+// extractZAIError inspects a parsed Z.AI SSE payload for an embedded error
+// (Z.AI sometimes returns HTTP 200 with the error inside the JSON body).
+// Returns the human-readable detail string, or "" if no error is present.
+func extractZAIError(j map[string]interface{}) string {
+    if data, ok := j["data"].(map[string]interface{}); ok {
+        // data.error
+        if errObj, ok := data["error"].(map[string]interface{}); ok {
+            detail, _ := errObj["detail"].(string)
+            if detail == "" {
+                if s, ok := errObj["message"].(string); ok {
+                    detail = s
+                }
+            }
+            if detail != "" {
+                if code, ok := errObj["code"]; ok && code != nil {
+                    return fmt.Sprintf("%s (code: %v)", detail, code)
+                }
+                return detail
+            }
+        }
+        // data.data.error (nested variant observed in production)
+        if nested, ok := data["data"].(map[string]interface{}); ok {
+            if errObj, ok := nested["error"].(map[string]interface{}); ok {
+                detail, _ := errObj["detail"].(string)
+                if detail == "" {
+                    if s, ok := errObj["message"].(string); ok {
+                        detail = s
+                    }
+                }
+                if detail != "" {
+                    if code, ok := errObj["code"]; ok && code != nil {
+                        return fmt.Sprintf("%s (code: %v)", detail, code)
+                    }
+                    return detail
+                }
+            }
+        }
+    }
+    // Top-level error (non-Z.AI shape, just in case)
+    if errObj, ok := j["error"].(map[string]interface{}); ok {
+        detail, _ := errObj["detail"].(string)
+        if detail == "" {
+            if s, ok := errObj["message"].(string); ok {
+                detail = s
+            }
+        }
+        if detail != "" {
+            return detail
+        }
+    }
+    return ""
+}
+
+// statusFromError maps a Z.AI/bridge error string to an HTTP status code.
+func statusFromError(errMsg string) int {
+    switch {
+    case strings.Contains(errMsg, "401"):
+        return 401
+    case strings.Contains(errMsg, "403"):
+        return 403
+    case strings.Contains(errMsg, "429"):
+        return 429
+    case strings.Contains(errMsg, "400"):
+        return 400
+    default:
+        return 500
+    }
+}
+
 func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
     scanner := bufio.NewScanner(body)
     scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+
+    // ── Accumulated state across SSE lines ──
+    var fullText strings.Builder
+    sentLen := 0
+
+    flush := func() {
+        if fullText.Len() > sentLen {
+            delta := fullText.String()[sentLen:]
+            sentLen = fullText.Len()
+            ch <- ZAIResult{Chunk: delta, FullText: fullText.String()}
+        } else if fullText.Len() < sentLen {
+            // edit_content truncated the text — resync
+            sentLen = fullText.Len()
+        }
+    }
 
     for scanner.Scan() {
         line := scanner.Text()
@@ -1571,6 +1804,7 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
         }
         dataStr := trimmed[6:]
         if dataStr == "[DONE]" {
+            flush()
             return nil
         }
 
@@ -1582,40 +1816,56 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
             continue
         }
 
-        
+        // ── Detect inline errors (HTTP 200 with error in body) ──
+        if errDetail := extractZAIError(j); errDetail != "" {
+            if config.Logging.Level == "debug" {
+                log.Println("[DEBUG] Z.AI inline SSE error:", errDetail)
+            }
+            return fmt.Errorf("Z.AI error: %s", errDetail)
+        }
+
         if data, ok := j["data"].(map[string]interface{}); ok {
             if phase, ok := data["phase"].(string); ok && phase == "done" {
+                flush()
                 return nil
             }
         }
 
-        chunk := ""
+        // ── Content accumulation ──
         if data, ok := j["data"].(map[string]interface{}); ok {
             if ec, ok := data["edit_content"].(string); ok && ec != "" {
-                chunk = ec
-            } else if dc, ok := data["delta_content"].(string); ok && dc != "" {
-                chunk = dc
-            } else if tc, ok := data["content"].(string); ok && tc != "" {
-                chunk = tc
-            }
-        }
-        if chunk == "" {
-            if choices, ok := j["choices"].([]interface{}); ok && len(choices) > 0 {
-                if choice, ok := choices[0].(map[string]interface{}); ok {
-                    if delta, ok := choice["delta"].(map[string]interface{}); ok {
-                        if c, ok := delta["content"].(string); ok {
-                            chunk = c
-                        }
-                    }
+                // edit_content = FULL replacement starting at edit_index
+                editIndex := -1
+                if ei, ok := data["edit_index"].(float64); ok {
+                    editIndex = int(ei)
                 }
+                current := fullText.String()
+                if editIndex >= 0 {
+                    if editIndex <= len(current) {
+                        current = current[:editIndex] + ec
+                    } else {
+                        // Z.AI index beyond current length — pad
+                        for len(current) < editIndex {
+                            current += " "
+                        }
+                        current += ec
+                    }
+                } else {
+                    current += ec
+                }
+                fullText.Reset()
+                fullText.WriteString(current)
+            } else if dc, ok := data["delta_content"].(string); ok && dc != "" {
+                fullText.WriteString(dc)
+            } else if tc, ok := data["content"].(string); ok && tc != "" {
+                fullText.WriteString(tc)
             }
-        }
-        if chunk != "" {
-            ch <- ZAIResult{Chunk: chunk, FullText: chunk}
         }
 
+        flush()
     }
 
+    flush()
     return scanner.Err()
 }
 
@@ -1903,7 +2153,7 @@ func corsMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Access-Control-Allow-Origin", "*")
         w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id, X-Fresh-Session")
+        w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id, X-Fresh-Session, Include-All-Features")
         if r.Method == "OPTIONS" {
             w.WriteHeader(200)
             return
@@ -1991,16 +2241,147 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
     })
 }
 
+// fetchModelsFromZAI retrieves models from Z.AI /api/models,
+// keeping only glm-4.7 and newer (the API returns newest-first).
+func fetchModelsFromZAI() []ModelInfo {
+    modelsCacheMu.Lock()
+    defer modelsCacheMu.Unlock()
+
+    if len(modelsCache) > 0 && time.Since(modelsCacheTime) < modelsCacheTTL {
+        return modelsCache
+    }
+
+    ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+    defer cancel()
+
+    req, err := http.NewRequestWithContext(ctx, "GET", BASE_URL+"/api/models", nil)
+    if err != nil {
+        logError("fetchModels request: " + err.Error())
+        if len(modelsCache) > 0 {
+            return modelsCache
+        }
+        return fallbackModels
+    }
+    req.Header.Set("Accept", "application/json")
+    req.Header.Set("authorization", "Bearer "+session.Token)
+    resp, err := zaiHTTPClient.Do(req)
+    if err != nil {
+        logError("fetchModels do: " + err.Error())
+        if len(modelsCache) > 0 {
+            return modelsCache
+        }
+        return fallbackModels
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != 200 {
+        logError(fmt.Sprintf("fetchModels status: %d", resp.StatusCode))
+        if len(modelsCache) > 0 {
+            return modelsCache
+        }
+        return fallbackModels
+    }
+
+    body, err := io.ReadAll(resp.Body)
+    if err != nil {
+        logError("fetchModels read: " + err.Error())
+        if len(modelsCache) > 0 {
+            return modelsCache
+        }
+        return fallbackModels
+    }
+
+    var apiResp struct {
+        Data []struct {
+            ID   string `json:"id"`
+            Name string `json:"name"`
+            Info struct {
+                Name string `json:"name"`
+                Meta struct {
+                    Description  string                 `json:"description"`
+                    Capabilities map[string]interface{} `json:"capabilities"`
+                } `json:"meta"`
+            } `json:"info"`
+        } `json:"data"`
+    }
+
+    if err := json.Unmarshal(body, &apiResp); err != nil {
+        logError("fetchModels parse: " + err.Error())
+        if len(modelsCache) > 0 {
+            return modelsCache
+        }
+        return fallbackModels
+    }
+
+    var filtered []ModelInfo
+    for _, m := range apiResp.Data {
+        filtered = append(filtered, ModelInfo{
+            ID:           m.ID,
+            Name:         m.Name,
+            Description:  m.Info.Meta.Description,
+            Capabilities: m.Info.Meta.Capabilities,
+        })
+        // glm-4.7 is the cutoff — stop here (inclusive)
+        if m.ID == "glm-4.7" {
+            break
+        }
+    }
+
+    if len(filtered) > 0 {
+        modelsCache = filtered
+        modelsCacheTime = time.Now()
+        logInfo(fmt.Sprintf("Fetched %d models from Z.AI", len(filtered)))
+    }
+
+    if len(modelsCache) > 0 {
+        return modelsCache
+    }
+    return fallbackModels
+}
+
+// getFeaturesForModel maps a model's capabilities to a Features struct.
+func getFeaturesForModel(modelID string) Features {
+    f := Features{}
+    for _, m := range fetchModelsFromZAI() {
+        if strings.EqualFold(m.ID, modelID) {
+            if v, ok := m.Capabilities["web_search"].(bool); ok {
+                f.WebSearch = v
+                f.AutoWebSearch = v
+            }
+            if v, ok := m.Capabilities["think"].(bool); ok {
+                f.Thinking = v
+            }
+            if v, ok := m.Capabilities["preview_mode"].(bool); ok {
+                f.PreviewMode = v
+            }
+            break
+        }
+    }
+    return f
+}
+
+// getModelCapabilities returns the raw capabilities map for a model.
+func getModelCapabilities(modelID string) map[string]interface{} {
+    for _, m := range fetchModelsFromZAI() {
+        if strings.EqualFold(m.ID, modelID) {
+            return m.Capabilities
+        }
+    }
+    return nil
+}
+
 func modelsHandler(w http.ResponseWriter, r *http.Request) {
     now := time.Now().Unix()
-    data := make([]map[string]interface{}, 0, len(knownModels))
-    for _, m := range knownModels {
+    models := fetchModelsFromZAI()
+    data := make([]map[string]interface{}, 0, len(models))
+    for _, m := range models {
         data = append(data, map[string]interface{}{
-            "id":           m,
+            "id":           m.ID,
             "object":       "model",
             "created":      now,
             "owned_by":     "z-ai",
-            "display_name": m,
+            "display_name": m.Name,
+            "description":  m.Description,
         })
     }
     writeJSON(w, 200, map[string]interface{}{
@@ -2010,9 +2391,18 @@ func modelsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func modelsHandler2(w http.ResponseWriter, r *http.Request) {
+    models := fetchModelsFromZAI()
+    ids := make([]string, 0, len(models))
+    for _, m := range models {
+        ids = append(ids, m.ID)
+    }
+    currentModel := "glm-5.2"
+    if len(ids) > 0 {
+        currentModel = ids[0]
+    }
     writeJSON(w, 200, map[string]interface{}{
-        "models":       knownModels,
-        "currentModel": "glm-5",
+        "models":       ids,
+        "currentModel": currentModel,
     })
 }
 
@@ -2060,31 +2450,22 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
     requestId := generateID()
     prompt := messagesToPrompt(messages)
 
-    session.mu.Lock()
-    features := session.Features
-    session.mu.Unlock()
-
-    webSearch := features.WebSearch
-    if body.WebSearch != nil {
-        webSearch = *body.WebSearch
-    } else if body.Search != nil {
-        webSearch = *body.Search
-    }
-
-    thinking := features.Thinking
-    if body.DeepThink != nil {
-        thinking = *body.DeepThink
-    }
-
+    // Features are now resolved per-model inside sendToZAI.
+    // Per-request overrides are only set if explicitly provided in the body.
     opts := SendOptions{
         Model:             model,
-        WebSearch:         boolPtr(webSearch),
-        Thinking:          boolPtr(thinking),
-        ImageGen:          boolPtr(features.ImageGen),
-        PreviewMode:       boolPtr(features.PreviewMode),
         ChatID:            reqSession.ChatID,
         Messages:          reqSession.Messages,
         ClientMessagesRaw: body.Messages,
+    }
+
+    if body.WebSearch != nil {
+        opts.WebSearch = body.WebSearch
+    } else if body.Search != nil {
+        opts.WebSearch = body.Search
+    }
+    if body.DeepThink != nil {
+        opts.Thinking = body.DeepThink
     }
 
     if stream {
@@ -2133,14 +2514,14 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
         ch, err := sendToZAI(prompt, opts)
         if err != nil {
             log.Printf("[Stream] Error: %s", err.Error())
-            writeSSE(toJSON(map[string]interface{}{"error": map[string]string{"message": err.Error()}}))
+            writeSSE(toJSON(formatOpenAIError(err.Error(), "api_error", statusFromError(err.Error()))))
             writeSSE("[DONE]")
             errored = true
         } else {
             for result := range ch {
                 if result.Err != nil {
                     log.Printf("[Stream] Error: %s", result.Err.Error())
-                    writeSSE(toJSON(map[string]interface{}{"error": map[string]string{"message": result.Err.Error()}}))
+                    writeSSE(toJSON(formatOpenAIError(result.Err.Error(), "api_error", statusFromError(result.Err.Error()))))
                     writeSSE("[DONE]")
                     errored = true
                     break
@@ -2184,11 +2565,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
         ch, err := sendToZAI(prompt, opts)
         if err != nil {
             log.Printf("[API] Error: %s", err.Error())
-            statusCode := 500
-            if strings.Contains(err.Error(), "401") {
-                statusCode = 401
-            }
-            writeJSON(w, statusCode, formatOpenAIError(err.Error(), "api_error", nil))
+            writeJSON(w, statusFromError(err.Error()), formatOpenAIError(err.Error(), "api_error", nil))
             return
         }
 
@@ -2196,12 +2573,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
         for result := range ch {
             if result.Err != nil {
                 log.Printf("[API] Error: %s", result.Err.Error())
-                statusCode := 500
-                if strings.Contains(result.Err.Error(), "401") {
-                    statusCode = 401
-                }
-                
-                writeJSON(w, statusCode, formatOpenAIError(result.Err.Error(), "api_error", nil))
+                writeJSON(w, statusFromError(result.Err.Error()), formatOpenAIError(result.Err.Error(), "api_error", nil))
                 return
             }
             if result.FullText != "" {
@@ -2235,6 +2607,7 @@ func promptHandler(w http.ResponseWriter, r *http.Request) {
 
     var body struct {
         Prompt    string `json:"prompt"`
+        Model     string `json:"model"`
         Search    *bool  `json:"search"`
         DeepThink *bool  `json:"deepThink"`
         WebSearch *bool  `json:"webSearch"`
@@ -2249,26 +2622,19 @@ func promptHandler(w http.ResponseWriter, r *http.Request) {
 
     reqSession := getOrCreateSession(r)
 
-    session.mu.Lock()
-    features := session.Features
-    session.mu.Unlock()
-
-    webSearch := features.WebSearch
-    if body.WebSearch != nil {
-        webSearch = *body.WebSearch
-    } else if body.Search != nil {
-        webSearch = *body.Search
-    }
-    thinking := features.Thinking
-    if body.DeepThink != nil {
-        thinking = *body.DeepThink
-    }
-
+    // Features are now resolved per-model inside sendToZAI.
     opts := SendOptions{
-        WebSearch: boolPtr(webSearch),
-        Thinking:  boolPtr(thinking),
-        ChatID:    reqSession.ChatID,
-        Messages:  reqSession.Messages,
+        Model:    body.Model,
+        ChatID:   reqSession.ChatID,
+        Messages: reqSession.Messages,
+    }
+    if body.WebSearch != nil {
+        opts.WebSearch = body.WebSearch
+    } else if body.Search != nil {
+        opts.WebSearch = body.Search
+    }
+    if body.DeepThink != nil {
+        opts.Thinking = body.DeepThink
     }
 
     ch, err := sendToZAI(body.Prompt, opts)
@@ -2309,45 +2675,132 @@ func promptHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func featuresHandler(w http.ResponseWriter, r *http.Request) {
+    // ── GET: return resolved features for a model ──
+    if r.Method == "GET" {
+        model := r.URL.Query().Get("model")
+        if model != "" {
+            resolved := resolveFeaturesForModel(model)
+            state := getModelFeatureState(model)
+            caps := getModelCapabilities(model)
+            writeJSON(w, 200, map[string]interface{}{
+                "model":       model,
+                "features":    resolved,
+                "includeAll":  state.IncludeAll,
+                "overrides":   state.Overrides,
+                "capabilities": caps,
+            })
+            return
+        }
+        // No model specified — return all per-model states
+        modelFeatureStatesMu.Lock()
+        states := make(map[string]interface{})
+        for k, v := range modelFeatureStates {
+            states[k] = map[string]interface{}{
+                "includeAll": v.IncludeAll,
+                "overrides":  v.Overrides,
+            }
+        }
+        modelFeatureStatesMu.Unlock()
+        writeJSON(w, 200, map[string]interface{}{
+            "states": states,
+        })
+        return
+    }
+
     if r.Method != "POST" {
         http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
         return
     }
 
-    var body struct {
-        WebSearch      *bool `json:"webSearch"`
-        Thinking       *bool `json:"thinking"`
-        ImageGen       *bool `json:"imageGen"`
-        PreviewMode    *bool `json:"previewMode"`
-        PersistHistory *bool `json:"persistHistory"`
-    }
-    bodyBytes, _ := io.ReadAll(r.Body)
-    json.Unmarshal(bodyBytes, &body)
+    // ── POST: update per-model feature state ──
 
+    bodyBytes, err := io.ReadAll(r.Body)
+    if err != nil {
+        writeJSON(w, 400, map[string]interface{}{"error": "Failed to read body"})
+        return
+    }
+
+    // Parse as raw map to capture arbitrary capability keys
+    var body map[string]interface{}
+    if err := json.Unmarshal(bodyBytes, &body); err != nil {
+        writeJSON(w, 400, map[string]interface{}{"error": "Invalid JSON"})
+        return
+    }
+
+    model, _ := body["model"].(string)
+    if model == "" {
+        writeJSON(w, 400, map[string]interface{}{"error": "model is required"})
+        return
+    }
+
+    // Check Include-All-Features header
+    includeAllHeader := strings.EqualFold(r.Header.Get("Include-All-Features"), "true")
+
+    modelFeatureStatesMu.Lock()
+    state, ok := modelFeatureStates[model]
+    if !ok {
+        state = &ModelFeatureState{
+            IncludeAll: false,
+            Overrides:  make(map[string]interface{}),
+        }
+        modelFeatureStates[model] = state
+    }
+
+    // Set IncludeAll flag if header is present
+    if includeAllHeader {
+        state.IncludeAll = true
+    }
+
+    // Process user overrides — any key except "model" is treated as a feature override
+    for k, v := range body {
+        if k == "model" {
+            continue
+        }
+        snakeKey := normalizeFeatureKey(k)
+        // image_generation overrides are ignored — always forced false
+        if snakeKey == "image_generation" {
+            continue
+        }
+        state.Overrides[snakeKey] = v
+    }
+
+    // Resolve final features for response
+    caps := getModelCapabilities(model)
+    resolved := resolveFeaturesWithState(caps, state)
+    includeAll := state.IncludeAll
+    overrides := make(map[string]interface{})
+    for k, v := range state.Overrides {
+        overrides[k] = v
+    }
+    modelFeatureStatesMu.Unlock()
+
+    // Update session.Features for backward compat (dashboard display)
     session.mu.Lock()
-    if body.WebSearch != nil {
-        session.Features.WebSearch = *body.WebSearch
-        session.Features.AutoWebSearch = *body.WebSearch
+    if v, ok := resolved["web_search"].(bool); ok {
+        session.Features.WebSearch = v
+        session.Features.AutoWebSearch = v
     }
-    if body.Thinking != nil {
-        session.Features.Thinking = *body.Thinking
+    if v, ok := resolved["think"].(bool); ok {
+        session.Features.Thinking = v
     }
-    if body.ImageGen != nil {
-        session.Features.ImageGen = *body.ImageGen
+    if v, ok := resolved["preview_mode"].(bool); ok {
+        session.Features.PreviewMode = v
     }
-    if body.PreviewMode != nil {
-        session.Features.PreviewMode = *body.PreviewMode
+    if v, ok := overrides["persist_history"].(bool); ok {
+        session.Features.PersistHistory = v
     }
-    if body.PersistHistory != nil {
-        session.Features.PersistHistory = *body.PersistHistory
-    }
-    features := session.Features
+    session.Features.ImageGen = false
     session.mu.Unlock()
 
-    log.Printf("[Features] Updated: %+v", features)
+    log.Printf("[Features] model=%s includeAll=%v overrides=%+v resolved=%+v",
+        model, includeAll, overrides, resolved)
+
     writeJSON(w, 200, map[string]interface{}{
-        "success":  true,
-        "features": features,
+        "success":    true,
+        "model":      model,
+        "includeAll": includeAll,
+        "overrides":  overrides,
+        "features":   resolved,
     })
 }
 
@@ -2514,6 +2967,8 @@ func main() {
         if err := initializeSession(); err != nil {
             log.Println("[Startup] Session init deferred — will retry on first request.")
         }
+        // Warm up model cache
+        fetchModelsFromZAI()
     }()
 
     srv := &http.Server{
