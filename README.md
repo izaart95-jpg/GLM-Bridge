@@ -7,12 +7,12 @@ An OpenAI-compatible API proxy for [chat.z.ai](https://chat.z.ai). Drop it in fr
 ## Features
 
 - **OpenAI-compatible** — Works as a drop-in replacement for `/v1/chat/completions` and `/v1/models`
-- **Pure HTTP** — No Playwright, no Selenium, no browser overhead
+- **Pure HTTP** — No Playwright, no Selenium, no browser overhead at runtime
 - **In-process captcha** — Aliyun CaptchaV3 verification handled entirely in-memory (no FIFO / named pipe)
 - **Streaming + non-streaming** — Full SSE support with keep-alive ticks every 5s
 - **Session management** — Per-client conversation threads via `X-Session-Id`, with 30-minute TTL (cleaned every 5 min)
 - **Per-model feature resolution** — Features are resolved per-model from Z.AI server capabilities, with user overrides stored per-model. `image_generation` is **always forced to `false`**.
-- **Token pool** — Device tokens stored in `tokens.sqlite`, consumed FIFO and removed after use (max 2 retries per request)
+- **Token pool** — Device tokens harvested via `captcha.go` and stored in `tokens.sqlite`. Consumed FIFO and removed after use (max 2 retries per request).
 - **Live dashboard** — Status, features, and curl examples at `/`
 - **Pure-Go SQLite** — Uses `modernc.org/sqlite` — no CGO required
 - **HTTP/2 + pooled connections** — Optimised transport for both Aliyun and Z.AI endpoints
@@ -132,8 +132,6 @@ On startup, you'll see a banner with your dashboard URL and auth token. The Z.AI
 | `model` | string | `glm-5` | Any model ID from `/v1/models` |
 | `messages` | array | *(required)* | OpenAI-style message array |
 | `stream` | bool | `true` | SSE stream when true |
-| `webSearch` | bool | *(per-model)* | Enables `web_search` + `auto_web_search` for this request |
-| `search` | bool | *(per-model)* | Alias for `webSearch` (used if `webSearch` is absent) |
 | `deepThink` | bool | *(per-model)* | Enables `think` + `enable_thinking` for this request |
 
 #### Request headers
@@ -170,7 +168,7 @@ Features are resolved **per model** (not globally). The resolution logic is:
 
 1. Start from the model's server capabilities.
 2. If `Include-All-Features: true` header has been set for that model → include **all** capabilities.
-   Otherwise include only `web_search`, `think`, `preview_mode` by default.
+   Otherwise include only `think`, `preview_mode` by default.
 3. Apply stored user overrides (per-model).
 4. **Always force `image_generation = false`** (overrides are ignored for this key).
 
@@ -178,31 +176,79 @@ Features are resolved **per model** (not globally). The resolution logic is:
 
 - Without query: returns all per-model states:
 
+  ```bash
+  curl -X GET http://localhost:3001/features \
+    -H "Authorization: Bearer Waguri"
+  ```
   ```json
-  { "states": { "glm-4.7": { "includeAll": false, "overrides": {...} } } }
+  {
+    "states": {
+      "glm-4.7": {
+        "includeAll": false,
+        "overrides": {
+          "preview_mode": true,
+          "think": true
+        }
+      }
+    }
+  }
   ```
 
 - With `?model=glm-4.7`: returns the resolved feature map, the stored `includeAll` flag, stored `overrides`, and the model's raw `capabilities`:
 
+  ```bash
+  curl -X GET "http://localhost:3001/features?model=glm-4.7" \
+    -H "Authorization: Bearer Waguri"
+  ```
   ```json
   {
     "model": "glm-4.7",
-    "features": { "web_search": false, "think": false, "preview_mode": false, "image_generation": false },
+    "features": {
+      "think": true,
+      "preview_mode": false,
+      "image_generation": false
+    },
     "includeAll": false,
-    "overrides": {},
-    "capabilities": { ... }
+    "overrides": {
+      "think": true
+    },
+    "capabilities": {
+      "think": true,
+      "preview_mode": false,
+      "image_generation": true
+    }
   }
   ```
 
 ### `POST /features`
 
-Body **must** contain `model`. Any other key is treated as a feature override and is normalised to snake_case (e.g. `webSearch` → `web_search`, `deepThink` → `think`, `imageGen` → `image_generation`).
+Body **must** contain `model`. Any other key is treated as a feature override and is normalised to snake_case (e.g. `deepThink` → `think`, `imageGen` → `image_generation`).
+
+**Toggle thinking for `glm-4.7`:**
 
 ```bash
 curl -X POST http://localhost:3001/features \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer Waguri" \
-  -d '{"model":"glm-4.7","webSearch":true,"thinking":true}'
+  -d '{"model":"glm-4.7","thinking":true}'
+```
+
+Response:
+
+```json
+{
+  "success": true,
+  "model": "glm-4.7",
+  "includeAll": false,
+  "overrides": {
+    "think": true
+  },
+  "features": {
+    "think": true,
+    "preview_mode": false,
+    "image_generation": false
+  }
+}
 ```
 
 To enable **all** server capabilities for a model (e.g. for testing), send the header:
@@ -213,18 +259,6 @@ curl -X POST http://localhost:3001/features \
   -H "Authorization: Bearer Waguri" \
   -H "Include-All-Features: true" \
   -d '{"model":"glm-4.7"}'
-```
-
-Response:
-
-```json
-{
-  "success": true,
-  "model": "glm-4.7",
-  "includeAll": false,
-  "overrides": { "web_search": true, "think": true },
-  "features": { "web_search": true, "think": true, "preview_mode": false, "image_generation": false }
-}
 ```
 
 > `imageGen` / `image_generation` is **always** `false` — sending it in the body has no effect.
@@ -261,28 +295,30 @@ curl -N -X POST http://localhost:3001/v1/chat/completions \
   }'
 ```
 
-**Web search + deep thinking**
+**Deep thinking**
 
 ```bash
-curl -X POST http://localhost:3001/v1/chat/completions \
+curl -N -X POST http://localhost:3001/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer Waguri" \
   -d '{
     "model": "glm-4.7",
     "stream": true,
-    "webSearch": true,
     "deepThink": true,
     "messages": [{"role": "user", "content": "Summarize today'\''s top AI news."}]
   }'
 ```
 
-**Toggle per-model features**
+**Using the `/prompt` endpoint**
 
 ```bash
-curl -X POST http://localhost:3001/features \
+curl -X POST http://localhost:3001/prompt \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer Waguri" \
-  -d '{"model":"glm-4.7","webSearch":true,"thinking":true}'
+  -d '{
+    "model": "glm-4.7",
+    "prompt": "Tell me a joke."
+  }'
 ```
 
 **Python (OpenAI SDK)**
@@ -310,12 +346,36 @@ Pass `X-Session-Id` to pin a conversation thread across requests. Use `X-Fresh-S
 
 History is only appended server-side when `persistHistory` is enabled for the model via `POST /features` (e.g. `{"model":"glm-4.7","persistHistory":true}`).
 
+**Example of a multi-turn conversation:**
+
+*Turn 1:*
 ```bash
 curl -X POST http://localhost:3001/v1/chat/completions \
   -H "Authorization: Bearer Waguri" \
   -H "X-Session-Id: my-thread-1" \
   -H "Content-Type: application/json" \
   -d '{"model":"glm-4.7","messages":[{"role":"user","content":"My name is Alice."}]}'
+```
+
+*Turn 2:*
+```bash
+curl -X POST http://localhost:3001/v1/chat/completions \
+  -H "Authorization: Bearer Waguri" \
+  -H "X-Session-Id: my-thread-1" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"glm-4.7","messages":[{"role":"user","content":"What is my name?"}]}'
+```
+
+**Clearing sessions:**
+
+```bash
+# Clear all sessions
+curl -X POST http://localhost:3001/admin/session/clear \
+  -H "Authorization: Bearer Waguri"
+
+# Clear a specific client ID (clears all in direct mode)
+curl -X POST http://localhost:3001/admin/clients/my-thread-1/clear \
+  -H "Authorization: Bearer Waguri"
 ```
 
 ---
@@ -335,12 +395,63 @@ curl -X POST http://localhost:3001/v1/chat/completions \
 
 ---
 
+## Token Collection (`captcha.go`)
+
+The `captcha.go` script seeds `tokens.sqlite` with device tokens harvested from `chat.z.ai` using Playwright.
+
+### Build & Run
+
+```bash
+# Portable fallback (any CPU / any OS)
+go build -ldflags="-s -w" -trimpath -o token-collector captcha.go
+./token-collector
+
+# Or, for modern CPUs (fully static, stripped)
+CGO_ENABLED=0 GOAMD64=v3 go build -ldflags="-s -w" -trimpath -o token-collector captcha.go
+```
+
+### Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--unsafe` | `false` | Increase token limit to 1500 and batch limit to 25 |
+| `--tokens` | `0` | Tokens per batch (0 = prompt) |
+| `--batch` | `0` | Number of batches (0 = prompt) |
+| `--parallel` | `0` | Parallel workers (pages) on a single browser; 0 = prompt y/N |
+| `--headed` | `false` | Show browser window for debugging |
+
+### Usage Examples
+
+```bash
+# Interactive prompts
+./token-collector
+
+# High volume
+./token-collector --unsafe
+
+# Specific configuration
+./token-collector --tokens 750 --batch 3
+
+# Parallel collection with a visible browser
+./token-collector --parallel 3 --headed
+```
+
+### Implementation Details
+
+- Uses pure-Go SQLite (`modernc.org/sqlite`) — no CGO needed.
+- Opens a single DB connection with WAL mode + 64MB page cache.
+- Runs batches in parallel using multiple pages on a single browser instance.
+- GC tuned to 200% to reduce pause times in allocation-heavy workloads.
+- Uses lock-free atomics for the abort flag and running total.
+
+---
+
 ## Project Structure
 
 ```
 zai-api/
 ├── main.go          # HTTP server, captcha generation, Z.AI bridge, OpenAI shim
-├── captcha.go          # Seeds tokens.sqlite with device tokens
+├── captcha.go       # Seeds tokens.sqlite with device tokens
 ├── tokens.sqlite    # Generated token pool (consumed at runtime)
 ├── go.mod
 └── README.md
