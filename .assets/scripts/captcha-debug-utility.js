@@ -146,3 +146,61 @@ Array.prototype.join = function(separator) {
     
     return result;
 };
+
+
+
+// Script 4
+
+(function() {
+    const pattern = /feilin[^/]*\.js$/i; // Matches any filename starting with "feilin" and ending with ".js"
+    const REDIRECT_URL = 'https://g.alicdn.com/captcha-frontend/FeiLin/1.4.2/feilin087.5a04960823b08b091639f12277086e009b548b458ac029b57336f5de75bc2f96.js';
+
+    // 1. REDIRECT <script src="..."> tags
+    const scriptProto = HTMLScriptElement.prototype;
+    const originalSrcSetter = Object.getOwnPropertyDescriptor(scriptProto, 'src')?.set;
+    if (originalSrcSetter) {
+        Object.defineProperty(scriptProto, 'src', {
+            set: function(url) {
+                const filename = typeof url === 'string' ? url.split('/').pop().split('?')[0] : '';
+                if (filename && pattern.test(filename)) {
+                    console.log(`[Redirected] Script tag src: ${url} -> ${REDIRECT_URL}`);
+                    originalSrcSetter.call(this, REDIRECT_URL); // Load from different URL instead
+                    return;
+                }
+                originalSrcSetter.call(this, url);
+            },
+            get: function() { return this.getAttribute('src'); },
+            configurable: true,
+            enumerable: true
+        });
+    }
+
+    // 2. REDIRECT fetch() and dynamic import()
+    const origFetch = window.fetch;
+    window.fetch = function(...args) {
+        let url = args[0];
+        if (typeof url === 'string') {
+            const filename = url.split('/').pop().split('?')[0];
+            if (pattern.test(filename)) {
+                console.log(`[Redirected] Fetch/Import: ${url} -> ${REDIRECT_URL}`);
+                args[0] = REDIRECT_URL; // Replace the target URL
+            }
+        }
+        return origFetch.call(this, ...args);
+    };
+
+    // 3. REDIRECT XMLHttpRequest
+    const origOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        if (typeof url === 'string') {
+            const filename = url.split('/').pop().split('?')[0];
+            if (pattern.test(filename)) {
+                console.log(`[Redirected] XHR: ${url} -> ${REDIRECT_URL}`);
+                url = REDIRECT_URL; // Replace the target URL
+            }
+        }
+        return origOpen.call(this, method, url, ...rest);
+    };
+
+    console.log('✅ Network interceptor active. Redirecting "feilin*.js" files to the target URL.');
+})();
