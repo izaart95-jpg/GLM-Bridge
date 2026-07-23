@@ -40,6 +40,7 @@ import (
     "sync"
     "sync/atomic"
     "time"
+    "unicode/utf8"
 
     _ "modernc.org/sqlite"
 )
@@ -53,8 +54,7 @@ const (
     accessKey       = "LTAI5tSEBwYMwVKAQGpxmvTd"
     secretKey       = "YSKfst7GaVkXwZYvVihJsKF9r89koz"
     sceneID         = "didk33e0"
-    pipeName        = "captcha_pipe" // kept for reference; no longer used
-    maxTokenRetries = 2
+    maxTokenRetries = 5
 
     // Z.AI direct config
     BASE_URL           = "https://chat.z.ai"
@@ -143,12 +143,11 @@ var config = loadConfig()
 // ---------- Z.AI types ----------
 
 type Features struct {
-    WebSearch      bool `json:"webSearch"`
-    AutoWebSearch  bool `json:"autoWebSearch"`
-    Thinking       bool `json:"thinking"`
-    ImageGen       bool `json:"imageGen"`
-    PreviewMode    bool `json:"previewMode"`
-    PersistHistory bool `json:"persistHistory"`
+    WebSearch     bool `json:"webSearch"`
+    AutoWebSearch bool `json:"autoWebSearch"`
+    Thinking      bool `json:"thinking"`
+    ImageGen      bool `json:"imageGen"`
+    PreviewMode   bool `json:"previewMode"`
 }
 
 type Message struct {
@@ -170,20 +169,12 @@ type SessionState struct {
     Initializing bool
 }
 
-type ClientSession struct {
-    ChatID   string
-    Messages []Message
-    LastUsed time.Time
-}
-
-
 type ZAIResult struct {
     Chunk     string
     FullText  string
     Reasoning string
     Err       error
 }
-
 
 type SendOptions struct {
     Model             string
@@ -194,6 +185,7 @@ type SendOptions struct {
     ChatID            string
     Messages          []Message
     ClientMessagesRaw json.RawMessage
+    ReasoningEffort   string // "high" or "max"; only forwarded if model supports it
 }
 
 type ResponseResult struct {
@@ -276,13 +268,6 @@ var session = &SessionState{
     FeVersion: DEFAULT_FE_VERSION,
     Features:  Features{Thinking: true}, // enable_thinking on by default
 }
-
-var (
-    sessions   = make(map[string]*ClientSession)
-    sessionsMu sync.Mutex
-)
-
-const SESSION_TTL = 30 * 60 * 1000 * time.Millisecond
 
 type ModelInfo struct {
     ID           string
@@ -393,8 +378,13 @@ func resolveFeaturesWithState(caps map[string]interface{}, state *ModelFeatureSt
     result := make(map[string]interface{})
 
     if state.IncludeAll {
-        // Include ALL server capabilities
+        // Include ALL server capabilities except reasoning_effort
+        // (reasoning_effort in capabilities is a boolean support flag,
+        //  not an actual feature value — handled separately per-request)
         for k, v := range caps {
+            if k == "reasoning_effort" {
+                continue
+            }
             result[k] = v
         }
     }
@@ -405,6 +395,10 @@ func resolveFeaturesWithState(caps map[string]interface{}, state *ModelFeatureSt
     for k, v := range state.Overrides {
         result[k] = v
     }
+
+    // Defensive: reasoning_effort is never a stored feature — strip any stale value.
+    // It is a per-request parameter validated against model capabilities in sendToZAI.
+    delete(result, "reasoning_effort")
 
     // enable_thinking defaults to true unless explicitly overridden
     if _, ok := result["enable_thinking"]; !ok {
@@ -433,22 +427,6 @@ func init() {
             baseSafeTable[i] = true
         }
     }
-
-    // Session cleanup ticker
-    go func() {
-        ticker := time.NewTicker(5 * time.Minute)
-        defer ticker.Stop()
-        for range ticker.C {
-            now := time.Now()
-            sessionsMu.Lock()
-            for id, s := range sessions {
-                if now.Sub(s.LastUsed) > SESSION_TTL {
-                    delete(sessions, id)
-                }
-            }
-            sessionsMu.Unlock()
-        }
-    }()
 }
 
 // ============================================================================
@@ -623,30 +601,6 @@ func messagesToPrompt(messages []Message) string {
 }
 
 func boolPtr(b bool) *bool { return &b }
-
-func getOrCreateSession(r *http.Request) *ClientSession {
-    sessionId := r.Header.Get("X-Session-Id")
-    if sessionId == "" {
-        sessionId = "default"
-    }
-    fresh := r.Header.Get("X-Fresh-Session") == "true"
-
-    sessionsMu.Lock()
-    defer sessionsMu.Unlock()
-
-    if fresh {
-        s := &ClientSession{ChatID: randomUUID(), LastUsed: time.Now()}
-        sessions[sessionId] = s
-        return s
-    }
-    if s, ok := sessions[sessionId]; ok {
-        s.LastUsed = time.Now()
-        return s
-    }
-    s := &ClientSession{ChatID: randomUUID(), LastUsed: time.Now()}
-    sessions[sessionId] = s
-    return s
-}
 
 // ============================================================================
 // URL ENCODING — custom lookup table, zero allocations for safe chars
@@ -1658,6 +1612,34 @@ func sendToZAI(prompt string, opts SendOptions) (<-chan ZAIResult, error) {
         featuresMap["preview_mode"] = *opts.PreviewMode
     }
 
+    // ── reasoning_effort handling ──
+    // Defensive: always strip any stale reasoning_effort first so unsupported
+    // models never receive a placeholder value (would cause malfunction).
+    delete(featuresMap, "reasoning_effort")
+
+    if opts.ReasoningEffort != "" {
+        if modelSupportsReasoningEffort(model) {
+            if isValidReasoningEffort(opts.ReasoningEffort) {
+                // Forward reasoning_effort INSIDE the features payload
+                featuresMap["reasoning_effort"] = opts.ReasoningEffort
+                // When reasoning_effort is active, enable_thinking MUST be true
+                // and any user modification on enable_thinking is ignored.
+                featuresMap["enable_thinking"] = true
+                logInfo(fmt.Sprintf(
+                    "[reasoning_effort] model=%s effort=%s enabled (enable_thinking forced true)",
+                    model, opts.ReasoningEffort))
+            } else {
+                logError(fmt.Sprintf(
+                    "[reasoning_effort] invalid value '%s' for model=%s (accepted: high, max); ignored",
+                    opts.ReasoningEffort, model))
+            }
+        } else {
+            logInfo(fmt.Sprintf(
+                "[reasoning_effort] model=%s does not support reasoning_effort; parameter ignored",
+                model))
+        }
+    }
+
     // Remove 'think' entirely; ALWAYS force image_generation to false
     delete(featuresMap, "think")
     featuresMap["image_generation"] = false
@@ -1734,7 +1716,10 @@ func sendToZAIStream(prompt string, opts struct {
             return err
         }
 
-        // Build features payload from dynamically resolved per-model features
+        // Build features payload from dynamically resolved per-model features.
+        // reasoning_effort is only present in opts.FeaturesMap if the model supports
+        // it AND a valid value was provided — no placeholder is added for
+        // unsupported models (would cause malfunction).
         featuresPayload := make(map[string]interface{})
         for k, v := range opts.FeaturesMap {
             featuresPayload[k] = v
@@ -1771,7 +1756,8 @@ func sendToZAIStream(prompt string, opts struct {
             log.Println("[DEBUG] Z.AI request headers", string(hdrJSON))
         }
 
-        ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+        timeout := time.Duration(config.Timeouts.Default) * time.Millisecond
+        ctx, cancel := context.WithTimeout(context.Background(), timeout)
         req, err := http.NewRequestWithContext(ctx, "POST", urlStr, bytes.NewReader(bodyBytes))
         if err != nil {
             cancel()
@@ -2017,6 +2003,19 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
                 }
                 current := fullText.String()
                 if editIndex >= 0 {
+                    // Convert rune-based edit_index to byte offset
+                    byteIdx := 0
+                    runeCount := 0
+                    for byteIdx < len(current) {
+                        if runeCount == editIndex {
+                            break
+                        }
+                        _, size := utf8.DecodeRuneInString(current[byteIdx:])
+                        byteIdx += size
+                        runeCount++
+                    }
+                    editIndex = byteIdx
+
                     if editIndex <= len(current) {
                         current = current[:editIndex] + ec
                     } else {
@@ -2130,6 +2129,700 @@ func formatOpenAIError(message, errType string, code interface{}) interface{} {
     }
 }
 
+// ============================================================================
+// ANTHROPIC /v1/messages PROTOCOL SUPPORT  [ANTHROPIC_PROTOCOL_PATCHED]
+// ============================================================================
+//
+// Exposes the Anthropic Messages API at /v1/messages. Feeds directly on the
+// ZAIResult stream produced by sendToZAI — the same stream powering the
+// OpenAI handler — and converts each chunk to Anthropic SSE events on the
+// fly with zero intermediate allocations beyond the event JSON itself.
+//
+// Auth: Anthropic clients send the API key via x-api-key header (handled in
+// checkAuth). The anthropic-version header is allowed via CORS.
+
+// formatAnthropicError builds an Anthropic-style error envelope.
+func formatAnthropicError(errType, message string) interface{} {
+    return map[string]interface{}{
+        "type": "error",
+        "error": map[string]interface{}{
+            "type":    errType,
+            "message": message,
+        },
+    }
+}
+
+// extractAnthropicContent coerces an Anthropic content field (string or
+// array of content blocks) into a plain string.
+func extractAnthropicContent(content interface{}) string {
+    if content == nil {
+        return ""
+    }
+    if s, ok := content.(string); ok {
+        return s
+    }
+    if arr, ok := content.([]interface{}); ok {
+        var parts []string
+        for _, item := range arr {
+            if m, ok := item.(map[string]interface{}); ok {
+                if t, _ := m["type"].(string); t == "text" {
+                    if txt, ok := m["text"].(string); ok {
+                        parts = append(parts, txt)
+                    }
+                }
+            }
+        }
+        return strings.Join(parts, "\n")
+    }
+    b, _ := json.Marshal(content)
+    return string(b)
+}
+
+// anthropicToOpenAIRequest converts an Anthropic /v1/messages request body
+// to an OpenAI /v1/chat/completions request body for the existing sendToZAI
+// pipeline.
+func anthropicToOpenAIRequest(bodyBytes []byte) ([]byte, error) {
+    var req map[string]interface{}
+    if err := json.Unmarshal(bodyBytes, &req); err != nil {
+        return nil, err
+    }
+
+    out := make(map[string]interface{})
+    if m, ok := req["model"]; ok {
+        out["model"] = m
+    }
+    if s, ok := req["stream"]; ok {
+        out["stream"] = s
+    }
+    if mt, ok := req["max_tokens"]; ok {
+        out["max_tokens"] = mt
+    }
+    if temp, ok := req["temperature"]; ok {
+        out["temperature"] = temp
+    }
+    if tp, ok := req["top_p"]; ok {
+        out["top_p"] = tp
+    }
+    if ss, ok := req["stop_sequences"]; ok {
+        out["stop"] = ss
+    }
+
+    var messages []map[string]interface{}
+
+    // System field -> system message
+    if sys, ok := req["system"]; ok {
+        sysStr := extractAnthropicContent(sys)
+        if sysStr != "" {
+            messages = append(messages, map[string]interface{}{
+                "role":    "system",
+                "content": sysStr,
+            })
+        }
+    }
+
+    // Convert messages
+    if msgs, ok := req["messages"].([]interface{}); ok {
+        for _, m := range msgs {
+            mm, ok := m.(map[string]interface{})
+            if !ok {
+                continue
+            }
+            role, _ := mm["role"].(string)
+            content := mm["content"]
+
+            // Handle tool_result content blocks in user messages
+            if arr, ok := content.([]interface{}); ok {
+                hasToolResult := false
+                for _, item := range arr {
+                    if mp, ok := item.(map[string]interface{}); ok {
+                        if t, _ := mp["type"].(string); t == "tool_result" {
+                            hasToolResult = true
+                            toolUseID, _ := mp["tool_use_id"].(string)
+                            resultContent := extractAnthropicContent(mp["content"])
+                            messages = append(messages, map[string]interface{}{
+                                "role":         "tool",
+                                "tool_call_id": toolUseID,
+                                "content":      resultContent,
+                            })
+                        }
+                    }
+                }
+                if hasToolResult {
+                    continue
+                }
+            }
+
+            // Handle assistant tool_use blocks -> OpenAI tool_calls
+            if role == "assistant" {
+                if arr, ok := content.([]interface{}); ok {
+                    var textParts []string
+                    var toolCalls []map[string]interface{}
+                    for _, item := range arr {
+                        if mp, ok := item.(map[string]interface{}); ok {
+                            switch t, _ := mp["type"].(string); t {
+                            case "text":
+                                if txt, ok := mp["text"].(string); ok {
+                                    textParts = append(textParts, txt)
+                                }
+                            case "tool_use":
+                                id, _ := mp["id"].(string)
+                                name, _ := mp["name"].(string)
+                                args := mp["input"]
+                                if args == nil {
+                                    args = map[string]interface{}{}
+                                }
+                                argsJSON, _ := json.Marshal(args)
+                                toolCalls = append(toolCalls, map[string]interface{}{
+                                    "id":   id,
+                                    "type": "function",
+                                    "function": map[string]interface{}{
+                                        "name":      name,
+                                        "arguments": string(argsJSON),
+                                    },
+                                })
+                            }
+                        }
+                    }
+                    msg := map[string]interface{}{
+                        "role":    "assistant",
+                        "content": strings.Join(textParts, "\n"),
+                    }
+                    if len(toolCalls) > 0 {
+                        msg["tool_calls"] = toolCalls
+                    }
+                    messages = append(messages, msg)
+                    continue
+                }
+            }
+
+            messages = append(messages, map[string]interface{}{
+                "role":    role,
+                "content": extractAnthropicContent(content),
+            })
+        }
+    }
+    out["messages"] = messages
+
+    // Convert tools: input_schema -> parameters, wrap in function
+    if tools, ok := req["tools"].([]interface{}); ok && len(tools) > 0 {
+        var openaiTools []map[string]interface{}
+        for _, t := range tools {
+            tm, ok := t.(map[string]interface{})
+            if !ok {
+                continue
+            }
+            name, _ := tm["name"].(string)
+            desc, _ := tm["description"].(string)
+            fn := map[string]interface{}{
+                "name":        name,
+                "description": desc,
+            }
+            if is, ok := tm["input_schema"]; ok {
+                fn["parameters"] = is
+            }
+            openaiTools = append(openaiTools, map[string]interface{}{
+                "type":     "function",
+                "function": fn,
+            })
+        }
+        out["tools"] = openaiTools
+    }
+
+    // Convert thinking config
+    if thinking, ok := req["thinking"].(map[string]interface{}); ok {
+        out["thinking"] = thinking
+        if t, _ := thinking["type"].(string); t == "enabled" {
+            out["reasoning"] = true
+        }
+    }
+
+    return json.Marshal(out)
+}
+
+// thinkingEnabled returns true if the Anthropic thinking config is enabled.
+func thinkingEnabled(thinkingCfg json.RawMessage) bool {
+    if len(thinkingCfg) == 0 {
+        return false
+    }
+    var tc struct {
+        Type string `json:"type"`
+    }
+    if err := json.Unmarshal(thinkingCfg, &tc); err != nil {
+        return false
+    }
+    return tc.Type == "enabled"
+}
+
+// anthropicMessagesHandler exposes the Anthropic Messages API at /v1/messages.
+func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != "POST" {
+        writeJSON(w, 405, formatAnthropicError("invalid_request_error", "Method not allowed"))
+        return
+    }
+
+    bodyBytes, err := io.ReadAll(r.Body)
+    if err != nil {
+        writeJSON(w, 400, formatAnthropicError("invalid_request_error", "Failed to read body"))
+        return
+    }
+
+    openaiBody, err := anthropicToOpenAIRequest(bodyBytes)
+    if err != nil {
+        writeJSON(w, 400, formatAnthropicError("invalid_request_error", "Invalid JSON: "+err.Error()))
+        return
+    }
+
+    var body struct {
+        Model           string          `json:"model"`
+        Messages        json.RawMessage `json:"messages"`
+        Stream          *bool           `json:"stream"`
+        Reasoning       *bool           `json:"reasoning"`
+        Thinking        json.RawMessage `json:"thinking"`
+        Tools           json.RawMessage `json:"tools"`
+        ReasoningEffort string          `json:"reasoning_effort"`
+    }
+    if err := json.Unmarshal(openaiBody, &body); err != nil {
+        writeJSON(w, 400, formatAnthropicError("invalid_request_error", "Conversion error: "+err.Error()))
+        return
+    }
+
+    var anthReq struct {
+        Stream   bool            `json:"stream"`
+        Thinking json.RawMessage `json:"thinking"`
+    }
+    json.Unmarshal(bodyBytes, &anthReq)
+
+    model := body.Model
+    if model == "" {
+        model = "glm-5"
+    }
+
+    var messages []Message
+    if err := json.Unmarshal(body.Messages, &messages); err != nil || len(messages) == 0 {
+        writeJSON(w, 400, formatAnthropicError("invalid_request_error", "messages is required and must be an array"))
+        return
+    }
+
+    stream := anthReq.Stream
+    chatID := randomUUID()
+    requestId := "msg_" + generateID()
+
+    var transformedMessages json.RawMessage = body.Messages
+    if config.AgentMode {
+        var agentTools []interface{}
+        if len(body.Tools) > 0 {
+            _ = json.Unmarshal(body.Tools, &agentTools)
+        }
+        if tm, err := transformMessagesForAgent(body.Messages, agentTools); err == nil {
+            transformedMessages = tm
+            var localMsgs []Message
+            if err := json.Unmarshal(tm, &localMsgs); err == nil {
+                messages = localMsgs
+            }
+        }
+    }
+
+    prompt := messagesToPrompt(messages)
+
+    opts := SendOptions{
+        Model:             model,
+        ChatID:            chatID,
+        ClientMessagesRaw: transformedMessages,
+        ReasoningEffort:   body.ReasoningEffort,
+    }
+
+    if body.Reasoning != nil {
+        opts.Thinking = body.Reasoning
+    } else if len(body.Thinking) > 0 {
+        enabled := thinkingEnabled(body.Thinking)
+        opts.Thinking = &enabled
+    }
+
+    if stream {
+        anthropicStreamResponse(w, prompt, opts, model, requestId)
+    } else {
+        anthropicNonStreamResponse(w, prompt, opts, model, requestId)
+    }
+}
+
+// anthropicStreamResponse converts a ZAIResult stream to Anthropic SSE events.
+func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOptions, model, requestId string) {
+    w.Header().Set("Content-Type", "text/event-stream")
+    w.Header().Set("Cache-Control", "no-cache")
+    w.Header().Set("Connection", "keep-alive")
+    w.Header().Set("X-Accel-Buffering", "no")
+
+    flusher, _ := w.(http.Flusher)
+    var writeMu sync.Mutex
+
+    writeEvent := func(eventType string, data interface{}) {
+        writeMu.Lock()
+        defer writeMu.Unlock()
+        d, _ := json.Marshal(data)
+        fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, string(d))
+        if flusher != nil {
+            flusher.Flush()
+        }
+    }
+
+    inputTokens := estimateTokens(prompt)
+
+    // message_start
+    writeEvent("message_start", map[string]interface{}{
+        "type": "message_start",
+        "message": map[string]interface{}{
+            "id":            requestId,
+            "type":          "message",
+            "role":          "assistant",
+            "content":       []interface{}{},
+            "model":         model,
+            "stop_reason":   nil,
+            "stop_sequence": nil,
+            "usage": map[string]interface{}{
+                "input_tokens":  inputTokens,
+                "output_tokens": 0,
+            },
+        },
+    })
+
+    writeEvent("ping", map[string]interface{}{"type": "ping"})
+
+    // Keep-alive pings
+    keepAliveStop := make(chan struct{})
+    var wg sync.WaitGroup
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        ticker := time.NewTicker(5 * time.Second)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-ticker.C:
+                writeEvent("ping", map[string]interface{}{"type": "ping"})
+            case <-keepAliveStop:
+                return
+            }
+        }
+    }()
+
+    blockIndex := -1
+    currentBlockType := ""
+    outputTokens := 0
+
+    startBlock := func(bType string, extra map[string]interface{}) {
+        blockIndex++
+        currentBlockType = bType
+        cb := map[string]interface{}{"type": bType}
+        for k, v := range extra {
+            cb[k] = v
+        }
+        writeEvent("content_block_start", map[string]interface{}{
+            "type":          "content_block_start",
+            "index":         blockIndex,
+            "content_block": cb,
+        })
+    }
+
+    stopBlock := func() {
+        if currentBlockType != "" {
+            writeEvent("content_block_stop", map[string]interface{}{
+                "type":  "content_block_stop",
+                "index": blockIndex,
+            })
+            currentBlockType = ""
+        }
+    }
+
+    var interceptor *agentStreamInterceptor
+    if config.AgentMode {
+        interceptor = newAgentStreamInterceptor()
+    }
+    toolCallEmitted := false
+
+    fullContent := ""
+    sentContent := ""
+
+    ch, err := sendToZAI(prompt, opts)
+    if err != nil {
+        close(keepAliveStop)
+        wg.Wait()
+        writeEvent("error", formatAnthropicError("api_error", err.Error()))
+        writeEvent("message_stop", map[string]interface{}{"type": "message_stop"})
+        return
+    }
+
+    for result := range ch {
+        if result.Err != nil {
+            stopBlock()
+            close(keepAliveStop)
+            wg.Wait()
+            writeEvent("error", formatAnthropicError("api_error", result.Err.Error()))
+            writeEvent("message_stop", map[string]interface{}{"type": "message_stop"})
+            return
+        }
+
+        // Reasoning -> thinking content block
+        if result.Reasoning != "" {
+            if currentBlockType != "thinking" {
+                stopBlock()
+                startBlock("thinking", map[string]interface{}{"thinking": ""})
+            }
+            writeEvent("content_block_delta", map[string]interface{}{
+                "type":  "content_block_delta",
+                "index": blockIndex,
+                "delta": map[string]interface{}{
+                    "type":     "thinking_delta",
+                    "thinking": result.Reasoning,
+                },
+            })
+            outputTokens += estimateTokens(result.Reasoning)
+            continue
+        }
+
+        // Content delta
+        if result.FullText != "" {
+            fullContent = result.FullText
+        } else {
+            fullContent += result.Chunk
+        }
+
+        if len(fullContent) < len(sentContent) {
+            sentContent = ""
+            if interceptor != nil {
+                interceptor = newAgentStreamInterceptor()
+            }
+        }
+
+        if len(fullContent) <= len(sentContent) {
+            continue
+        }
+        delta := fullContent[len(sentContent):]
+        sentContent = fullContent
+
+        if interceptor != nil {
+            contentDelta, toolCalls, _ := interceptor.feed(delta)
+            if contentDelta != "" {
+                if currentBlockType != "text" {
+                    stopBlock()
+                    startBlock("text", map[string]interface{}{"text": ""})
+                }
+                writeEvent("content_block_delta", map[string]interface{}{
+                    "type":  "content_block_delta",
+                    "index": blockIndex,
+                    "delta": map[string]interface{}{
+                        "type": "text_delta",
+                        "text": contentDelta,
+                    },
+                })
+                outputTokens += estimateTokens(contentDelta)
+            }
+            if len(toolCalls) > 0 {
+                for _, tc := range toolCalls {
+                    stopBlock()
+                    fn, _ := tc["function"].(map[string]interface{})
+                    name, _ := fn["name"].(string)
+                    argsStr, _ := fn["arguments"].(string)
+                    id, _ := tc["id"].(string)
+                    tooluID := "toolu_" + strings.TrimPrefix(id, "call_")
+                    startBlock("tool_use", map[string]interface{}{
+                        "id":    tooluID,
+                        "name":  name,
+                        "input": map[string]interface{}{},
+                    })
+                    writeEvent("content_block_delta", map[string]interface{}{
+                        "type":  "content_block_delta",
+                        "index": blockIndex,
+                        "delta": map[string]interface{}{
+                            "type":         "input_json_delta",
+                            "partial_json": argsStr,
+                        },
+                    })
+                    stopBlock()
+                    toolCallEmitted = true
+                }
+            }
+        } else {
+            if currentBlockType != "text" {
+                stopBlock()
+                startBlock("text", map[string]interface{}{"text": ""})
+            }
+            writeEvent("content_block_delta", map[string]interface{}{
+                "type":  "content_block_delta",
+                "index": blockIndex,
+                "delta": map[string]interface{}{
+                    "type": "text_delta",
+                    "text": delta,
+                },
+            })
+            outputTokens += estimateTokens(delta)
+        }
+    }
+
+    // Flush interceptor trailing text
+    if interceptor != nil {
+        if rem := interceptor.flushFinal(); rem != "" && !toolCallEmitted {
+            if currentBlockType != "text" {
+                stopBlock()
+                startBlock("text", map[string]interface{}{"text": ""})
+            }
+            writeEvent("content_block_delta", map[string]interface{}{
+                "type":  "content_block_delta",
+                "index": blockIndex,
+                "delta": map[string]interface{}{
+                    "type": "text_delta",
+                    "text": rem,
+                },
+            })
+            outputTokens += estimateTokens(rem)
+        }
+
+        if !toolCallEmitted {
+            toolCalls := extractAgentToolCalls(fullContent)
+            if len(toolCalls) > 0 {
+                for _, tc := range toolCalls {
+                    stopBlock()
+                    fn, _ := tc["function"].(map[string]interface{})
+                    name, _ := fn["name"].(string)
+                    argsStr, _ := fn["arguments"].(string)
+                    id, _ := tc["id"].(string)
+                    tooluID := "toolu_" + strings.TrimPrefix(id, "call_")
+                    startBlock("tool_use", map[string]interface{}{
+                        "id":    tooluID,
+                        "name":  name,
+                        "input": map[string]interface{}{},
+                    })
+                    writeEvent("content_block_delta", map[string]interface{}{
+                        "type":  "content_block_delta",
+                        "index": blockIndex,
+                        "delta": map[string]interface{}{
+                            "type":         "input_json_delta",
+                            "partial_json": argsStr,
+                        },
+                    })
+                    stopBlock()
+                    toolCallEmitted = true
+                }
+            }
+        }
+    }
+
+    stopBlock()
+
+    close(keepAliveStop)
+    wg.Wait()
+
+    stopReason := "end_turn"
+    if toolCallEmitted {
+        stopReason = "tool_use"
+    }
+
+    writeEvent("message_delta", map[string]interface{}{
+        "type": "message_delta",
+        "delta": map[string]interface{}{
+            "stop_reason":   stopReason,
+            "stop_sequence": nil,
+        },
+        "usage": map[string]interface{}{
+            "output_tokens": outputTokens,
+        },
+    })
+
+    writeEvent("message_stop", map[string]interface{}{"type": "message_stop"})
+}
+
+// anthropicNonStreamResponse produces a single Anthropic message object.
+func anthropicNonStreamResponse(w http.ResponseWriter, prompt string, opts SendOptions, model, requestId string) {
+    ch, err := sendToZAI(prompt, opts)
+    if err != nil {
+        writeJSON(w, statusFromError(err.Error()), formatAnthropicError("api_error", err.Error()))
+        return
+    }
+
+    fullContent := ""
+    fullReasoning := ""
+    for result := range ch {
+        if result.Err != nil {
+            writeJSON(w, statusFromError(result.Err.Error()), formatAnthropicError("api_error", result.Err.Error()))
+            return
+        }
+        if result.Reasoning != "" {
+            fullReasoning += result.Reasoning
+            continue
+        }
+        if result.FullText != "" {
+            fullContent = result.FullText
+        } else {
+            fullContent += result.Chunk
+        }
+    }
+
+    content := []interface{}{}
+    stopReason := "end_turn"
+
+    if fullReasoning != "" {
+        content = append(content, map[string]interface{}{
+            "type":     "thinking",
+            "thinking": fullReasoning,
+        })
+    }
+
+    if config.AgentMode {
+        toolCalls := extractAgentToolCalls(fullContent)
+        if len(toolCalls) > 0 {
+            stripped := stripAgentToolCallBlocks(fullContent)
+            if stripped != "" {
+                content = append(content, map[string]interface{}{
+                    "type": "text",
+                    "text": stripped,
+                })
+            }
+            for _, tc := range toolCalls {
+                fn, _ := tc["function"].(map[string]interface{})
+                name, _ := fn["name"].(string)
+                argsStr, _ := fn["arguments"].(string)
+                id, _ := tc["id"].(string)
+                tooluID := "toolu_" + strings.TrimPrefix(id, "call_")
+                var args interface{}
+                json.Unmarshal([]byte(argsStr), &args)
+                if args == nil {
+                    args = map[string]interface{}{}
+                }
+                content = append(content, map[string]interface{}{
+                    "type":  "tool_use",
+                    "id":    tooluID,
+                    "name":  name,
+                    "input": args,
+                })
+            }
+            stopReason = "tool_use"
+        } else {
+            content = append(content, map[string]interface{}{
+                "type": "text",
+                "text": fullContent,
+            })
+        }
+    } else {
+        content = append(content, map[string]interface{}{
+            "type": "text",
+            "text": fullContent,
+        })
+    }
+
+    writeJSON(w, 200, map[string]interface{}{
+        "id":            requestId,
+        "type":          "message",
+        "role":          "assistant",
+        "content":       content,
+        "model":         model,
+        "stop_reason":   stopReason,
+        "stop_sequence": nil,
+        "usage": map[string]interface{}{
+            "input_tokens":  estimateTokens(prompt),
+            "output_tokens": estimateTokens(fullContent),
+        },
+    })
+}
+
 func toJSON(v interface{}) string {
     b, _ := json.Marshal(v)
     return string(b)
@@ -2142,192 +2835,6 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 }
 
 // ============================================================================
-// DASHBOARD HTML
-// ============================================================================
-
-func getDashboardHTML(host string) string {
-    html := `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Z.AI Direct Bridge</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: linear-gradient(135deg, #1e3a5f 0%, #0d1b2a 50%, #1b263b 100%);
-      min-height: 100vh; color: #e0e0e0; padding: 20px;
-    }
-    .container { max-width: 1200px; margin: 0 auto; }
-    .header {
-      text-align: center; padding: 40px 20px;
-      background: rgba(255,255,255,0.05); border-radius: 16px;
-      margin-bottom: 30px; border: 1px solid rgba(255,255,255,0.1);
-    }
-    .header h1 {
-      font-size: 2.5rem;
-      background: linear-gradient(135deg, #3b82f6, #1d4ed8, #60a5fa);
-      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-      margin-bottom: 10px;
-    }
-    .header p { color: #888; font-size: 1.1rem; }
-    .badges { display: flex; gap: 8px; justify-content: center; margin-top: 12px; flex-wrap: wrap; }
-    .badge {
-      display: inline-block; padding: 4px 12px; border-radius: 12px;
-      font-size: 0.8rem; font-weight: 700;
-    }
-    .badge-green { background: #22c55e; color: #000; }
-    .badge-blue  { background: #3b82f6; color: #fff; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
-    .card {
-      background: rgba(255,255,255,0.05); border-radius: 12px;
-      padding: 24px; border: 1px solid rgba(255,255,255,0.1);
-    }
-    .card h2 { color: #60a5fa; margin-bottom: 16px; font-size: 1.2rem; }
-    .stat-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
-    .stat { background: rgba(0,0,0,0.2); padding: 12px; border-radius: 8px; }
-    .stat .label { color: #888; font-size: 0.85rem; }
-    .stat .value { color: #60a5fa; font-weight: 600; font-size: 1.5rem; margin-top: 4px; }
-    .code-block {
-      background: #0d1117; border-radius: 8px; padding: 16px; overflow-x: auto;
-      font-family: 'Monaco', 'Menlo', monospace; font-size: 0.85rem;
-      border: 1px solid #30363d; margin: 12px 0;
-    }
-    .code-block code { color: #c9d1d9; white-space: pre-wrap; }
-    .endpoint { background: rgba(0,0,0,0.2); padding: 12px; border-radius: 8px; margin-bottom: 8px; }
-    .method {
-      display: inline-block; padding: 4px 8px; border-radius: 4px;
-      font-size: 0.75rem; font-weight: 600; margin-right: 8px;
-    }
-    .method.get { background: #22c55e; color: #000; }
-    .method.post { background: #3b82f6; color: #fff; }
-    .path { font-family: monospace; color: #e0e0e0; }
-    .desc { color: #888; font-size: 0.85rem; margin-top: 4px; }
-    .section-label {
-      font-size: 0.75rem; font-weight: 700; text-transform: uppercase;
-      letter-spacing: 0.1em; color: #a855f7; margin: 16px 0 8px;
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="header">
-      <h1>Z.AI Direct Bridge</h1>
-      <p>HTTP-only mode — No browser required</p>
-      <div class="badges">
-        <span class="badge badge-green">⚡ Direct Mode</span>
-        <span class="badge badge-blue">OpenAI Compatible</span>
-      </div>
-    </div>
-
-    <div class="grid">
-      <div class="card">
-        <h2>Session Status</h2>
-        <div class="stat-grid">
-          <div class="stat">
-            <div class="label">Connection</div>
-            <div class="value" id="sessionStatus">...</div>
-          </div>
-          <div class="stat">
-            <div class="label">User</div>
-            <div class="value" id="sessionUser" style="font-size:1rem">...</div>
-          </div>
-          <div class="stat">
-            <div class="label">Messages</div>
-            <div class="value" id="msgCount">0</div>
-          </div>
-          <div class="stat">
-            <div class="label">FE Version</div>
-            <div class="value" id="feVersion" style="font-size:0.85rem">...</div>
-          </div>
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>Features</h2>
-        <div class="stat-grid">
-          <div class="stat"><div class="label">Web Search</div><div class="value" id="featSearch">-</div></div>
-          <div class="stat"><div class="label">Thinking</div><div class="value" id="featThink">-</div></div>
-          <div class="stat"><div class="label">Image Gen</div><div class="value" id="featImage">-</div></div>
-          <div class="stat"><div class="label">Preview</div><div class="value" id="featPreview">-</div></div>
-        </div>
-      </div>
-
-      <div class="card" style="grid-column: span 2;">
-        <h2>API Endpoints</h2>
-
-        <div class="section-label">OpenAI-Compatible</div>
-        <div class="endpoint">
-          <span class="method post">POST</span>
-          <span class="path">/v1/chat/completions</span>
-          <div class="desc">OpenAI-compatible chat endpoint. Supports streaming.</div>
-        </div>
-        <div class="endpoint">
-          <span class="method get">GET</span>
-          <span class="path">/v1/models</span>
-          <div class="desc">Model list</div>
-        </div>
-
-        <div class="section-label">Management</div>
-        <div class="endpoint">
-          <span class="method post">POST</span>
-          <span class="path">/features</span>
-          <div class="desc">Toggle webSearch, thinking, imageGen, previewMode, persistHistory</div>
-        </div>
-        <div class="endpoint">
-          <span class="method post">POST</span>
-          <span class="path">/admin/session/clear</span>
-          <div class="desc">Clear conversation history</div>
-        </div>
-      </div>
-
-      <div class="card" style="grid-column: span 2;">
-        <h2>Test the OpenAI endpoint</h2>
-        <div class="code-block">
-          <code># Non-streaming
-curl -X POST http://__HOST__/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer __TOKEN__" \
-  -d '{"model":"glm-5","messages":[{"role":"user","content":"Hello!"}],"stream":false}'
-
-# Streaming
-curl -X POST http://__HOST__/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer __TOKEN__" \
-  -d '{"model":"glm-5","stream":true,"messages":[{"role":"user","content":"Say hi"}]}'</code>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    async function updateStatus() {
-      try {
-        const res = await fetch('/status');
-        const d = await res.json();
-        document.getElementById('sessionStatus').textContent = d.connected ? '✓ OK' : '✗ Off';
-        document.getElementById('sessionUser').textContent = d.userName || '-';
-        document.getElementById('msgCount').textContent = d.messageCount || 0;
-        document.getElementById('feVersion').textContent = d.feVersion || '-';
-        document.getElementById('featSearch').textContent = d.features?.webSearch ? 'ON' : 'OFF';
-        document.getElementById('featThink').textContent = d.features?.thinking ? 'ON' : 'OFF';
-        document.getElementById('featImage').textContent = d.features?.imageGen ? 'ON' : 'OFF';
-        document.getElementById('featPreview').textContent = d.features?.previewMode ? 'ON' : 'OFF';
-      } catch(e) { console.error(e); }
-    }
-    updateStatus();
-    setInterval(updateStatus, 3000);
-  </script>
-</body>
-</html>`
-
-    html = strings.ReplaceAll(html, "__HOST__", host)
-    html = strings.ReplaceAll(html, "__TOKEN__", config.Auth.Token)
-    return html
-}
-
-// ============================================================================
 // MIDDLEWARE
 // ============================================================================
 
@@ -2335,7 +2842,7 @@ func corsMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Access-Control-Allow-Origin", "*")
         w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id, X-Fresh-Session, Include-All-Features")
+        w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Include-All-Features, x-api-key, anthropic-version")
         if r.Method == "OPTIONS" {
             w.WriteHeader(200)
             return
@@ -2352,6 +2859,10 @@ func checkAuth(r *http.Request) bool {
     provided := authHeader
     if len(authHeader) >= 7 && strings.EqualFold(authHeader[:7], "Bearer ") {
         provided = authHeader[7:]
+    }
+    // Anthropic clients send the API key via x-api-key header
+    if provided == "" {
+        provided = r.Header.Get("x-api-key")
     }
     return provided == config.Auth.Token
 }
@@ -2387,12 +2898,7 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
         http.NotFound(w, r)
         return
     }
-    host := r.Host
-    if host == "" {
-        host = fmt.Sprintf("localhost:%d", config.Server.Port)
-    }
-    w.Header().Set("Content-Type", "text/html")
-    w.Write([]byte(getDashboardHTML(host)))
+    http.Redirect(w, r, "/health", http.StatusFound)
 }
 
 func statusHandler(w http.ResponseWriter, r *http.Request) {
@@ -2408,18 +2914,13 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
         userIDPreview = uid + "..."
     }
 
-    sessionsMu.Lock()
-    activeSessions := len(sessions)
-    sessionsMu.Unlock()
-
     writeJSON(w, 200, map[string]interface{}{
-        "connected":      session.Initialized,
-        "userName":       session.UserName,
-        "userId":         userIDPreview,
-        "feVersion":      session.FeVersion,
-        "activeSessions": activeSessions,
-        "features":       session.Features,
-        "mode":           "direct",
+        "connected": session.Initialized,
+        "userName":  session.UserName,
+        "userId":    userIDPreview,
+        "feVersion": session.FeVersion,
+        "features":  session.Features,
+        "mode":      "direct",
     })
 }
 
@@ -2547,6 +3048,32 @@ func getModelCapabilities(modelID string) map[string]interface{} {
         }
     }
     return nil
+}
+
+// modelSupportsReasoningEffort returns true only when the model's capabilities
+// JSON explicitly contains "reasoning_effort": true.
+// Models with "reasoning_effort": false or without the field are NOT supported.
+func modelSupportsReasoningEffort(modelID string) bool {
+    if modelID == "" {
+        return false
+    }
+    caps := getModelCapabilities(modelID)
+    if caps == nil {
+        return false
+    }
+    v, ok := caps["reasoning_effort"].(bool)
+    return ok && v
+}
+
+// isValidReasoningEffort validates the accepted reasoning_effort values.
+// Accepted: "high", "max". Any other value is rejected.
+func isValidReasoningEffort(value string) bool {
+    switch value {
+    case "high", "max":
+        return true
+    default:
+        return false
+    }
 }
 
 func modelsHandler(w http.ResponseWriter, r *http.Request) {
@@ -2984,15 +3511,16 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
     }
 
     var body struct {
-        Model      string          `json:"model"`
-        Messages   json.RawMessage `json:"messages"`
-        Stream     *bool           `json:"stream"`
-        Reasoning  *bool           `json:"reasoning"`
-        Thinking   json.RawMessage `json:"thinking"`
-        WebSearch  *bool           `json:"webSearch"`
-        Search     *bool           `json:"search"`
-        Tools      json.RawMessage `json:"tools"`
-        ToolChoice json.RawMessage `json:"tool_choice"`
+        Model           string          `json:"model"`
+        Messages        json.RawMessage `json:"messages"`
+        Stream          *bool           `json:"stream"`
+        Reasoning       *bool           `json:"reasoning"`
+        Thinking        json.RawMessage `json:"thinking"`
+        WebSearch       *bool           `json:"webSearch"`
+        Search          *bool           `json:"search"`
+        Tools           json.RawMessage `json:"tools"`
+        ToolChoice      json.RawMessage `json:"tool_choice"`
+        ReasoningEffort string          `json:"reasoning_effort"`
     }
     bodyBytes, err := io.ReadAll(r.Body)
     if err != nil {
@@ -3020,7 +3548,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
         stream = *body.Stream
     }
 
-    reqSession := getOrCreateSession(r)
+    chatID := randomUUID()
     requestId := generateID()
 
     // ── Agent mode: transform tools & roles for Z.AI compatibility ──
@@ -3048,9 +3576,9 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
     // Per-request overrides are only set if explicitly provided in the body.
     opts := SendOptions{
         Model:             model,
-        ChatID:            reqSession.ChatID,
-        Messages:          reqSession.Messages,
+        ChatID:            chatID,
         ClientMessagesRaw: transformedMessages,
+        ReasoningEffort:   body.ReasoningEffort,
     }
 
     // Parse thinking configuration:
@@ -3180,6 +3708,15 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                 } else {
                     fullContent += result.Chunk
                 }
+                
+                // Detect content shrinkage (e.g., edit_content truncated the text)
+                if len(fullContent) < len(sentContent) {
+                    sentContent = ""
+                    if interceptor != nil {
+                        interceptor = newAgentStreamInterceptor()
+                    }
+                }
+                
                 if len(fullContent) <= len(sentContent) {
                     continue
                 }
@@ -3210,6 +3747,16 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                     c := formatOpenAIResponse(ResponseResult{Content: rem}, model, requestId, true)
                     writeSSE(toJSON(c))
                 }
+                
+                // Safety net: fallback tool call extraction at stream end
+                if !toolCallEmitted {
+                    toolCalls := extractAgentToolCalls(fullContent)
+                    if len(toolCalls) > 0 {
+                        emitToolCallChunk(toolCalls)
+                        toolCallEmitted = true
+                    }
+                }
+
                 if toolCallEmitted {
                     finalChunk := map[string]interface{}{
                         "id":      "chatcmpl-" + requestId,
@@ -3239,16 +3786,6 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
         close(keepAliveStop)
         wg.Wait()
 
-        session.mu.Lock()
-        if session.Features.PersistHistory {
-            promptJSON, _ := json.Marshal(prompt)
-            reqSession.Messages = append(reqSession.Messages, Message{Role: "user", Content: json.RawMessage(promptJSON)})
-            if fullContent != "" {
-                contentJSON, _ := json.Marshal(fullContent)
-                reqSession.Messages = append(reqSession.Messages, Message{Role: "assistant", Content: json.RawMessage(contentJSON)})
-            }
-        }
-        session.mu.Unlock()
     } else {
         ch, err := sendToZAI(prompt, opts)
         if err != nil {
@@ -3276,22 +3813,11 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
             }
         }
 
-
         // Agent-mode: parse out tool-call blocks for non-stream response
         if config.AgentMode {
             toolCalls := extractAgentToolCalls(fullContent)
             if len(toolCalls) > 0 {
                 stripped := stripAgentToolCallBlocks(fullContent)
-                session.mu.Lock()
-                if session.Features.PersistHistory {
-                    promptJSON, _ := json.Marshal(prompt)
-                    reqSession.Messages = append(reqSession.Messages, Message{Role: "user", Content: json.RawMessage(promptJSON)})
-                    if fullContent != "" {
-                        contentJSON, _ := json.Marshal(fullContent)
-                        reqSession.Messages = append(reqSession.Messages, Message{Role: "assistant", Content: json.RawMessage(contentJSON)})
-                    }
-                }
-                session.mu.Unlock()
                 writeJSON(w, 200, map[string]interface{}{
                     "id":      "chatcmpl-" + requestId,
                     "object":  "chat.completion",
@@ -3323,17 +3849,6 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                 return
             }
         }
-
-        session.mu.Lock()
-        if session.Features.PersistHistory {
-            promptJSON, _ := json.Marshal(prompt)
-            reqSession.Messages = append(reqSession.Messages, Message{Role: "user", Content: json.RawMessage(promptJSON)})
-            if fullContent != "" {
-                contentJSON, _ := json.Marshal(fullContent)
-                reqSession.Messages = append(reqSession.Messages, Message{Role: "assistant", Content: json.RawMessage(contentJSON)})
-            }
-        }
-        session.mu.Unlock()
 
         writeJSON(w, 200, formatOpenAIResponse(ResponseResult{Content: fullContent, Reasoning: fullReasoning}, model, requestId, false))
     }
@@ -3455,6 +3970,11 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
         if snakeKey == "think" {
             continue
         }
+        // reasoning_effort is a per-request parameter validated against model
+        // capabilities; it is NOT stored as a persistent override.
+        if snakeKey == "reasoning_effort" {
+            continue
+        }
         state.Overrides[snakeKey] = v
     }
 
@@ -3480,9 +4000,6 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
     if v, ok := resolved["preview_mode"].(bool); ok {
         session.Features.PreviewMode = v
     }
-    if v, ok := overrides["persist_history"].(bool); ok {
-        session.Features.PersistHistory = v
-    }
     session.Features.ImageGen = false
     session.mu.Unlock()
 
@@ -3499,14 +4016,6 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func statsHandler(w http.ResponseWriter, r *http.Request) {
-    sessionsMu.Lock()
-    totalMessages := 0
-    for _, s := range sessions {
-        totalMessages += len(s.Messages)
-    }
-    activeSessions := len(sessions)
-    sessionsMu.Unlock()
-
     session.mu.Lock()
     initialized := session.Initialized
     session.mu.Unlock()
@@ -3517,11 +4026,10 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
     }
 
     writeJSON(w, 200, map[string]interface{}{
-        "mode":           "direct",
-        "totalClients":   totalClients,
-        "activeSessions": activeSessions,
+        "mode":         "direct",
+        "totalClients": totalClients,
         "stats": map[string]interface{}{
-            "totalRequests": totalMessages / 2,
+            "totalRequests": 0,
         },
     })
 }
@@ -3552,41 +4060,6 @@ func clientsHandler(w http.ResponseWriter, r *http.Request) {
         clients = []map[string]interface{}{}
     }
     writeJSON(w, 200, map[string]interface{}{"clients": clients})
-}
-
-func clearSessionHandler(w http.ResponseWriter, r *http.Request) {
-    sessionsMu.Lock()
-    sessions = make(map[string]*ClientSession)
-    sessionsMu.Unlock()
-    log.Println("[Session] All session histories cleared.")
-    writeJSON(w, 200, map[string]interface{}{
-        "success":        true,
-        "message":        "All session histories cleared",
-        "activeSessions": 0,
-    })
-}
-
-func clearClientHandler(w http.ResponseWriter, r *http.Request) {
-    if !checkAuth(r) {
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(401)
-        json.NewEncoder(w).Encode(map[string]interface{}{
-            "type": "error",
-            "error": map[string]interface{}{
-                "type":    "authentication_error",
-                "message": "Invalid or missing authentication token",
-            },
-        })
-        return
-    }
-    if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/clear") {
-        sessionsMu.Lock()
-        sessions = make(map[string]*ClientSession)
-        sessionsMu.Unlock()
-        writeJSON(w, 200, map[string]interface{}{"success": true, "message": "History cleared"})
-        return
-    }
-    http.NotFound(w, r)
 }
 
 func injectHandler(w http.ResponseWriter, r *http.Request) {
@@ -3635,16 +4108,16 @@ func main() {
     mux := http.NewServeMux()
 
     mux.HandleFunc("/", dashboardHandler)
+    mux.HandleFunc("/health", healthHandler)
     mux.HandleFunc("/status", statusHandler)
     mux.HandleFunc("/v1/models", authMiddleware(modelsHandler))
     mux.HandleFunc("/models", authMiddleware(modelsHandler2))
     mux.HandleFunc("/v1/chat/completions", authMiddleware(chatCompletionsHandler))
+    mux.HandleFunc("/v1/messages", authMiddleware(anthropicMessagesHandler))
     mux.HandleFunc("/features", authMiddleware(featuresHandler))
     mux.HandleFunc("/admin/stats", statsHandler)
     mux.HandleFunc("/admin/health", healthHandler)
     mux.HandleFunc("/admin/clients", clientsHandler)
-    mux.HandleFunc("/admin/session/clear", authMiddleware(clearSessionHandler))
-    mux.HandleFunc("/admin/clients/", clearClientHandler)
     mux.HandleFunc("/inject.js", injectHandler)
     mux.HandleFunc("/stop", authMiddleware(stopHandler))
 
@@ -3659,13 +4132,14 @@ func main() {
 ╠═══════════════════════════════════════════════════════════════╣
 ║  Mode:          DIRECT HTTP (no browser needed)               ║
 ║  Captcha IPC:   IN-MEMORY (no FIFO / named pipe)             ║
-║  Dashboard:     http://localhost:%d                      ║
+║  Health:        http://localhost:%d/health               ║
 ╠═══════════════════════════════════════════════════════════════╣
-║  OpenAI API:    http://localhost:%d/v1/chat/completions  ║
+║  OpenAI API:    http://localhost:%d/v1/chat/completions
+║  Anthropic API: http://localhost:%d/v1/messages  ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║  Auth Token:    %s║
 ╚═══════════════════════════════════════════════════════════════╝
-`, config.Server.Port, config.Server.Port, tokenPadded)
+`, config.Server.Port, config.Server.Port, config.Server.Port, tokenPadded)
 
     go func() {
         if err := initializeSession(); err != nil {
