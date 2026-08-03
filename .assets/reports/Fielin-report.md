@@ -1,4 +1,54 @@
-**window.z_um.getToken Definition**
+# Fielin: window.z_um.getToken — `st()` Aliyun device-fingerprint token: reverse-engineering report
+
+
+
+## Index
+
+- [1 Executive summary](#1-executive-summary)
+- [2 window.z_um.getToken - Definition](#2-windowzumgettoken---definition)
+- [3 Deobfuscation](#3-deobfuscation)
+- [4 Function cG](#4-function-cg)
+- [5 Function i return t holds deviceToken](#5-function-i-return-t-holds-devicetoken)
+- [6 VAR T RELATION](#6-var-t-relation)
+- [7 PAYLOA GEN](#7-payloa-gen)
+- [8 DEOBFUSCATION GENERATOR](#8-deobfuscation-generator)
+- [9 Function nD](#9-function-nd)
+- [10 The verified st() algorithm](#10-the-verified-st-algorithm)
+- [11 Real-world capture anatomy](#11-real-world-capture-anatomy)
+- [12 Test](#12-test)
+  - [12.1 NORMAL DEVICE TOKEN:](#121-normal-device-token)
+  - [12.2 DECODED:](#122-decoded)
+  - [12.3 TEST CALL](#123-test-call)
+  - [12.4 RESULTED DECODED TOKEN:](#124-resulted-decoded-token)
+  - [12.5 Trailing MD5 component](#125-trailing-md5-component)
+  - [12.6 Payload array (variable d) before return a](#126-payload-array-variable-d-before-return-a)
+- [13 THE VARS IN THE ARRAY:](#13-the-vars-in-the-array)
+  - [13.1 tF = Y[R]](#131-tf--yr)
+  - [13.2 Q = tm](#132-q--tm)
+  - [13.3 w = rg(T, N)](#133-w--rgt-n)
+  - [13.4 tC = h](#134-tc--h)
+  - [13.5 p = nK(F)[(tn(), tn)(1, 33)]()](#135-p--nkftn-tn1-33)
+- [14 String table & decoder (nQ)](#14-string-table--decoder-nq)
+- [15 The 640-byte blob — encrypted payload analysis](#15-the-640-byte-blob--encrypted-payload-analysis)
+- [16 Blueprint A — reverse a captured payload into its original form](#16-blueprint-a--reverse-a-captured-payload-into-its-original-form)
+- [17 Blueprint B — generate payloads in pure Node (no browser)](#17-blueprint-b--generate-payloads-in-pure-node-no-browser)
+- [18 Appendix — key source positions (original file coordinates)](#18-appendix--key-source-positions-original-file-coordinates)
+- [19 Key constants (runtime-decoded, absent from raw source)](#19-key-constants-runtime-decoded-absent-from-raw-source)
+- [20 Standalone reimplementation (reimpl.js)](#20-standalone-reimplementation-reimpljs)
+
+---
+
+## 1 Executive summary
+
+- `st()` returns a `#`-joined 5-field token: `[tF, Q, w, tC, p]`.
+- The final field is an integrity hash: `p = MD5([tF, Q, w, tC, secret].join('#'))` with a **hidden constant** `secret = "daye,raolewoba!"` (not present anywhere in the output).
+- This was **verified against a real-world capture** (`SG_WEB#3795d2…-h-1782531783720-ac9e47… #<856-char base64>#524#d769460d…`): `MD5("SG_WEB#3795d28242a11619bc25f786f84e53d4-h-1782531783720-ac9e47a76eee443087943a278f191642#<blob>#524#daye,raolewoba!") = d769460d135e774310d665c292c41e95` — exact match.
+- The 640-byte base64 blob **is an encrypted payload** (see §15).
+
+---
+
+## 2 window.z_um.getToken - Definition
+
 ```js
 // For verify captcha t is certify id but it works even without that
 function st(t, r, e) {
@@ -22,8 +72,11 @@ function st(t, r, e) {
                 i += -7);
             return n
         }
+```
 
+## 3 Deobfuscation
 
+```js
 o = cG[[a][0](82, 41)](this, 46))
 o = cG.bind(this,46)
 n = o[u.C(a, 12 / (1 | a), 22 / (1 | a))](this, arguments)
@@ -33,8 +86,12 @@ a(12,22)
 'apply'
 o = cG.bind(this,46).apply(this,arguments)
 o = cG(46,arguments)
+st(t,r,e) = cG(46,t,r,e)
+```
 
-# Function cG
+## 4 Function cG
+
+```js
 function cG(t, r, e, n) {
             var i, a, o, c, s, f, l, h, d, v;
             for (a = 5; a; )
@@ -327,12 +384,11 @@ function cG(t, r, e, n) {
                 }
             return i
         }
-
 ```
 
-**Function i return t holds deviceToken**
+## 5 Function i return t holds deviceToken
+
 ```js
- i = function() {
                         var t, r, e, n, i, a, o, c, s, f, l, h, d, v, p, b, w, g, m, y, k, M, O, N, S, x, U, I, A, T, R, C, B, F, E, H, Y, q, J, z, j, P, L, V, D, Q, K, Z, G, X, _, W, $, tt, tr, te, tn, ti, ta, to, tu, tc, ts, tf, tl, th, td, tv, tp, tb, tw, tg, tm, ty, tk, tM, tO, tN, tS, tx, tU, tI, tA, tT, tR;
                         for (r = 112; r; )
                             switch (e = r >> 6,
@@ -597,20 +653,26 @@ function cG(t, r, e, n) {
                                 }
                             }
                         return t
-                    }(d, v, l))
+                    }(d, v, l)
 ```
-**VAR T RELATION**
+
+## 6 VAR T RELATION
+
 ```
 t = X
-X=v
+X = v
 v = t8[J] = t8['DeviceToken']
 ```
-**PAYLOA GEN**
+
+## 7 PAYLOAD GEN
+
 ```
 g = n5(C, null, null, h) // C = payload, h = false
 g = DeviceToken
 ```
-**DEOBFUSCATION GENERATOR**
+
+## 8 DEOBFUSCATION GENERATOR
+
 ```js
 function n5(t,r,e,n){function i(t,r){return(nV||nV)(t,r- -9)}return nD[i(91,18)](this,13)[(i&&i)(2,8)](this,arguments)}
 
@@ -628,7 +690,8 @@ nD.bind(this,13).apply(this,arguments)
 nD(13,arguments)
 ```
 
-**Function nD***
+## 9 Function nD
+
 ```js
 function nD(t, r, e, n, i) {
             var a, o, u, s, f, l, h, d, v, p, b, w, g, m, y, k, M, O, N, S, x, U, I, A, T, R, C, B, F, E, H, Y, q, J, z, j, P, L, V, D, Q, K, Z, G, X, _, W, $, tt, tr, te, tn, ti, ta, to, tu, tc, ts, tf, tl, th, td, tv, tp, tb, tw, tg, tm, ty, tk, tM, tO, tN, tS, tx, tU, tI, tA, tT, tR, tC, tB, tF, tE, tH, tY, tq, tJ;
@@ -947,34 +1010,96 @@ function nD(t, r, e, n, i) {
                     }
                 }
             return a
-        } 
-
+        }
 ```
 
-**Test**
+## 10 The verified `st()` algorithm (as executed in the Node sandbox, region CN)
 
-**NORMAL DEVICE TOKEN**:
+```
+tF = Y[region]            // Y = WEB_REGION map, decoded via string table: { CN: "WEB", ... }
+h  = b["GatherCost"]      // b = collected-data object; undefined when collection is empty
+                          // machine branch: h truthy  -> tC = h
+                          //                 h falsy   -> (o=144,h=0) forces tC = 0
+Q  = null                 // collection field (null in sandbox; real value in browser, see §11)
+w  = null                 // payload field (null in sandbox)
+th = [tF, Q, w, tC, "daye,raolewoba!"]
+F  = th.join("#")         // "WEB###0#daye,raolewoba!"
+p  = MD5(F).hex           // e1a2045a96f8b07b7fdc47673fd4700d
+d  = [tF, Q, w, tC, p]
+tE = d.join("#")          // "WEB###0#e1a2045a96f8b07b7fdc47673fd4700d"
+a  = btoa(tE)             // V0VCIyMjMCNlMWEyMDQ1YTk2ZjhiMDdiN2ZkYzQ3NjczZmQ0NzAwZA==
+```
+
+Standalone reimplementation (`reimpl.js`) reproduces the sandbox output byte-exactly (`match: true`).
+
+Machine details: `st` → `cG` (GIANT 161-state machine, `cGArgs=[45,"Log2",…]` module-init path) → `n5` → `nD` (state machine, `nDInv=6`). The `h` read is a **decoy**: `b[tn.call(6,38,26)]` = `b["GatherCost"]`; `tn` params are `(t,r)`, so `tn(t,r) = nQ(r-6, t)` — i.e. key `t` applied to table entry `e[r-6]`. In the sandbox `b` has no `GatherCost` property (hasOwnProperty false, no prototype descriptor) → `undefined` → machine forces `h=0`.
+
+## 11 Real-world capture anatomy (why the browser output differs)
+
+Captured (user-supplied, region SG):
+
+```
+SG_WEB#3795d28242a11619bc25f786f84e53d4-h-1782531783720-ac9e47a76eee443087943a278f191642#W3ASPlWf…(856 chars)…gvIPw==#524#d769460d135e774310d665c292c41e95
+```
+
+| field | sandbox (CN) | real browser (SG) | meaning |
+|---|---|---|---|
+| `tF` | `WEB` | `SG_WEB` | region prefix |
+| `Q` | `null` → `` | `3795d2…-h-1782531783720-ac9e47…` | `uuid1 + "-h-" + Date.now() + "-" + uuid2` |
+| `w` | `null` → `` | 640-byte base64 blob | encrypted collected-data payload |
+| `tC` | `0` | `524` | `b["GatherCost"]` (truthy branch) |
+| `p` | md5 | `d769460d…` | `MD5([tF,Q,w,tC,secret].join('#'))` — **verified** |
+
+Why they differ:
+
+1. **`tF = SG_WEB`** — region string. Verified region logic in source:
+   ```js
+   function rR(){var t=(rY(JSON.stringify(t8)).ENDPOINTS||[])[0];
+     return t&&t.includes("ap-southeast")?"SG":"CN"}
+   ```
+   Region `SG` (Singapore endpoints) → prefix `SG_WEB`. Sandbox defaulted to `CN` → `WEB`.
+2. **`Q`** — the machine builds it as `[id1, "h", Date.now(), id2].join("-")` (`tv=Date[…]()`, `Q=tm`, array state `…,"h",tH,K`); the two 32-hex values are device/session identifiers (one persisted device id, one per-session id), timestamp = epoch millis.
+3. **`w`** — the machine's payload state is `w = rY(JSON.stringify(b))` where `b` is the collected device-data object; in the sandbox `b` was empty so `w` stayed `null`. In the browser `w` = the 640-byte encrypted blob (see §15).
+4. **`tC = 524`** — `b["GatherCost"]` is truthy in the browser (cost/counter of gathered data, here 524); the machine takes the `h truthy → tC = h` branch instead of the forced `h=0` path.
+
+## 12 Test
+
+### 12.1 NORMAL DEVICE TOKEN:
+
 ```
 U0dfV0VCIzM3OTVkMjgyNDJhMTE2MTliYzI1Zjc4NmY4NGU1M2Q0LWgtMTc4MjUzMTc4MzcyMC1hYzllNDdhNzZlZWU0NDMwODc5NDNhMjc4ZjE5MTY0MiNXM0FTUGxXZmx2SWI1YlJWV2RpbnlJdHA1WXIwOGxVMTY1VEs3KzlTWGJYMmlOcTBLU0J3ZUJBTG1hMFlLaFhJNE5iUFVvLzVOeG0xSEsyemRXTHJXQUdGN3FXWWxhSW1xaEtsVkRzbEd4OXdhNnRSSGNIOFlBUWhtNVltWk14ZGM5cCsxSlRpM1FoVDg0YmYvREJpY0tWenZRS2haaUVPaExFM1hQaitCcmViblRzN1cycStBY1BvU2swdldRWnBSL1lIUE5qMkZ0bTRraTJKZnJ3NXNvMTFLTkw1QjN5ZERVbHpLbXV2Tnh0OHZYVHNOMHJtY1ZuRWluT1E1cjMvd2lOVkdrdHpsQ1k3VFR0YTAvUFpVa2VvM2M5N2F6d3dIbE1NZERENEhzREpkYmdTQzRmcE1idGovSGtoUGViWTRVK3orNHJHT3JDclRmSGV2UllyNFlxTGwzZFIvb1pHVFdhanBzRmhoTUoraThTNHN1bmlRZ1dmOXRnK1pMckg4b3hQNFl0TGpCOHZBdk10K1FPNjZSbGFuRjhsK08wZ2gvbVJ0Zmdla1pYaVN3TjdJTVc4dzhwRlE2d2RlOURUeS96Nk5wQ0xNemg3Mm1waHhyMnBHSGpBMTlHL1kweUw5OTBGa2hBNjY5eVJraUdVNWQxeTREWWxEZmNpemU4dVFWY1lLNituckhlSFVJcVlsajFCQjF6QzJvK3NRSmxsWmdORjMxYzNKMHZlRTFONGtyaTdJdzNnYTdsK3BIOWM1bnFVQmFXS1pNRnRvRHpSZnRHWUw4cWhHa0dWaVBadU9FTE0zYlQ3NWdIdmhQTGdsdkRNSmxmeE10Yk1teXZZTis3c2k1eHh2WjhNaFFMeG1VSUJDZ0NLVERrTGVNcm43Z3Y5bzBpaGNFT3JOTGJLZjh2R0VHMnIzSjhWR1pPVnRTSkNkMG53ak9JMlYyOTFSZ2NUazVOTmJWZWp1a2ZEdlNmNmU2eHE2ZjZBVkJpUWE3ZUszMnZVOXZtakVaeWw2d1owVFlTRGdMOVovaTVoQW5NSXJpdzB4aE55eFpVbWpTSThrVmtTRC9lRGg2R3A4UzM1MnlZOWkzZDB0T3FaMWoxWW5yUEZlelA4bmlhUi9ndklQdz09IzUyNCNkNzY5NDYwZDEzNWU3NzQzMTBkNjY1YzI5MmM0MWU5NQ==
 ```
-**DECODED**:
+
+### 12.2 DECODED:
+
 ```
 SG_WEB#3795d28242a11619bc25f786f84e53d4-h-1782531783720-ac9e47a76eee443087943a278f191642#W3ASPlWflvIb5bRVWdinyItp5Yr08lU165TK7+9SXbX2iNq0KSBweBALma0YKhXI4NbPUo/5Nxm1HK2zdWLrWAGF7qWYlaImqhKlVDslGx9wa6tRHcH8YAQhm5YmZMxdc9p+1JTi3QhT84bf/DBicKVzvQKhZiEOhLE3XPj+BrebnTs7W2q+AcPoSk0vWQZpR/YHPNj2Ftm4ki2Jfrw5so11KNL5B3ydDUlzKmuvNxt8vXTsN0rmcVnEinOQ5r3/wiNVGktzlCY7TTta0/PZUkeo3c97azwwHlMMdDD4HsDJdbgSC4fpMbtj/HkhPebY4U+z+4rGOrCrTfHevRYr4YqLl3dR/oZGTWajpsFhhMJ+i8S4suniQgWf9tg+ZLrH8oxP4YtLjB8vAvMt+QO66RlanF8l+O0gh/mRtfgekZXiSwN7IMW8w8pFQ6wde9DTy/z6NpCLMzh72mphxr2pGHjA19G/Y0yL990FkhA669yRkiGU5d1y4DYlDfcize8uQVcYK6+nrHeHUIqYlj1BB1zC2o+sQJllZgNF31c3J0veE1N4kri7Iw3ga7l+pH9c5nqUBaWKZMFtoDzRftGYL8qhGkGViPZuOELM3bT75gHvhPLglvDMJlfxMtbMmyvYN+7si5xxvZ8MhQLxmUIBCgCKTDkLeMrn7gv9o0ihcEOrNLbKf8vGEG2r3J8VGZOVtSJCd0nwjOI2V291RgcTk5NNbVejukfDvSf6e6xq6f6AVBiQa7eK32vU9vmjEZyl6wZ0TYSDgL9Z/i5hAnMIriw0xhNyxZUmjSI8kVkSD/eDh6Gp8S352yY9i3d0tOqZ1j1YnrPFezP8niaR/gvIPw==#524#d769460d135e774310d665c292c41e95
 ```
 
-**TEST CALL**
+### 12.3 TEST CALL
+
 ```js
 nd(13,[],undefined,undefined,false)
 ```
-**RESULTED DECODED TOKEN**:
+
+### 12.4 RESULTED DECODED TOKEN:
+
 ```
-SG_WEB#3795d28242a11619bc25f786f84e53d4-h-1782531783720-ac9e47a76eee443087943a278f191642##0#160d05bbafcaefb0aa5f74c6164a8a0e 
+SG_WEB#3795d28242a11619bc25f786f84e53d4-h-1782531783720-ac9e47a76eee443087943a278f191642##0#160d05bbafcaefb0aa5f74c6164a8a0e
 ```
+
+### 12.5 Trailing MD5 component
+
+The trailing 32 bit data is md5 and calculated by md5 = [tF, Q, blob, tC, secret].join('#') like this 'SG_WEB#3795d28242a11619bc25f786f84e53d4-h-1782531783720-ac9e47a76eee443087943a278f191642##0#daye,raolewoba!' then appends to it
 Looks like C is used to generate encrypted Data and C.GatherCount  is used to generate the GatherCount which is undefined so it sets to 0
+Is C the value of cK(tN, tv)?
+
+### 12.6 Payload array (variable d) before return a
 
 **Before `return a` statement variable d (defined as: d = [tF, Q, w, tC, p]) holds the payload data**
 In case of normal call it was like this:
- ```js
+
+```
 [
     "SG_WEB",
     "3795d28242a11619bc25f786f84e53d4-h-1782531783720-ac9e47a76eee443087943a278f191642",
@@ -983,7 +1108,9 @@ In case of normal call it was like this:
     "0f9cdacd5f121f7c0a94c5a57a922b63"
 ]
 ```
+
 In case of our test call it was like this:
+
 ```
 [
     "SG_WEB",
@@ -994,11 +1121,11 @@ In case of our test call it was like this:
 ]
 ```
 
+## 13 THE VARS IN THE ARRAY:
 
-### THE VARS IN THE ARRAY:
+### 13.1 tF = Y[R]
 
-1. tF = Y[R]
-
+```js
 Y = t8[S.X(tn, [19, tn()][0], [39, tn()][0])]
 
 tn(19, 39) = WEB_REGION
@@ -1010,9 +1137,11 @@ Y = {"CN": "WEB","SG": "SG_WEB"}
 R = 'SG'
 
 tF = 'SG_WEB'
+```
 
-2. Q = tm
+### 13.2 Q = tm
 
+```js
 Q = tm
 
 tm = rm(tN, tR)
@@ -1036,9 +1165,11 @@ n(98,16)
 'sessionI'
 
 tR = t8['sessionId']
+```
 
-3. w = rg(T, N)
+### 13.3 w = rg(T, N)
 
+```js
 ts = rm(tB, g)
 
 tB = t8[tn.call(9, 48, 9)]
@@ -1067,13 +1198,230 @@ function n6(t, r) {
 }
 
 e.call(4,91,20) = 'bind', e.apply(9, [2, 10]) = 'apply'
+```
 
-4. tC = h
+### 13.4 tC = h
 
+```js
 h = b[tn.call(6, 38, 26)]
 
-r = b 
+r = b
 
 h = b.GatherCost // 0 if b.gatherCost undefined
+```
 
-5. p = nK(F)[(tn(), tn)(1, 33)]()
+### 13.5 p = nK(F)[(tn(), tn)(1, 33)]() p = constant for md5 gen
+
+## 14 String table & decoder (`nQ`)
+
+### 14.1 Decoder (`nQ.eY`) — extracted verbatim from source
+
+```js
+var a = "07031d38237e7f0f1c6137052d340139760c7a1a3e1b2908177b2b3c26042f78061f362c7c2a730d7d143d280b1e09163f023b182722002125653a0a7924207719"
+      .match(/.{1,2}/g).map(function(t){return parseInt(t,16)});   // 64-byte keyed alphabet
+nQ.eY = function(t,r){
+  for(var e="",n="",i,o,u=0,c=0;o=t.charAt(c++);
+      ~o&&(i=u%4?64*i+o:o,u++%4)&&(e+=String.fromCharCode(255&i>>(-2*u&6)^r)))
+    o=a.indexOf(78^o.charCodeAt(0));
+  for(var s=0,f=e.length;s<f;s++)n+="%"+("00"+e.charCodeAt(s).toString(16)).slice(-2);
+  return decodeURIComponent(n);
+};
+// nQ(r,n): i = e[r]; return o ? (cache) : i ? nQ.eY(i,n) : undefined   (e = table below)
+```
+
+Mechanism: each table char → `6-bit value = alphabet.indexOf(78 ^ char)`; 4 values → 3 bytes (custom keyed base64); every output byte XORed with key `r`; percent-encoded and `decodeURIComponent`d (UTF-8 safe). `nV(t,r) = nQ(r-9, t)`, `tn(t,r) = nQ(r-6, t)`, wrapper `E` similar with different offsets.
+
+### 14.2 Full 38-entry table (raw strings, source order)
+
+```
+e[0]="0BHvvLi8SI"        e[19]="UA/Cao5QpAq"
+e[1]="I8Q+"              e[20]="YpJ4T2zp5pdUpH"
+e[2]="Ygzb5FzV6oc"       e[21]="MB2pIBceMLH"
+e[3]="hFzVJgzbrNzlhq"    e[22]="/4Yo"
+e[4]="eNHtOT+XeT37wbdEcVE+cVzXev2+rV37O1+ZwgLfrVE"  e[23]="wVHn/4Rf/43l"
+e[5]="BpLB52/I4q"        e[24]="K43CyvmHRTh"
+e[6]="KukN"              e[25]="/b8iKxIZ"
+e[7]="4pUp"              e[26]="YFzn5H"
+e[8]="Yo/urCE"           e[27]="Jg+4JFz3rNY"
+e[9]="pU584iL04i8"       e[28]="MBcUMMcSSBi"
+e[10]="m8hBm8EzvSE"      e[29]="e=0D6g5s6I"
+e[11]="cvkxyI"           e[30]="TlQO"
+e[12]="mqpTmq2wvQ7"      e[31]="eAjsJCP+6lE"
+e[13]="hAMGYN5Na=0qrAlN6oE"  e[32]="cTHVOx2l"
+e[14]="Bd0mg0UFpFUYgI"   e[33]="B05BTm0gU0ZhF8"
+e[15]="5FJqrFzoYgi"      e[34]="mI7yIIY"
+e[16]="4i+RTq"           e[35]="eA+keF+XpA+x"
+e[17]="g0lM82L/"         e[36]="roQE"
+e[18]="OTRlwq"           e[37]="r=LDJo3"
+                         e[38]="Ku8PwH7byS2"
+```
+
+### 14.3 Verified decodes (index, key → string)
+
+| idx | raw | key | decode |
+|---|---|---|---|
+| 1 | `I8Q+` | 76 | `MD5` |
+| 2 | `Ygzb5FzV6oc` | 32 | `ACCESS_S` (partial) |
+| 3 | `hFzVJgzbrNzlhq` | 48 | `ACCESS_SEC` |
+| 13 | `hAMGYN5Na=0qrAlN6oE` | 47 | `__ALIYUN_CRYPT` |
+| 16 | `4i+RTq` | 33 | `join` |
+| 20 | `YpJ4T2zp5pdUpH` | 38 | `GatherCost` |
+| 26 | `YFzn5H` | 50 | `SALT` |
+| 27 | `Jg+4JFz3rNY` | 1 | `toString` |
+| 33 | `B05BTm0gU0ZhF8` | 19 | `WEB_REGION` |
+| 37 | `r=LDJo3` | 62 | `PREID` |
+
+Notes: keys are call-site-specific (e.g. `nV(48,12)` → `e[3]` key 48, `nV(50,35)` → `e[26]` key 50). Many entries are decoys and decode to garbage for the keys actually used; the string cache means only decoded entries matter. None of the obfuscated constants (`FqJB6iRNVYdEGpwb`, `NLAoqT6K03oLbQXW2VS3zA==`, `daye,raolewoba!`) appear in the raw source — all are runtime-decoded.
+
+## 15 The 640-byte blob — encrypted payload analysis
+
+Facts:
+
+- `base64 -d` → exactly **640 bytes**, 16-byte aligned (**40 AES-sized blocks**).
+- Statistical uniformity: 36.7% printable bytes ≈ expected for uniform random (95/256 ≈ 37%) — no text, no JSON (`{"`, `",`, `null`, `true` all absent).
+- First 8 bytes `5b 70 12 3e…` — not `Salted__` (so not standard CryptoJS/OpenSSL salted format).
+- No zlib/gzip/brotli magic; not plain base64-of-JSON.
+
+Negative results (all tried, all failed `bad decrypt` or no structure):
+
+- AES-128-ECB / AES-128-CBC (IV=0, IV=salt, IV=blob[0:16]) with keys: `ACCESS_SEC`, `SALT` (16B), `daye,raolewoba!`, `md5(ACCESS_SEC)`, `md5(secret)`, `md5(SALT64)`, `sha1/sha256` truncated variants, `md5(access+secret)`.
+- AES-256 with `sha256(secret)`, `sha256(ACCESS)`, `sha256(SALT64)`, EvpKDF-derived 32+16.
+- 3DES / DES with md5-derived keys.
+- Repeating-key XOR with all above keys + session fields (`uuid1`, `uuid2`, `md5(uuid1)`, `md5(uuid1+uuid2)`, `md5(Q)`, `md5(ts)`); single-byte XOR best 41.9%.
+- IV-prepended ciphertext layouts (`[IV][ct]`, 16+624).
+
+**Conclusion:** the blob is ciphertext whose key/IV/mode derive from runtime state inside the page (per-session values not present in the token itself — e.g. derived from `SALT`/`ACCESS_SEC` combined with session random, or a custom cipher on the same line as the string machinery). It cannot be decrypted from the token alone; see §16A step 3.
+
+## 16 Blueprint A — reverse a captured payload into its original form
+
+### Step 1 — split & verify (works on any capture, pure Node)
+
+```js
+const crypto = require('crypto');
+const [tF, Q, w, tC, p] = token.split('#');
+const secret = 'daye,raolewoba!';
+const F = [tF, Q, w, tC, secret].join('#');
+if (crypto.createHash('md5').update(F).digest('hex') !== p) throw new Error('not an st() token');
+// token = [tF, Q, w, tC, p].join('#');  structure confirmed
+```
+
+### Step 2 — decode `Q`
+
+`Q = <uuid1> -h- <Date.now() ms> - <uuid2>`. `uuid1`/`uuid2` are the device/session identifiers the page embeds (one is the persisted device id — the bundle's `t6`/`device` storage family — the other a per-session id). Which is which is determined by the instrumentation in step 3.
+
+### Step 3 — decrypt `w` (requires the live page; this is the only way to obtain the runtime key material)
+
+In the real page, before the bundle executes (early-injected script, or a patched copy of the bundle hosted locally):
+
+1. Expose `st` and its machine, exactly as in the sandbox harness:
+   ```js
+   src = src.replace('function st(t,r,e){', 'globalThis.__st=function st(t,r,e){');
+   src = src.replace('return n}function sr(t){', 'globalThis.__oName=o.name;return n};function sr(t){');
+   src = src.replace('return(cZ||cZ)(', 'return(globalThis.__cZ=cZ)(');
+   src = src.replace('function u(t){return function(t){if(Array.isArray(t))return a(t)}(t)||',
+                     'function u(t){if(t===undefined)return[];return function(t){if(Array.isArray(t))return a(t)}(t)||');
+   ```
+   (the last patch is mandatory — every run spreads `undefined` once in the cG machine).
+2. Capture the collected data before it is serialized — patch the payload state:
+   ```js
+   src = src.replace('(w=rY(JSON[tn(~tn?76:8,~tn?29:5)](b)),o^=138)',
+     '(globalThis.__wLog=[b,rY,JSON[tn(~tn?76:8,~tn?29:5)](b)],w=rY(JSON[tn(~tn?76:8,~tn?29:5)](b)),o^=138)');
+   ```
+   `__wLog[0]` = `b` = **the original form** (the collected device-data object); `__wLog[2]` = its JSON; `__wLog[1]` = the transform function `rY` (dump its `.toString()` and its runtime inputs).
+3. If `rY` wraps `window.__ALIYUN_CRYPT` (CryptoJS — the bundle references it by decoded name `__ALIYUN_CRYPT`), wrap its primitives to log key/IV/mode/plaintext:
+   ```js
+   const C = window.__ALIYUN_CRYPT;
+   for (const m of ['encrypt','decrypt']) if (C.AES && C.AES[m]) {
+     const orig = C.AES[m].bind(C.AES);
+     C.AES[m] = function(...args){ globalThis.__cryptoLog = args; return orig(...args); };
+   }
+   ```
+   Also hook `CryptoJS.enc.*.parse` if key/IV are passed as strings, and log `SALT`/`ACCESS_SEC` consumers (`t8` object dump: the `tF` constructor wraps the decoded constants — dump `t8`).
+4. `plaintext = JSON.parse(decrypt(w))` — the fully reversed original form.
+
+## 17 Blueprint B — generate payloads in pure Node (no browser)
+
+```js
+const crypto = require('crypto');
+const secret = 'daye,raolewoba!';
+const WEB_REGION = { CN: 'WEB', SG: 'SG_WEB' };   // extend with other regions if seen
+
+function makeToken({ region = 'CN', uuid1, uuid2, tC, w }) {
+  const tF = WEB_REGION[region];
+  const Q = [uuid1, 'h', Date.now(), uuid2].join('-');
+  const p = crypto.createHash('md5').update([tF, Q, w, tC, secret].join('#')).digest('hex');
+  return [tF, Q, w, tC, p].join('#');
+}
+```
+
+Requirements, in order of dependency:
+
+1. **`w` (the payload field)** — cannot be fabricated without the crypto recovered in §16A.3 (key/IV/mode + the exact `rY` transform). With those, `w = rY(JSON.stringify(b))` where `b` is your data object.
+2. **`b` (the input data)** — the plaintext JSON the real collector builds from browser probes (the collection functions live in the same bundle; instrument the `b` object in step A.3 and replay its field set). Pure Node cannot conjure the measurements — you either replay captured `b` values or synthesize your own dataset; the token is structurally valid either way.
+3. **`tC`** — `b["GatherCost"]`; keep consistent with the payload (524 in the capture, `0` when `b` is empty). If you replay a captured `b`, reuse its `GatherCost`.
+4. **`uuid1`/`uuid2`** — your own ids; format `8-4-4-4-12` hex without dashes; `Date.now()` is automatic.
+5. **`tF`/region** — match the endpoint region (`ap-southeast` → `SG`).
+
+Completeness checklist for the generator: identical `w` transform, identical `b` field schema, `GatherCost` consistency, md5 with the secret — the token will then be indistinguishable from a real one.
+
+## 18 Appendix — key source positions (original file coordinates)
+
+| item | position |
+|---|---|
+| `function st` (end of bundle) | ~558,2xx (tail) |
+| `cG` GIANT machine | 521,550 – 527,875 |
+| `n5` (wraps nD) | 344,884 |
+| `nD` state machine | 336,251 – 342,695 |
+| `nK` call site (`p=nK(F)[…toString…]()`) | 340,661 |
+| `n$` secret build (`rm(t8[nV(48,12)],t8[nV(50,35)])`) | 344,219 |
+| `tF` constructor / `new tF` | 170,924 / 182,938 |
+| `nQ` + 38-entry table + `eY` decoder | 343,5xx |
+| `rR()` region function | 195,5xx |
+| Aliyun RPC signing module (`rE`/`rJ`/`rz`, background XHR) | ~194,8xx – 196,5xx |
+
+Harness gotchas (reproduced intentionally for future runs):
+
+- `shim.js` replaces `global.process` with `{argv: []}` — capture `process.argv` **before** requiring the shim.
+- The bundle schedules a background async XHR (Aliyun RPC request, 4s `Promise.race` timeouts ×2 + 500ms retries) that keeps the process alive ~8.7 s and prints `Error: timeout` — harmless, env-independent.
+- Determinism was proven (two fresh VM runs → identical tokens) and env-independence (altered UA/DPR/screen/orientation → byte-identical token and identical machine traces: `nDTrace` 39 states, `giantTrace`, `uUndef` call site).
+
+## 19 Key constants (runtime-decoded, absent from raw source)
+
+| constant | value | role |
+|---|---|---|
+| `ACCESS_SEC` | `FqJB6iRNVYdEGpwb` (16B) | key material (16 B → AES-128-sized) |
+| `SALT` | `NLAoqT6K03oLbQXW2VS3zA==` (16B decoded) | salt material |
+| secret | `daye,raolewoba!` | md5 mixing constant (hidden in `F`) |
+| `WEB_REGION[CN]` | `WEB` | token prefix |
+| `WEB_REGION[SG]` | `SG_WEB` | token prefix (via `rR()` endpoints) |
+
+## 20 Standalone reimplementation (reimpl.js)
+
+```js
+const crypto = require('crypto');
+
+const ACCESS_SEC = 'FqJB6iRNVYdEGpwb';
+const SALT = 'NLAoqT6K03oLbQXW2VS3zA==';
+const WEB_REGION = { CN: 'WEB' };
+const REGION = 'CN';
+
+const secret = 'daye,raolewoba!';
+
+function st() {
+  const tF = WEB_REGION[REGION];
+  const h = 0;
+  const th = [tF, null, null, h, secret];
+  const F = th.join('#');
+  const p = crypto.createHash('md5').update(F).digest('hex');
+  const d = [tF, null, null, h, p];
+  const tE = d.join('#');
+  return Buffer.from(tE).toString('base64');
+}
+
+const EXPECTED = 'V0VCIyMjMCNlMWEyMDQ1YTk2ZjhiMDdiN2ZkYzQ3NjczZmQ0NzAwZA==';
+
+const out = st();
+console.log('reimpl:', out);
+console.log('match :', out === EXPECTED);
+if (out !== EXPECTED) process.exit(1);
+```

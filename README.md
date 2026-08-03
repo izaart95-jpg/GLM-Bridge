@@ -565,4 +565,4 @@ zai-api/
 
 ## License
 
-Provided as-is for educational and interoperability purposes. Use responsibly and in accordance with Z.AI's terms of service.
+Provided under MIT License. Use responsibly and in accordance with Z.AI's terms of service.
