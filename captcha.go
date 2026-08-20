@@ -17,6 +17,7 @@
 //   ./token-collector --tokens 750 --batch 3
 //   ./token-collector --headed         # visible browser for debugging
 
+
 package main
 
 import (
@@ -24,6 +25,7 @@ import (
     "database/sql"
     "flag"
     "fmt"
+    "math/rand"
     "os"
     "path/filepath"
     "regexp"
@@ -56,15 +58,21 @@ const (
     // Parallel workers = parallel PAGES on a single browser (not parallel browsers)
     MaxParallel       = 3
     UnsafeMaxParallel = 5
+
+    // Stealth identity — keep these coherent with each other AND with the
+    // region of your egress IP. If you proxy through Tokyo, switch to
+    // Asia/Tokyo + ja-JP and a matching Accept-Language.
+    StealthTimezone = "America/New_York"
+    StealthLocale   = "en-US"
 )
 
 // ---------- Flags ----------
 var (
-    unsafeFlag   = flag.Bool("unsafe", false, "increase token limit to 1500 and batch limit to 25")
-    tokensFlag   = flag.Int("tokens", 0, "tokens per batch (0 = prompt)")
-    batchFlag    = flag.Int("batch", 0, "number of batches (0 = prompt)")
-    headedFlag   = flag.Bool("headed", false, "show browser window for debugging")
-    parallelFlag = flag.Int("parallel", 0, "parallel workers (pages) on a single browser; 0 = prompt y/N")
+    unsafeFlag        = flag.Bool("unsafe", false, "increase token limit to 1500 and batch limit to 25")
+    tokensFlag        = flag.Int("tokens", 0, "tokens per batch (0 = prompt)")
+    batchFlag         = flag.Int("batch", 0, "number of batches (0 = prompt)")
+    headedFlag        = flag.Bool("headed", false, "show browser window for debugging")
+    parallelFlag      = flag.Int("parallel", 0, "parallel workers (pages) on a single browser; 0 = prompt y/N")
     blockTrackersFlag = flag.Bool("block-trackers", false, "enable URL allowlist filter to block trackers (off by default)")
     noTUIFlag         = flag.Bool("no-tui", false, "disable TUI, use plain text output")
 )
@@ -424,6 +432,425 @@ func (ts *tokenStore) close() {
     ts.db.Close()
 }
 
+// =====================================================================
+// STEALTH LAYER — make headless Chromium indistinguishable from a real
+// interactive Chrome running on a desktop.
+// =====================================================================
+
+// stealthChromeMajor resolves the bundled Chromium's major version once
+// so the spoofed UA / userAgentData match the REAL engine version
+// (a Chrome/131 UA on a Chromium/140 engine is itself a mismatch flag).
+var (
+    stealthVersionOnce sync.Once
+    stealthMajor       string
+)
+
+func stealthChromeMajor(browser playwright.Browser) string {
+    stealthVersionOnce.Do(func() {
+        v := browser.Version()
+        if i := strings.IndexByte(v, '.'); i > 0 {
+            stealthMajor = v[:i]
+        }
+        if stealthMajor == "" {
+            stealthMajor = "131"
+        }
+        fmt.Printf("🥷 Stealth identity: Chrome/%s on Windows 10 (x64)\n", stealthMajor)
+    })
+    return stealthMajor
+}
+
+func stealthUserAgent(major string) string {
+    // Identical to a real headed Chrome on Windows 10 — no "HeadlessChrome".
+    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + major + ".0.0.0 Safari/537.36"
+}
+
+// stealthJSTemplate is injected via AddInitScript — it runs BEFORE any page
+// script (including captcha SDKs) on every document and every frame.
+// __VER__ is replaced with the real Chromium major version at runtime.
+//
+// Coverage:
+//   1.  navigator.webdriver        → false (prototype-level)
+//   2.  languages / language       → en-US
+//   3.  platform                   → Win32 (coherent with the UA)
+//   4.  hardwareConcurrency / deviceMemory
+//   5.  plugins / mimeTypes        → exact replica of real Chrome's
+//                                     5 built-in PDF plugins
+//   6.  window.chrome              → runtime/app/loadTimes/csi objects
+//   7.  permissions.query          → notifications report 'default'
+//   8.  WebGL vendor/renderer      → ANGLE/Intel D3D11, not SwiftShader
+//   9.  userAgentData              → real Chrome brands, no HeadlessChrome
+//  10.  window/screen geometry     → coherent 2560×1440 display
+//  11.  iframe contentWindow       → chrome object present cross-frame
+//  12.  Notification.permission
+//  13.  Function.prototype.toString → every override above reports
+//                                     "[native code]" (anti-tamper mask)
+const stealthJSTemplate = `(function () {
+    'use strict';
+
+    var patched = [];
+    function track(fn) { patched.push(fn); return fn; }
+
+    var ua = navigator.userAgent || '';
+    var isWin = ua.indexOf('Windows NT') !== -1;
+    var isMac = ua.indexOf('Macintosh') !== -1;
+    var platOS = isWin ? 'Windows' : (isMac ? 'macOS' : 'Linux');
+    var platNav = isWin ? 'Win32' : (isMac ? 'MacIntel' : 'Linux x86_64');
+
+    // 1) navigator.webdriver → false (matches normal, non-automated Chrome)
+    try {
+        Object.defineProperty(Navigator.prototype, 'webdriver', {
+            get: track(function webdriver() { return false; }),
+            configurable: true,
+        });
+    } catch (e) {}
+
+    // 2) language / languages
+    try {
+        Object.defineProperty(Navigator.prototype, 'languages', {
+            get: track(function languages() { return ['en-US', 'en']; }),
+            configurable: true,
+        });
+        Object.defineProperty(Navigator.prototype, 'language', {
+            get: track(function language() { return 'en-US'; }),
+            configurable: true,
+        });
+    } catch (e) {}
+
+    // 3) platform — must agree with the UA's OS token
+    try {
+        Object.defineProperty(Navigator.prototype, 'platform', {
+            get: track(function platform() { return platNav; }),
+            configurable: true,
+        });
+    } catch (e) {}
+
+    // 4) CPU / memory
+    try {
+        Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', {
+            get: track(function hardwareConcurrency() { return 8; }),
+            configurable: true,
+        });
+        if (!('deviceMemory' in navigator)) {
+            Object.defineProperty(Navigator.prototype, 'deviceMemory', {
+                get: track(function deviceMemory() { return 8; }),
+                configurable: true,
+            });
+        }
+    } catch (e) {}
+
+    // 5) plugins / mimeTypes — replicate a real Chrome install exactly
+    try {
+        var names = ['PDF Viewer', 'Chrome PDF Viewer', 'Chromium PDF Viewer',
+                     'Microsoft Edge PDF Viewer', 'WebKit built-in PDF'];
+        var file = 'internal-pdf-viewer';
+        var desc = 'Portable Document Format';
+        var mimeDefs = [
+            { type: 'application/pdf', suffixes: 'pdf' },
+            { type: 'text/pdf', suffixes: 'pdf' },
+        ];
+        var plugins = [];
+        names.forEach(function (n) {
+            var plugin = Object.create(Plugin.prototype);
+            var mimes = mimeDefs.map(function (m) {
+                var mt = Object.create(MimeType.prototype);
+                Object.defineProperties(mt, {
+                    type: { value: m.type, enumerable: true },
+                    suffixes: { value: m.suffixes, enumerable: true },
+                    description: { value: desc, enumerable: true },
+                    enabledPlugin: { value: plugin, enumerable: true },
+                });
+                return mt;
+            });
+            Object.defineProperties(plugin, {
+                name: { value: n, enumerable: true },
+                filename: { value: file, enumerable: true },
+                description: { value: desc, enumerable: true },
+                length: { value: mimes.length, enumerable: true },
+            });
+            mimes.forEach(function (m, i) {
+                Object.defineProperty(plugin, String(i), { value: m, enumerable: true });
+            });
+            plugin.item = track(function item(i) { return mimes[i] || null; });
+            plugin.namedItem = track(function namedItem(nm) {
+                for (var i = 0; i < mimes.length; i++) { if (mimes[i].type === nm) return mimes[i]; }
+                return null;
+            });
+            plugins.push(plugin);
+        });
+        var pa = Object.create(PluginArray.prototype);
+        Object.defineProperty(pa, 'length', { value: plugins.length, enumerable: true });
+        plugins.forEach(function (p, i) {
+            Object.defineProperty(pa, String(i), { value: p, enumerable: true });
+        });
+        pa.item = track(function item(i) { return plugins[i] || null; });
+        pa.namedItem = track(function namedItem(nm) {
+            for (var i = 0; i < plugins.length; i++) { if (plugins[i].name === nm) return plugins[i]; }
+            return null;
+        });
+        pa.refresh = track(function refresh() {});
+        Object.defineProperty(Navigator.prototype, 'plugins', {
+            get: track(function plugins() { return pa; }),
+            configurable: true,
+        });
+
+        var navMimes = [plugins[0][0], plugins[0][1]];
+        var ma = Object.create(MimeTypeArray.prototype);
+        Object.defineProperty(ma, 'length', { value: navMimes.length, enumerable: true });
+        navMimes.forEach(function (m, i) {
+            Object.defineProperty(ma, String(i), { value: m, enumerable: true });
+        });
+        ma.item = track(function item(i) { return navMimes[i] || null; });
+        ma.namedItem = track(function namedItem(nm) {
+            for (var i = 0; i < navMimes.length; i++) { if (navMimes[i].type === nm) return navMimes[i]; }
+            return null;
+        });
+        Object.defineProperty(Navigator.prototype, 'mimeTypes', {
+            get: track(function mimeTypes() { return ma; }),
+            configurable: true,
+        });
+    } catch (e) {}
+
+    // 6) window.chrome — absent in headless, present in every real Chrome
+    try {
+        if (!window.chrome) { window.chrome = {}; }
+        if (!window.chrome.runtime) {
+            window.chrome.runtime = {
+                PlatformOs: { MAC: 'mac', WIN: 'win', ANDROID: 'android', CROS: 'cros', LINUX: 'linux', OPENBSD: 'openbsd' },
+                PlatformArch: { ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64', MIPS: 'mips', MIPS64: 'mips64' },
+                connect: track(function connect() { return undefined; }),
+                sendMessage: track(function sendMessage() { return undefined; }),
+            };
+        }
+        if (!window.chrome.app) {
+            window.chrome.app = {
+                isInstalled: false,
+                InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+                RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
+                getDetails: track(function getDetails() { return null; }),
+                getIsInstalled: track(function getIsInstalled() { return false; }),
+                installState: track(function installState(cb) {
+                    if (typeof cb === 'function') { cb('not_installed'); }
+                }),
+            };
+        }
+        if (!window.chrome.loadTimes) {
+            window.chrome.loadTimes = track(function loadTimes() {
+                var t = Date.now() / 1000;
+                return {
+                    requestTime: t, startLoadTime: t, commitLoadTime: t,
+                    finishDocumentLoadTime: t, finishLoadTime: t, firstPaintTime: t,
+                    firstPaintAfterLoadTime: 0, navigationType: 'Other',
+                    wasFetchedViaSpdy: false, wasNpnNegotiated: true,
+                    npnNegotiatedProtocol: 'h2', wasAlternateProtocolAvailable: false,
+                    connectionInfo: 'h2',
+                };
+            });
+        }
+        if (!window.chrome.csi) {
+            window.chrome.csi = track(function csi() {
+                return { startE: Date.now(), onloadT: Date.now(), pageT: 10, tran: 15 };
+            });
+        }
+    } catch (e) {}
+
+    // 7) permissions.query — headless reports 'denied' for notifications
+    try {
+        if (window.navigator.permissions && window.navigator.permissions.query) {
+            var oq = window.navigator.permissions.query.bind(window.navigator.permissions);
+            window.navigator.permissions.query = track(function query(p) {
+                if (p && p.name === 'notifications') {
+                    return Promise.resolve({ state: 'default', onchange: null });
+                }
+                return oq(p);
+            });
+        }
+    } catch (e) {}
+
+    // 8) WebGL — headless leaks SwiftShader; fake a plausible GPU stack
+    try {
+        var vendor = isWin ? 'Google Inc. (Intel)' : (isMac ? 'Google Inc. (Apple)' : 'Google Inc. (Intel)');
+        var renderer = isWin
+            ? 'ANGLE (Intel, Intel(R) UHD Graphics 630 (D3D11), D3D11)'
+            : (isMac
+                ? 'ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)'
+                : 'ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)');
+        function patchGet(proto) {
+            var orig = proto.getParameter;
+            proto.getParameter = track(function getParameter(p) {
+                if (p === 37445) { return vendor; }
+                if (p === 37446) { return renderer; }
+                return orig.apply(this, arguments);
+            });
+        }
+        if (typeof WebGLRenderingContext !== 'undefined') { patchGet(WebGLRenderingContext.prototype); }
+        if (typeof WebGL2RenderingContext !== 'undefined') { patchGet(WebGL2RenderingContext.prototype); }
+    } catch (e) {}
+
+    // 9) userAgentData — headless leaks a 'HeadlessChrome' brand
+    try {
+        if (navigator.userAgentData) {
+            var uad = {
+                brands: [
+                    { brand: 'Chromium', version: '__VER__' },
+                    { brand: 'Google Chrome', version: '__VER__' },
+                    { brand: 'Not_A Brand', version: '24' },
+                ],
+                mobile: false,
+                platform: platOS,
+                getHighEntropyValues: track(function getHighEntropyValues(hints) {
+                    return Promise.resolve({
+                        architecture: 'x86',
+                        bitness: '64',
+                        model: '',
+                        platform: platOS,
+                        platformVersion: isWin ? '15.0.0' : (isMac ? '14.1.0' : '6.5.0'),
+                        uaFullVersion: '__VER__.0.0.0',
+                        fullVersionList: [
+                            { brand: 'Chromium', version: '__VER__.0.0.0' },
+                            { brand: 'Google Chrome', version: '__VER__.0.0.0' },
+                            { brand: 'Not_A Brand', version: '24.0.0.0' },
+                        ],
+                    });
+                }),
+            };
+            Object.defineProperty(Navigator.prototype, 'userAgentData', {
+                get: track(function userAgentData() { return uad; }),
+                configurable: true,
+            });
+        }
+    } catch (e) {}
+
+    // 10) window / screen geometry — headless reports a 0-sized outer window
+    try {
+        Object.defineProperty(window, 'outerWidth', {
+            get: track(function outerWidth() { return 1920; }), configurable: true,
+        });
+        Object.defineProperty(window, 'outerHeight', {
+            get: track(function outerHeight() { return 1160; }), configurable: true,
+        });
+        Object.defineProperty(Screen.prototype, 'width', {
+            get: track(function width() { return 2560; }), configurable: true,
+        });
+        Object.defineProperty(Screen.prototype, 'height', {
+            get: track(function height() { return 1440; }), configurable: true,
+        });
+        Object.defineProperty(Screen.prototype, 'availWidth', {
+            get: track(function availWidth() { return 2560; }), configurable: true,
+        });
+        Object.defineProperty(Screen.prototype, 'availHeight', {
+            get: track(function availHeight() { return 1400; }), configurable: true,
+        });
+        Object.defineProperty(Screen.prototype, 'colorDepth', {
+            get: track(function colorDepth() { return 24; }), configurable: true,
+        });
+        Object.defineProperty(Screen.prototype, 'pixelDepth', {
+            get: track(function pixelDepth() { return 24; }), configurable: true,
+        });
+    } catch (e) {}
+
+    // 11) iframes — captcha SDKs check contentWindow.chrome cross-frame
+    try {
+        var d = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
+        if (d && d.get) {
+            var og = d.get;
+            Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+                get: track(function contentWindow() {
+                    var w = og.call(this);
+                    try {
+                        if (w && !w.chrome && window.chrome) { w.chrome = window.chrome; }
+                    } catch (e) {}
+                    return w;
+                }),
+                configurable: true,
+            });
+        }
+    } catch (e) {}
+
+    // 12) Notification.permission
+    try {
+        if (typeof Notification !== 'undefined') {
+            Object.defineProperty(Notification, 'permission', {
+                get: track(function permission() { return 'default'; }),
+                configurable: true,
+            });
+        }
+    } catch (e) {}
+
+    // 13) toString mask — every function patched above must report
+    //     "[native code]" or the tampering itself becomes detectable.
+    try {
+        var origToString = Function.prototype.toString;
+        var toStringProxy = new Proxy(origToString, {
+            apply: function (target, thisArg, args) {
+                if (thisArg && patched.indexOf(thisArg) !== -1) {
+                    return 'function ' + (thisArg.name || '') + '() { [native code] }';
+                }
+                return Reflect.apply(target, thisArg, args);
+            },
+        });
+        patched.push(toStringProxy);
+        Function.prototype.toString = toStringProxy;
+    } catch (e) {}
+})();`
+
+// =====================================================================
+// HUMAN INPUT SYNTHESIS — anti-bot systems watch pointer trajectories,
+// dwell times, and typing cadence. Synthesize them.
+// =====================================================================
+
+var humanRand = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+func jitter(min, max float64) float64 {
+    return min + humanRand.Float64()*(max-min)
+}
+
+func humanPause(msMin, msMax int) {
+    time.Sleep(time.Duration(jitter(float64(msMin), float64(msMax))) * time.Millisecond)
+}
+
+// humanMouseTo sweeps the cursor from a random point toward (tx,ty) with
+// smoothstep easing and per-step jitter — mimics a human pointer path.
+func humanMouseTo(page playwright.Page, tx, ty float64) error {
+    x := jitter(300, 1500)
+    y := jitter(200, 800)
+    steps := 12 + humanRand.Intn(10)
+    for i := 1; i <= steps; i++ {
+        t := float64(i) / float64(steps)
+        e := t * t * (3 - 2*t) // smoothstep: slow → fast → slow
+        nx := x + (tx-x)*e + jitter(-6, 6)
+        ny := y + (ty-y)*e + jitter(-6, 6)
+        if err := page.Mouse().Move(nx, ny); err != nil {
+            return err
+        }
+        time.Sleep(time.Duration(jitter(8, 22)) * time.Millisecond)
+    }
+    // Final exact landing on the target.
+    return page.Mouse().Move(tx, ty)
+}
+
+// humanClick moves the cursor along an eased path to a random point inside
+// the element, dwells briefly (decision time), then presses and releases.
+func humanClick(page playwright.Page, loc playwright.Locator) error {
+    box, err := loc.BoundingBox()
+    if err != nil {
+        return err
+    }
+    if box == nil {
+        return fmt.Errorf("element has no bounding box")
+    }
+    cx := box.X + box.Width*jitter(0.35, 0.65)
+    cy := box.Y + box.Height*jitter(0.35, 0.65)
+    if err := humanMouseTo(page, cx, cy); err != nil {
+        return err
+    }
+    humanPause(60, 180) // dwell: "reading" the button before committing
+    if err := page.Mouse().Down(); err != nil {
+        return err
+    }
+    humanPause(45, 110) // human press-hold duration
+    return page.Mouse().Up()
+}
+
 // ---------- Collect tokens on a single page ----------
 func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
     // The page is reused across batches; route handlers (if any) were installed
@@ -467,10 +894,30 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
     fmt.Println("✅ Model button & textarea found")
 
     textarea := page.Locator("#chat-input")
-    if err := textarea.Fill("__"); err != nil {
-        return nil, fmt.Errorf("fill textarea: %w", err)
+
+    // --- Behavioral warm-up: nobody lands on a page and instantly acts ---
+    tuiSetStatus("Simulating human interaction...")
+    fmt.Println("🧍 Human warm-up: cursor drift + micro-scroll...")
+    _ = humanMouseTo(page, jitter(500, 1300), jitter(250, 650))
+    humanPause(300, 800)
+    _ = page.Mouse().Wheel(0, jitter(120, 320))
+    humanPause(180, 450)
+    _ = page.Mouse().Wheel(0, -jitter(60, 180))
+    humanPause(250, 600)
+
+    // Click into the textarea like a person, then type character by
+    // character with irregular inter-key delays.
+    if err := humanClick(page, textarea); err != nil {
+        return nil, fmt.Errorf("human click on textarea: %w", err)
     }
-    fmt.Println(`✅ Textarea filled with "__"`)
+    humanPause(120, 300)
+    for _, r := range "__" {
+        if err := page.Keyboard().Type(string(r)); err != nil {
+            return nil, fmt.Errorf("type char: %w", err)
+        }
+        humanPause(50, 140)
+    }
+    fmt.Println(`✅ Typed "__" with human-like cadence`)
 
     sendBtn := page.Locator("#send-message-button")
     if err := sendBtn.WaitFor(
@@ -478,10 +925,11 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
     ); err != nil {
         return nil, fmt.Errorf("send button not found: %w", err)
     }
-    if err := sendBtn.Click(); err != nil {
-        return nil, fmt.Errorf("click send: %w", err)
+    humanPause(200, 500) // brief hesitation before firing
+    if err := humanClick(page, sendBtn); err != nil {
+        return nil, fmt.Errorf("human click on send: %w", err)
     }
-    fmt.Println("✅ Send clicked")
+    fmt.Println("✅ Send clicked (eased mouse path + button dwell)")
 
     fmt.Printf("⏳ Waiting %dms for token endpoint to initialize...\n", SendWaitMs)
     sleep(SendWaitMs)
@@ -540,14 +988,43 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
     }
 }
 
-// ---------- Create a worker page with optional route allowlist ----------
-// Route handlers persist across reloads on the same page, so the allowlist is
-// installed exactly once at page creation rather than per batch.
-func newWorkerPage(browser playwright.Browser) (playwright.Page, error) {
-    page, err := browser.NewPage()
+// ---------- Create a stealth worker page with a persistent identity ----------
+// Each worker gets its own BrowserContext carrying a coherent fingerprint
+// (UA / locale / timezone / viewport / screen) plus the stealth init script
+// injected into every frame BEFORE any page JavaScript runs. The optional
+// route allowlist is installed exactly once here, not per batch.
+func newWorkerPage(browser playwright.Browser) (playwright.BrowserContext, playwright.Page, error) {
+    major := stealthChromeMajor(browser)
+    ua := stealthUserAgent(major)
+    stealthJS := strings.ReplaceAll(stealthJSTemplate, "__VER__", major)
+
+    ctx, err := browser.NewContext(playwright.BrowserNewContextOptions{
+        UserAgent:         playwright.String(ua),
+        Locale:            playwright.String(StealthLocale),
+        TimezoneId:        playwright.String(StealthTimezone),
+        ColorScheme:       playwright.ColorSchemeLight,
+        DeviceScaleFactor: playwright.Float(1),
+        Viewport:          &playwright.Size{Width: 1920, Height: 1080},
+        Screen:            &playwright.Size{Width: 1920, Height: 1440},
+        ExtraHttpHeaders:  map[string]string{"Accept-Language": "en-US,en;q=0.9"},
+    })
     if err != nil {
-        return nil, err
+        return nil, nil, err
     }
+
+    page, err := ctx.NewPage()
+    if err != nil {
+        _ = ctx.Close()
+        return nil, nil, err
+    }
+
+    // Stealth init script — runs before any page JS on every frame,
+    // including captcha iframes.
+    if err := page.AddInitScript(playwright.Script{Content: playwright.String(stealthJS)}); err != nil {
+        _ = ctx.Close()
+        return nil, nil, fmt.Errorf("stealth init script: %w", err)
+    }
+
     if *blockTrackersFlag {
         if err := page.Route("**/*", func(route playwright.Route) {
             if urlAllowed(route.Request().URL()) {
@@ -556,11 +1033,11 @@ func newWorkerPage(browser playwright.Browser) (playwright.Page, error) {
                 route.Abort()
             }
         }); err != nil {
-            _ = page.Close()
-            return nil, fmt.Errorf("route setup: %w", err)
+            _ = ctx.Close()
+            return nil, nil, fmt.Errorf("route setup: %w", err)
         }
     }
-    return page, nil
+    return ctx, page, nil
 }
 
 // ---------- Run a single batch with retries ----------
@@ -611,10 +1088,10 @@ func runParallel(browser playwright.Browser, tokenCount, batchCount, workers int
         wg.Add(1)
         go func(workerID int) {
             defer wg.Done()
-            // Each worker keeps ONE page open for all its batches; every batch
-            // force-reloads the page instead of opening a new one and closing
-            // the old one.
-            page, perr := newWorkerPage(browser)
+            // Each worker keeps ONE stealth context + page open for all its
+            // batches; every batch force-reloads the page instead of opening
+            // a new one. Closing the context tears down the page with it.
+            ctx, page, perr := newWorkerPage(browser)
             if perr != nil {
                 once.Do(func() {
                     firstErr = fmt.Errorf("worker %d page: %w", workerID, perr)
@@ -622,7 +1099,7 @@ func runParallel(browser playwright.Browser, tokenCount, batchCount, workers int
                 })
                 return
             }
-            defer page.Close()
+            defer ctx.Close()
             for batchNum := range batchCh {
                 // Lock-free check — no mutex contention.
                 if aborted.Load() {
@@ -690,6 +1167,48 @@ var chromiumPerfArgs = []string{
     "--safebrowsing-disable-auto-update",
     "--password-store=basic",
     "--use-mock-keychain",
+    "--lang=en-US",
+}
+
+// ---------- Stealth browser launch ----------
+// The core trick: tell Playwright the browser is HEADED, then pass
+// --headless=new ourselves. Chromium runs the NEW headless engine — the
+// full real browser (real Blink, real GPU pipeline, real fingerprint
+// surface) minus the window — so it works on bare servers with no X
+// display, while every "headless tells" (outerWidth=0, SwiftShader,
+// missing chrome object, HeadlessChrome UA brand) are patched by the
+// init script anyway. --enable-automation is stripped from Playwright's
+// default args so the automation infobar flag never reaches the engine.
+func launchBrowser(pw *playwright.Playwright, headed bool) (playwright.Browser, error) {
+    base := append([]string{}, chromiumPerfArgs...)
+
+    if headed {
+        // Real visible window for debugging — stealth script still applies.
+        return pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
+            Headless:          playwright.Bool(false),
+            Args:              base,
+            IgnoreDefaultArgs: []string{"--enable-automation"},
+        })
+    }
+
+    args := append(base, "--headless=new", "--window-size=1920,1080")
+    b, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
+        Headless:          playwright.Bool(false), // OUR flag controls headlessness
+        Args:              args,
+        IgnoreDefaultArgs: []string{"--enable-automation"},
+    })
+    if err == nil {
+        return b, nil
+    }
+
+    // Fallback for ancient Chromium builds that reject --headless=new:
+    // classic headless — the stealth script still patches the surface.
+    fmt.Fprintf(os.Stderr, "⚠️  --headless=new launch failed (%v); falling back to classic headless\n", err)
+    return pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
+        Headless:          playwright.Bool(true),
+        Args:              base,
+        IgnoreDefaultArgs: []string{"--enable-automation"},
+    })
 }
 
 // ---------- Network allowlist (surgical URL filter) ----------
@@ -742,16 +1261,16 @@ func run(tokenCount, batchCount, parallelWorkers int, headed bool) error {
     }
 
     tuiSetStatus("Launching browser...")
+    if !headed {
+        fmt.Println("🥷 Stealth mode: new-headless engine + real-Chrome fingerprint emulation + human input synthesis")
+    }
     pw, err := playwright.Run()
     if err != nil {
         return fmt.Errorf("playwright run: %w", err)
     }
     defer pw.Stop()
 
-    browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
-        Headless: playwright.Bool(!headed),
-        Args:     chromiumPerfArgs,
-    })
+    browser, err := launchBrowser(pw, headed)
     if err != nil {
         return fmt.Errorf("browser launch: %w", err)
     }
@@ -793,13 +1312,13 @@ func run(tokenCount, batchCount, parallelWorkers int, headed bool) error {
 
     // ---------- Sequential batch loop ----------
     tuiSetStatus("Starting sequential batches...")
-    // Keep ONE page open across all batches; each batch force-reloads it
-    // instead of opening a new page and closing the old one.
-    page, err := newWorkerPage(browser)
+    // Keep ONE stealth context + page open across all batches; each batch
+    // force-reloads the page instead of opening a new one.
+    ctx, page, err := newWorkerPage(browser)
     if err != nil {
         return fmt.Errorf("page create: %w", err)
     }
-    defer page.Close()
+    defer ctx.Close()
 
     totalCollected := 0
     for b := 1; b <= batchCount; b++ {
