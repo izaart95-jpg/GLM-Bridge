@@ -30,6 +30,7 @@ import (
     "fmt"
     "io"
     "log"
+    "net"
     "net/http"
     "net/url"
     "os"
@@ -43,6 +44,7 @@ import (
     "unicode/utf8"
 
     _ "modernc.org/sqlite"
+    utls "github.com/refraction-networking/utls"
 )
 
 // ============================================================================
@@ -59,7 +61,7 @@ const (
     // Z.AI direct config
     BASE_URL           = "https://chat.z.ai"
     SALT_KEY           = "key-@@@@)))()((9))-xxxx&&&%%%%%"
-    DEFAULT_FE_VERSION = "prod-fe-1.0.185"
+    DEFAULT_FE_VERSION = "prod-fe-1.1.88"
     zaiUserAgent       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
@@ -488,19 +490,257 @@ var aliyunHTTPClient = &http.Client{
     Timeout: 30 * time.Second,
 }
 
-// Optimised client for Z.AI API calls (no global timeout — streaming)
+// TLS FINGERPRINT SPOOFING — uTLS with Chrome ClientHello
+// Aliyun ESA WAF does JA3 fingerprinting; Go's default TLS is blocked.
+// ============================================================================
+
+// dialUTLS creates a TLS connection using Chrome's ClientHello fingerprint.
+// Respects HTTP_PROXY/HTTPS_PROXY environment variables for proxy tunneling.
+func dialUTLS(ctx context.Context, network, addr string) (net.Conn, error) {
+    host, _, err := net.SplitHostPort(addr)
+    if err != nil {
+        return nil, err
+    }
+
+    dialer := &net.Dialer{
+        Timeout:   15 * time.Second,
+        KeepAlive: 30 * time.Second,
+    }
+
+    var rawConn net.Conn
+
+    // Check for proxy (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY)
+    proxyStr := os.Getenv("HTTPS_PROXY")
+    if proxyStr == "" {
+        proxyStr = os.Getenv("HTTP_PROXY")
+    }
+    if proxyStr == "" {
+        proxyStr = os.Getenv("ALL_PROXY")
+    }
+    if proxyStr == "" {
+        proxyStr = os.Getenv("https_proxy")
+    }
+    if proxyStr == "" {
+        proxyStr = os.Getenv("http_proxy")
+    }
+    if proxyStr == "" {
+        proxyStr = os.Getenv("all_proxy")
+    }
+
+    if proxyStr != "" {
+        // Parse proxy URL
+        proxyURL, err := url.Parse(proxyStr)
+        if err == nil && proxyURL.Host != "" {
+            // Connect to proxy
+            proxyConn, err := dialer.DialContext(ctx, "tcp", proxyURL.Host)
+            if err != nil {
+                return nil, fmt.Errorf("proxy connect: %w", err)
+            }
+
+            // Send CONNECT request for HTTPS tunneling
+            connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", addr, addr)
+            _, err = proxyConn.Write([]byte(connectReq))
+            if err != nil {
+                proxyConn.Close()
+                return nil, fmt.Errorf("proxy CONNECT write: %w", err)
+            }
+
+            // Read CONNECT response
+            br := bufio.NewReader(proxyConn)
+            line, err := br.ReadString('\n')
+            if err != nil {
+                proxyConn.Close()
+                return nil, fmt.Errorf("proxy CONNECT read: %w", err)
+            }
+            if !strings.Contains(line, "200") {
+                proxyConn.Close()
+                return nil, fmt.Errorf("proxy CONNECT failed: %s", strings.TrimSpace(line))
+            }
+            // Drain remaining headers
+            for {
+                line, err = br.ReadString('\n')
+                if err != nil || strings.TrimSpace(line) == "" {
+                    break
+                }
+            }
+
+            // If bufio reader buffered extra data, unwrap it
+            if br.Buffered() > 0 {
+                buffered := make([]byte, br.Buffered())
+                br.Read(buffered)
+                rawConn = &concatConn{
+                    Conn:   proxyConn,
+                    buffer: buffered,
+                }
+            } else {
+                rawConn = proxyConn
+            }
+
+            logInfo(fmt.Sprintf("[uTLS] Using proxy %s for %s", proxyURL.Host, addr))
+        } else {
+            rawConn, err = dialer.DialContext(ctx, network, addr)
+            if err != nil {
+                return nil, err
+            }
+        }
+    } else {
+        // Direct connection (no proxy)
+        rawConn, err = dialer.DialContext(ctx, network, addr)
+        if err != nil {
+            return nil, err
+        }
+    }
+
+    // uTLS config — advertise HTTP/1.1 only to avoid HTTP/2 fingerprinting
+    config := &utls.Config{
+        ServerName:         host,
+        NextProtos:         []string{"http/1.1"},
+        InsecureSkipVerify: false,
+    }
+
+    // Chrome 120 fingerprint
+    uConn := utls.UClient(rawConn, config, utls.HelloChrome_120)
+
+    if err := uConn.HandshakeContext(ctx); err != nil {
+        rawConn.Close()
+        return nil, err
+    }
+
+    return uConn, nil
+}
+
+// concatConn wraps a connection that has pre-buffered data from a bufio.Reader.
+type concatConn struct {
+    net.Conn
+    buffer []byte
+}
+
+func (c *concatConn) Read(b []byte) (int, error) {
+    if len(c.buffer) > 0 {
+        n := copy(b, c.buffer)
+        c.buffer = c.buffer[n:]
+        return n, nil
+    }
+    return c.Conn.Read(b)
+}
+
+// Z.AI client with cookie jar + uTLS Chrome fingerprint
+var zaiJar = &cookieJar{}
+
 var zaiHTTPClient = &http.Client{
     Transport: &http.Transport{
+        DialTLSContext:        dialUTLS,
         MaxIdleConns:          100,
         MaxIdleConnsPerHost:   20,
         MaxConnsPerHost:       20,
         IdleConnTimeout:       90 * time.Second,
-        TLSHandshakeTimeout:   10 * time.Second,
+        TLSHandshakeTimeout:   15 * time.Second,
         ExpectContinueTimeout: 1 * time.Second,
-        ForceAttemptHTTP2:     true,
+        ForceAttemptHTTP2:     false,
     },
+    Jar: zaiJar,
 }
 
+// ============================================================================
+// COOKIE JAR — minimal implementation, thread-safe
+// ============================================================================
+
+type cookieEntry struct {
+    name   string
+    value  string
+    domain string
+    path   string
+}
+
+type cookieJar struct {
+    mu      sync.Mutex
+    cookies []cookieEntry
+}
+
+func (j *cookieJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
+    j.mu.Lock()
+    defer j.mu.Unlock()
+    for _, c := range cookies {
+        filtered := j.cookies[:0]
+        for _, e := range j.cookies {
+            if e.name == c.Name && e.domain == c.Domain && e.path == c.Path {
+                continue
+            }
+            filtered = append(filtered, e)
+        }
+        j.cookies = filtered
+        j.cookies = append(j.cookies, cookieEntry{
+            name:   c.Name,
+            value:  c.Value,
+            domain: c.Domain,
+            path:   c.Path,
+        })
+    }
+}
+
+func (j *cookieJar) Cookies(u *url.URL) []*http.Cookie {
+    j.mu.Lock()
+    defer j.mu.Unlock()
+    var out []*http.Cookie
+    for _, e := range j.cookies {
+        out = append(out, &http.Cookie{
+            Name:   e.name,
+            Value:  e.value,
+            Domain: e.domain,
+            Path:   e.path,
+        })
+    }
+    return out
+}
+
+// ============================================================================
+// WARM-UP — acquire acw_tc anti-bot cookies before API calls
+// ============================================================================
+
+func warmupCookies() error {
+    ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+    defer cancel()
+
+    req, err := http.NewRequestWithContext(ctx, "GET", BASE_URL, nil)
+    if err != nil {
+        return err
+    }
+    req.Header.Set("User-Agent", zaiUserAgent)
+    req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+    req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+    req.Header.Set("sec-ch-ua", `"Not=A?Brand";v="99", "Brave";v="151", "Chromium";v="151"`)
+    req.Header.Set("sec-ch-ua-mobile", "?0")
+    req.Header.Set("sec-ch-ua-platform", `"Windows"`)
+
+    resp, err := zaiHTTPClient.Do(req)
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+    io.Copy(io.Discard, resp.Body)
+
+    if config.Logging.Level == "debug" {
+        cookies := zaiJar.Cookies(req.URL)
+        for _, c := range cookies {
+            v := c.Value
+            if len(v) > 20 {
+                v = v[:20]
+            }
+            log.Printf("[Warmup] Cookie: %s=%s...", c.Name, v)
+        }
+    }
+
+    return nil
+}
+
+func minInt(a, b int) int {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+// 
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
