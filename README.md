@@ -78,12 +78,15 @@ cd zai-api
 go mod init zai-api
 go mod tidy
 
-# 3. Generate the token database
+# 3. Install playwright  deps (Optional -> Only run when playwright dependencies not available)
+npx playwright install-deps
+
+# 4. Generate the token database
 go run captcha.go
 # Recommended: build first for better performance and faster startup:
 #   go build -o token-collector -trimpath -gcflags="all=-l=4" -ldflags="-s -w" captcha.go && ./token-collector
 
-# 4. Start the server
+# 5. Start the server
 go run main.go
 # Recommended: build first for better performance and faster startup:
 #   go build -o zai-api -trimpath -gcflags="all=-l=4" -ldflags="-s -w" main.go && ./zai-api
