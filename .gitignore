@@ -1,7 +1,8 @@
-# Built binaries
-zai-api
-zai-bridge
-token-collector
+# Built binaries (anchored to the repo root so they never shadow source
+# directories like cmd/token-collector/)
+/zai-api
+/zai-bridge
+/token-collector
 
 # Runtime artifacts (tokens.sqlite holds harvested device tokens — never commit)
 tokens.sqlite
@@ -9,6 +10,3 @@ tokens.sqlite
 
 # Local environment
 .env
-
-# Local reference checkout (symlink to DeepseekFreeAPI)
-reference

@@ -657,6 +657,29 @@ func holdBackPartialDetailsTag(s string) string {
     return s
 }
 
+// holdBackPartialQuoteMarker trims a trailing ">" that forms the entire
+// last line of s. Lines inside a <details> reasoning body are markdown-
+// quoted ("> ..."), and while the body streams in one character at a
+// time a new line's quote marker is transiently present as a bare ">"
+// — which stripDetailsTags cannot strip yet (TrimPrefix needs the
+// space) but strips one character later when the "> " completes.
+// Forwarding that transient ">" makes the stripped-reasoning snapshot
+// sequence non-monotonic, diverging the reasoning emitter: every later
+// snapshot re-emits everything after the stale ">" — the growing-prefix
+// reasoning_content duplication seen by clients. Holding the marker
+// back keeps the sequence monotonic; the final flush releases it if
+// the text really ends there.
+func holdBackPartialQuoteMarker(s string) string {
+    if !strings.HasSuffix(s, ">") {
+        return s
+    }
+    body := s[:len(s)-1]
+    if body == "" || strings.HasSuffix(body, "\n") {
+        return body
+    }
+    return s
+}
+
 // sseEmitter forwards snapshots of a growing (and occasionally rewritten)
 // text to an append-only consumer as rune-safe deltas. It tracks exactly
 // what the consumer has received so far and never emits a slice that
@@ -675,7 +698,12 @@ type sseEmitter struct {
 //     following growth is not re-sent from a rewound base
 //   - target rewrote part of the view -> everything after the longest
 //     common prefix; the stale fragment in between stays on the consumer
-//     (unavoidable for append-only SSE, but it remains valid UTF-8)
+//     (unavoidable for append-only SSE, but it remains valid UTF-8).
+//     The tracked state then re-syncs to target so later growth emits
+//     only the genuinely new suffix; keeping the stale fragment in the
+//     tracked view would make every later snapshot diverge at the same
+//     point and re-emit everything after it on every call (cascading
+//     growing-prefix duplication).
 func (e *sseEmitter) delta(target string) string {
     if target == e.clientView {
         return ""
@@ -690,7 +718,7 @@ func (e *sseEmitter) delta(target string) string {
         return "" // consumer already has everything target contains
     }
     delta := target[cp:]
-    e.clientView += delta
+    e.clientView = target
     return delta
 }
 
@@ -770,7 +798,22 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
             reasoning = stripDetailsTags(reasoning)
         }
 
-        // Emit reasoning delta (prefix-aware, rune-safe)
+        // Emit reasoning delta (prefix-aware, rune-safe). Reasoning rides
+        // the same edit-based stream as content, so while the stream is
+        // live it gets the same protection: hold back a small tail so
+        // trailing edit_content backtracks are absorbed invisibly, hold
+        // back a partial </details> close tag streamed character by
+        // character (splitDetails folds it into the reasoning body until
+        // it completes, so forwarding it would leak the fragment and
+        // then rewind the snapshot), and hold back a partially-streamed
+        // "> " quote marker that a later character would strip again
+        // (non-monotonic snapshots diverge the emitter and duplicate
+        // everything after them). The final flush releases everything.
+        if !final {
+            reasoning = holdBackTail(reasoning, config.StreamHoldback)
+            reasoning = holdBackPartialDetailsTag(reasoning)
+            reasoning = holdBackPartialQuoteMarker(reasoning)
+        }
         if delta := reasoningEmitter.delta(reasoning); delta != "" {
             ch <- ZAIResult{Reasoning: delta}
         }
