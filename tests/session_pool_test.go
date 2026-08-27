@@ -1,19 +1,19 @@
-// session_pool_test.go
-//
-// Tests for the throwaway-session lifecycle (session_pool.go), ported from
-// the DeepseekFreeAPI reference's session-pool coverage (reference/tests/
-// session_pool_test.go) and adapted to the Z.AI platform:
+// Blackbox tests for the throwaway-session lifecycle (package tests),
+// driving internal/zbridge through its exported API only — the same layout
+// the DeepseekFreeAPI reference uses (reference/tests/session_pool_test.go):
 //
 //   - pool warmup / acquire / release / refill discipline
 //   - acquire timeout + shutdown semantics (leftover cleanup, no refill)
 //   - create-retry backoff path
-//   - deleteZAIChat against a mock chat.z.ai (DELETE /api/v1/chats/{id}:
+//   - DeleteZAIChat against a mock chat.z.ai (DELETE /api/v1/chats/{id}:
 //     "true" on success, {"detail":"We could not find ..."} when already
 //     gone — which must count as a successful idempotent delete)
-//   - the sync-mode glue (acquireStatelessSession / releaseStatelessSession
-//     with no pool attached) end to end through the GC
+//   - the sync-mode glue (Acquire/ReleaseStatelessSession with no pool
+//     attached) end to end through the GC
+//   - the full HTTP loop: handler draws a pooled session, deletes it after
+//     the response, refills the batch
 
-package main
+package tests
 
 import (
     "context"
@@ -26,11 +26,13 @@ import (
     "sync"
     "testing"
     "time"
+
+    "zai-api/internal/zbridge"
 )
 
 // ── stub backend ────────────────────────────────────────────────────────────
 
-// stubBackend is a scriptable SessionBackend for pool tests.
+// stubBackend is a scriptable zbridge.SessionBackend for pool tests.
 type stubBackend struct {
     mu          sync.Mutex
     nextID      int
@@ -74,14 +76,8 @@ func (s *stubBackend) snapshot() (created, deleted []string) {
     return
 }
 
-func (s *stubBackend) counts() (int, int) {
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    return len(s.created), len(s.deleted)
-}
-
 // waitFor polls cond until it holds or the timeout elapses.
-func waitForPool(t *testing.T, what string, timeout time.Duration, cond func() bool) {
+func waitFor(t *testing.T, what string, timeout time.Duration, cond func() bool) {
     t.Helper()
     deadline := time.Now().Add(timeout)
     for time.Now().Before(deadline) {
@@ -97,10 +93,10 @@ func waitForPool(t *testing.T, what string, timeout time.Duration, cond func() b
 
 func TestSessionPoolWarmupAcquireRelease(t *testing.T) {
     b := &stubBackend{}
-    p := NewSessionPool(b, 3)
+    p := zbridge.NewSessionPool(b, 3)
     p.Start()
 
-    waitForPool(t, "warmup to stock 3 sessions", 3*time.Second, func() bool {
+    waitFor(t, "warmup to stock 3 sessions", 3*time.Second, func() bool {
         return p.Ready() == 3
     })
 
@@ -126,7 +122,7 @@ func TestSessionPoolWarmupAcquireRelease(t *testing.T) {
 
     // Releasing a consumed session deletes it upstream and refills the batch.
     p.Release(first)
-    waitForPool(t, "used session deleted + batch refilled", 3*time.Second, func() bool {
+    waitFor(t, "used session deleted + batch refilled", 3*time.Second, func() bool {
         _, deleted := b.snapshot()
         return len(deleted) == 1 && deleted[0] == first && p.Ready() == 1
     })
@@ -136,11 +132,11 @@ func TestSessionPoolWarmupAcquireRelease(t *testing.T) {
 
 func TestSessionPoolAcquireTimeout(t *testing.T) {
     b := &stubBackend{}
-    p := NewSessionPool(b, 1) // never Started: batch stays empty
+    p := zbridge.NewSessionPool(b, 1) // never Started: batch stays empty
 
     start := time.Now()
     _, err := p.Acquire(context.Background(), 50*time.Millisecond)
-    if !errors.Is(err, ErrPoolTimeout) {
+    if !errors.Is(err, zbridge.ErrPoolTimeout) {
         t.Fatalf("Acquire on empty pool: err = %v, want ErrPoolTimeout", err)
     }
     if elapsed := time.Since(start); elapsed > 2*time.Second {
@@ -157,10 +153,10 @@ func TestSessionPoolAcquireTimeout(t *testing.T) {
 
 func TestSessionPoolShutdownClearsLeftovers(t *testing.T) {
     b := &stubBackend{}
-    p := NewSessionPool(b, 3)
+    p := zbridge.NewSessionPool(b, 3)
     p.Start()
 
-    waitForPool(t, "warmup to stock 3 sessions", 3*time.Second, func() bool {
+    waitFor(t, "warmup to stock 3 sessions", 3*time.Second, func() bool {
         return p.Ready() == 3
     })
 
@@ -175,7 +171,7 @@ func TestSessionPoolShutdownClearsLeftovers(t *testing.T) {
     }
 
     // Acquire after shutdown is refused, and a second Shutdown is a no-op.
-    if _, err := p.Acquire(context.Background(), 50*time.Millisecond); !errors.Is(err, ErrPoolClosing) {
+    if _, err := p.Acquire(context.Background(), 50*time.Millisecond); !errors.Is(err, zbridge.ErrPoolClosing) {
         t.Fatalf("Acquire after shutdown: err = %v, want ErrPoolClosing", err)
     }
     p.Shutdown()
@@ -187,10 +183,10 @@ func TestSessionPoolShutdownClearsLeftovers(t *testing.T) {
 
 func TestSessionPoolReleaseAfterShutdownNoRefill(t *testing.T) {
     b := &stubBackend{}
-    p := NewSessionPool(b, 1)
+    p := zbridge.NewSessionPool(b, 1)
     p.Start()
 
-    waitForPool(t, "warmup to stock 1 session", 3*time.Second, func() bool {
+    waitFor(t, "warmup to stock 1 session", 3*time.Second, func() bool {
         return p.Ready() == 1
     })
 
@@ -204,7 +200,7 @@ func TestSessionPoolReleaseAfterShutdownNoRefill(t *testing.T) {
     // The checked-out session is still retired by its request's Release,
     // but the batch must NOT be rebuilt during shutdown.
     p.Release(id)
-    waitForPool(t, "checked-out session deleted", 3*time.Second, func() bool {
+    waitFor(t, "checked-out session deleted", 3*time.Second, func() bool {
         _, deleted := b.snapshot()
         return len(deleted) == 1 && deleted[0] == id
     })
@@ -220,11 +216,11 @@ func TestSessionPoolReleaseAfterShutdownNoRefill(t *testing.T) {
 
 func TestSessionPoolCreateRetry(t *testing.T) {
     b := &stubBackend{failCreates: 1} // first create fails, retry succeeds
-    p := NewSessionPool(b, 1)
+    p := zbridge.NewSessionPool(b, 1)
     p.Start()
 
     // fillSlot backs off 1s after the failure, then stocks the retry.
-    waitForPool(t, "session stocked after create retry", 5*time.Second, func() bool {
+    waitFor(t, "session stocked after create retry", 5*time.Second, func() bool {
         return p.Ready() == 1
     })
     created, _ := b.snapshot()
@@ -236,25 +232,14 @@ func TestSessionPoolCreateRetry(t *testing.T) {
 
 // ── Z.AI chat delete client ─────────────────────────────────────────────────
 
-// mockZAISession mocks the session/token globals for delete tests and
-// restores them on cleanup.
-func mockZAISession(t *testing.T, baseURL string) {
+// mockZAI points the bridge at a mock upstream with a pre-authenticated
+// session and restores everything on cleanup.
+func mockZAI(t *testing.T, baseURL string) {
     t.Helper()
-    oldBase := BASE_URL
-    BASE_URL = baseURL
-    t.Cleanup(func() { BASE_URL = oldBase })
-
-    session.mu.Lock()
-    oldToken, oldUser, oldInit := session.Token, session.UserID, session.Initialized
-    session.Token = "test-token"
-    session.UserID = "test-user"
-    session.Initialized = true
-    session.mu.Unlock()
-    t.Cleanup(func() {
-        session.mu.Lock()
-        session.Token, session.UserID, session.Initialized = oldToken, oldUser, oldInit
-        session.mu.Unlock()
-    })
+    oldBase := zbridge.BASE_URL
+    zbridge.BASE_URL = baseURL
+    t.Cleanup(func() { zbridge.BASE_URL = oldBase })
+    t.Cleanup(zbridge.OverrideSessionState("test-token", "test-user", true))
 }
 
 func TestDeleteZAIChat(t *testing.T) {
@@ -284,23 +269,23 @@ func TestDeleteZAIChat(t *testing.T) {
         }
     }))
     defer upstream.Close()
-    mockZAISession(t, upstream.URL)
+    mockZAI(t, upstream.URL)
 
     // Success: DELETE with the bearer token, "true" reply.
-    if err := deleteZAIChat(context.Background(), "ok-123"); err != nil {
-        t.Fatalf("deleteZAIChat(ok) failed: %v", err)
+    if err := zbridge.DeleteZAIChat(context.Background(), "ok-123"); err != nil {
+        t.Fatalf("DeleteZAIChat(ok) failed: %v", err)
     }
     // Already gone: idempotent success (the hint's second DELETE reply).
-    if err := deleteZAIChat(context.Background(), "gone-456"); err != nil {
-        t.Fatalf("deleteZAIChat(gone) must be an idempotent success, got: %v", err)
+    if err := zbridge.DeleteZAIChat(context.Background(), "gone-456"); err != nil {
+        t.Fatalf("DeleteZAIChat(gone) must be an idempotent success, got: %v", err)
     }
     // Server error surfaces as a failure.
-    if err := deleteZAIChat(context.Background(), "bad-789"); err == nil {
-        t.Fatal("deleteZAIChat(bad) succeeded, want error")
+    if err := zbridge.DeleteZAIChat(context.Background(), "bad-789"); err == nil {
+        t.Fatal("DeleteZAIChat(bad) succeeded, want error")
     }
     // Empty ID is a no-op.
-    if err := deleteZAIChat(context.Background(), ""); err != nil {
-        t.Fatalf("deleteZAIChat(\"\") failed: %v", err)
+    if err := zbridge.DeleteZAIChat(context.Background(), ""); err != nil {
+        t.Fatalf("DeleteZAIChat(\"\") failed: %v", err)
     }
 
     mu.Lock()
@@ -324,9 +309,8 @@ func TestDeleteZAIChat(t *testing.T) {
 
 func TestSyncModeAcquireReleaseDeletesUpstream(t *testing.T) {
     // No pool attached -> legacy per-request flow, still garbage-collected.
-    oldPool, oldWait := sessionPool, poolWait
-    sessionPool, poolWait = nil, defaultPoolWait
-    defer func() { sessionPool, poolWait = oldPool, oldWait }()
+    restore := zbridge.AttachSessionPool(nil, 10*time.Second)
+    defer restore()
 
     var mu sync.Mutex
     deletedPaths := []string{}
@@ -342,11 +326,11 @@ func TestSyncModeAcquireReleaseDeletesUpstream(t *testing.T) {
         http.NotFound(w, r)
     }))
     defer upstream.Close()
-    mockZAISession(t, upstream.URL)
+    mockZAI(t, upstream.URL)
 
-    chatID, pooled, err := acquireStatelessSession(context.Background())
+    chatID, pooled, err := zbridge.AcquireStatelessSession(context.Background())
     if err != nil {
-        t.Fatalf("acquireStatelessSession failed: %v", err)
+        t.Fatalf("AcquireStatelessSession failed: %v", err)
     }
     if pooled {
         t.Fatal("sync mode must not hand out pool-owned sessions")
@@ -355,10 +339,10 @@ func TestSyncModeAcquireReleaseDeletesUpstream(t *testing.T) {
         t.Fatal("sync mode must mint a non-empty chat ID")
     }
 
-    releaseStatelessSession(chatID, pooled)
+    zbridge.ReleaseStatelessSession(chatID, pooled)
 
     // GC is fire-and-forget: poll for the DELETE to land upstream.
-    waitForPool(t, "GC to delete the used chat upstream", 5*time.Second, func() bool {
+    waitFor(t, "GC to delete the used chat upstream", 5*time.Second, func() bool {
         mu.Lock()
         defer mu.Unlock()
         return len(deletedPaths) == 1 && deletedPaths[0] == "/api/v1/chats/"+chatID
@@ -369,15 +353,13 @@ func TestAcquireStatelessSessionPoolBusyFallback(t *testing.T) {
     // A starved pool (batch exhausted, no refill coming) must fall back to
     // creating a session on demand after poolWait instead of stalling.
     b := &stubBackend{blockCreate: true} // warmup/refill never produce anything
-    oldPool, oldWait := sessionPool, poolWait
-    sessionPool = NewSessionPool(b, 1)
-    poolWait = 50 * time.Millisecond
-    defer func() { sessionPool, poolWait = oldPool, oldWait }()
+    restore := zbridge.AttachSessionPool(zbridge.NewSessionPool(b, 1), 50*time.Millisecond)
+    defer restore()
 
     start := time.Now()
-    chatID, pooled, err := acquireStatelessSession(context.Background())
+    chatID, pooled, err := zbridge.AcquireStatelessSession(context.Background())
     if err != nil {
-        t.Fatalf("acquireStatelessSession failed: %v", err)
+        t.Fatalf("AcquireStatelessSession failed: %v", err)
     }
     if pooled {
         t.Fatal("on-demand fallback session must not be pool-owned")
@@ -392,19 +374,21 @@ func TestAcquireStatelessSessionPoolBusyFallback(t *testing.T) {
 
 func TestAcquireStatelessSessionFromPool(t *testing.T) {
     b := &stubBackend{}
-    oldPool, oldWait := sessionPool, poolWait
-    sessionPool = NewSessionPool(b, 2)
-    poolWait = time.Second
-    defer func() { sessionPool, poolWait = oldPool, oldWait }()
-    sessionPool.Start()
+    pool := zbridge.NewSessionPool(b, 2)
+    restore := zbridge.AttachSessionPool(pool, time.Second)
+    defer func() {
+        pool.Shutdown()
+        restore()
+    }()
+    pool.Start()
 
-    waitForPool(t, "warmup to stock 2 sessions", 3*time.Second, func() bool {
-        return sessionPool.Ready() == 2
+    waitFor(t, "warmup to stock 2 sessions", 3*time.Second, func() bool {
+        return pool.Ready() == 2
     })
 
-    chatID, pooled, err := acquireStatelessSession(context.Background())
+    chatID, pooled, err := zbridge.AcquireStatelessSession(context.Background())
     if err != nil {
-        t.Fatalf("acquireStatelessSession failed: %v", err)
+        t.Fatalf("AcquireStatelessSession failed: %v", err)
     }
     if !pooled {
         t.Fatal("async mode must hand out pool-owned sessions")
@@ -412,20 +396,19 @@ func TestAcquireStatelessSessionFromPool(t *testing.T) {
 
     // Release retires it through the pool: deleted upstream + refilled.
     // Batch was 2 with one checked out, so after release+refill it is full.
-    releaseStatelessSession(chatID, pooled)
-    waitForPool(t, "pool to retire + refill the session", 3*time.Second, func() bool {
+    zbridge.ReleaseStatelessSession(chatID, pooled)
+    waitFor(t, "pool to retire + refill the session", 3*time.Second, func() bool {
         _, deleted := b.snapshot()
-        return len(deleted) == 1 && deleted[0] == chatID && sessionPool.Ready() == 2
+        return len(deleted) == 1 && deleted[0] == chatID && pool.Ready() == 2
     })
-
-    sessionPool.Shutdown()
 }
 
 // ── end-to-end: handler draws a pooled session and deletes it after use ────
 
-// TestHTTPChatCompletionsUsesPooledSessionThenDeletes drives the REAL
-// chatCompletionsHandler with the async pool attached and a mock Z.AI
-// upstream, proving the full throwaway-session loop:
+// TestHTTPChatCompletionsUsesPooledSessionThenDeletes drives the REAL HTTP
+// surface (zbridge.NewHandler: routes + auth + CORS) with the async pool
+// attached and a mock Z.AI upstream, proving the full throwaway-session
+// loop:
 //
 //   warm pool -> handler acquires a pooled chat_id -> completion references
 //   it upstream -> response fully written -> deferred release deletes the
@@ -464,38 +447,33 @@ func TestHTTPChatCompletionsUsesPooledSessionThenDeletes(t *testing.T) {
         }
     }))
     defer upstream.Close()
-    mockZAISession(t, upstream.URL)
+    mockZAI(t, upstream.URL)
 
-    // Bypass captcha via the agent-mode cache (same trick as
-    // sse_http_integration_test.go).
-    oldAgentMode := config.AgentMode
-    config.AgentMode = true
-    defer func() { config.AgentMode = oldAgentMode }()
-    captchaCache.mu.Lock()
-    captchaCache.params = append(captchaCache.params, cachedCaptcha{
-        value:       "test-captcha-param",
-        generatedAt: time.Now(),
-    })
-    captchaCache.mu.Unlock()
+    // Bypass captcha via the agent-mode cache.
+    cfg := zbridge.GetConfig()
+    oldAgentMode := cfg.AgentMode
+    cfg.AgentMode = true
+    defer func() { cfg.AgentMode = oldAgentMode }()
+    zbridge.SeedCaptchaParam("test-captcha-param")
 
     // Attach a real pool backed by the production Z.AI backend.
-    oldPool, oldWait := sessionPool, poolWait
-    sessionPool = NewSessionPool(zaiSessionBackend{}, 2)
-    poolWait = time.Second
+    pool := zbridge.NewSessionPool(zbridge.NewZAIChatBackend(), 2)
+    restore := zbridge.AttachSessionPool(pool, time.Second)
     defer func() {
-        sessionPool.Shutdown()
-        sessionPool, poolWait = oldPool, oldWait
+        pool.Shutdown()
+        restore()
     }()
-    sessionPool.Start()
-    waitForPool(t, "warmup to stock 2 sessions", 3*time.Second, func() bool {
-        return sessionPool.Ready() == 2
+    pool.Start()
+    waitFor(t, "warmup to stock 2 sessions", 3*time.Second, func() bool {
+        return pool.Ready() == 2
     })
 
     body := `{"model":"glm-4.7","stream":false,"messages":[{"role":"user","content":"hi"}]}`
     req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
     req.Header.Set("Content-Type", "application/json")
+    req.Header.Set("Authorization", "Bearer "+cfg.Auth.Token)
     rec := httptest.NewRecorder()
-    chatCompletionsHandler(rec, req)
+    zbridge.NewHandler().ServeHTTP(rec, req)
 
     if rec.Code != 200 {
         t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
@@ -516,9 +494,9 @@ func TestHTTPChatCompletionsUsesPooledSessionThenDeletes(t *testing.T) {
 
     // After the response is fully written, the handler's deferred release
     // must delete the used chat upstream and refill the batch to full.
-    waitForPool(t, "used chat deleted upstream + pool refilled", 5*time.Second, func() bool {
+    waitFor(t, "used chat deleted upstream + pool refilled", 5*time.Second, func() bool {
         mu.Lock()
         defer mu.Unlock()
-        return len(deletedChatIDs) == 1 && deletedChatIDs[0] == usedID && sessionPool.Ready() == 2
+        return len(deletedChatIDs) == 1 && deletedChatIDs[0] == usedID && pool.Ready() == 2
     })
 }

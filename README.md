@@ -16,7 +16,7 @@ An OpenAI- **and Anthropic-compatible** API proxy for [chat.z.ai](https://chat.z
 - **Agent mode** — Translates OpenAI tools / function-calling into a text contract that Z.AI can understand, then intercepts `<<<TOOL_CALL>>>` blocks from the model's output and rewrites them back into native `tool_calls` deltas. Ships a **modern** XML-sectioned prompt shim (tolerant marker/fence/payload parsing, history summarization — the default) plus the original **legacy** `[ROLE: ...]` shim as an opt-in.
 - **Per-model feature resolution** — Features resolved per-model from Z.AI server capabilities, with user overrides stored per-model. `image_generation` is **always forced to `false`**.
 - **`reasoning_effort` support** — `high` / `max` values forwarded only when the model's capabilities explicitly allow it; `enable_thinking` is force-enabled when active
-- **Token pool** — Device tokens harvested via `captcha.go` and stored in `tokens.sqlite`. Consumed FIFO and removed after use (up to 5 retries per captcha computation)
+- **Token pool** — Device tokens harvested via the token collector (`cmd/token-collector`) and stored in `tokens.sqlite`. Consumed FIFO and removed after use (up to 5 retries per captcha computation)
 - **Live model list** — Models fetched from Z.AI `/api/models` (cached 5 min, falls back to a static list)
 - **Pure-Go SQLite** — Uses `modernc.org/sqlite` — no CGO required
 - **HTTP/2 + pooled connections** — Optimised transport for both Aliyun and Z.AI endpoints
@@ -87,14 +87,14 @@ go mod tidy
 npx playwright install-deps
 
 # 4. Generate the token database
-go run captcha.go
+go run ./cmd/token-collector
 # Recommended: build first for better performance and faster startup:
-#   go build -o token-collector -trimpath -gcflags="all=-l=4" -ldflags="-s -w" captcha.go && ./token-collector
+#   go build -o token-collector -trimpath -gcflags="all=-l=4" -ldflags="-s -w" ./cmd/token-collector && ./token-collector
 
 # 5. Start the server
-go run main.go agent.go session_pool.go
+go run .
 # Recommended: build first for better performance and faster startup:
-#   go build -o zai-api -trimpath -gcflags="all=-l=4" -ldflags="-s -w" main.go agent.go session_pool.go && ./zai-api
+#   go build -o zai-api -trimpath -gcflags="all=-l=4" -ldflags="-s -w" . && ./zai-api
 ```
 
 On startup, you'll see a banner with your health URL, API endpoints, and auth token. The Z.AI session is initialised asynchronously — if guest init fails, the first chat request will retry it.
@@ -566,19 +566,19 @@ print(resp.content[0].text)
 
 ---
 
-## Token Collection (`captcha.go`)
+## Token Collection (`cmd/token-collector`)
 
-The `captcha.go` script seeds `tokens.sqlite` with device tokens harvested from `chat.z.ai` using Playwright. It features a full TUI (Bubble Tea) with progress bar, live logs, and spinner.
+The token collector seeds `tokens.sqlite` with device tokens harvested from `chat.z.ai` using Playwright. It features a full TUI (Bubble Tea) with progress bar, live logs, and spinner. It is a standalone binary under `cmd/token-collector` (formerly the root-level `captcha.go`).
 
 ### Build & Run
 
 ```bash
 # Portable fallback (any CPU / any OS)
-go build -ldflags="-s -w" -trimpath -o token-collector captcha.go
+go build -ldflags="-s -w" -trimpath -o token-collector ./cmd/token-collector
 ./token-collector
 
 # Or, for modern CPUs (fully static, stripped)
-CGO_ENABLED=0 GOAMD64=v3 go build -ldflags="-s -w" -trimpath -o token-collector captcha.go
+CGO_ENABLED=0 GOAMD64=v3 go build -ldflags="-s -w" -trimpath -o token-collector ./cmd/token-collector
 ```
 
 ### Flags
@@ -630,17 +630,46 @@ CGO_ENABLED=0 GOAMD64=v3 go build -ldflags="-s -w" -trimpath -o token-collector 
 
 ## Project Structure
 
+The bridge core lives in `internal/zbridge` (mirroring the DeepseekFreeAPI
+layout this project follows); `main.go` is a thin entry point, the token
+collector is a separate binary under `cmd/`, and blackbox tests live in
+`tests/` next to whitebox tests kept with the package they exercise.
+
 ```
 zai-api/
-├── main.go              # HTTP server, captcha generation, Z.AI bridge, OpenAI + Anthropic shims, legacy agent shim
-├── agent.go             # Modern agent-mode shim (XML-sectioned prompt, tolerant parsing, streaming interceptor)
-├── session_pool.go      # Throwaway chat sessions + async session pool + GC + graceful shutdown (ported from DeepseekFreeAPI)
-├── agent_test.go        # Tests for the modern agent shim + variant dispatch
-├── session_pool_test.go # Tests for the session pool, chat-delete client, and GC wiring
-├── captcha.go           # Seeds tokens.sqlite with device tokens (TUI + parallel collection)
-├── tokens.sqlite        # Generated token pool (consumed at runtime)
+├── main.go                        # Thin entry point -> zbridge.Run()
+├── internal/zbridge/              # The bridge core (package zbridge)
+│   ├── run.go                     # Run() entry, NewHandler(), graceful shutdown
+│   ├── config.go                  # Config struct + env/flag loading
+│   ├── types.go                   # Shared types + global state
+│   ├── features.go                # Per-model feature resolution
+│   ├── util.go                    # Logging, HTTP clients, cookie jar, helpers
+│   ├── captcha.go                 # Aliyun captcha machinery + captcha cache
+│   ├── zai.go                     # Z.AI signature, session init, streaming, SSE parse
+│   ├── format.go                  # OpenAI response/error formatting
+│   ├── anthropic.go               # Anthropic-compatible endpoint + translation
+│   ├── middleware.go              # CORS, auth, JSON, misc handlers
+│   ├── models.go                  # Live model list + capabilities
+│   ├── handlers.go                # /v1/chat/completions + admin handlers
+│   ├── agent.go                   # Modern agent-mode shim (XML-sectioned prompt)
+│   ├── agent_legacy.go            # Legacy [ROLE: ...] agent shim
+│   ├── session_pool.go            # Throwaway sessions + async pool + GC
+│   ├── testhooks.go               # Exported seams for the tests/ package
+│   ├── agent_test.go              # Whitebox tests: modern agent shim
+│   └── sse_garble_test.go         # Whitebox tests: SSE parser (issue #23)
+├── cmd/token-collector/           # Standalone binary: seeds tokens.sqlite (TUI)
+├── tests/                         # Blackbox tests (package tests)
+│   ├── session_pool_test.go       # Pool mechanics, chat-delete client, GC wiring
+│   └── integration_test.go        # End-to-end HTTP garble regression (issue #23)
+├── tokens.sqlite                  # Generated token pool (consumed at runtime)
 ├── go.mod
 └── README.md
+```
+
+Run the whole suite the same way as the reference project:
+
+```bash
+go test ./...
 ```
 
 ---
@@ -648,7 +677,7 @@ zai-api/
 ## Notes
 
 - **Hosted instance:** `https://api.lelouch.indevs.in/v1` — Bearer / `x-api-key`: `Waguri` — supports `glm-5.2` — running in agent mode. OpenAI API recommended; Anthropic API is primitive.
-- Device tokens are **consumed and deleted** after use. Re-run `captcha.go` to replenish the pool. Each captcha computation tries up to **5 tokens**.
+- Device tokens are **consumed and deleted** after use. Re-run the token collector (`cmd/token-collector`) to replenish the pool. Each captcha computation tries up to **5 tokens**.
 - The default auth token (`Waguri`) is a placeholder — set `AUTH_TOKEN` in production.
 - `ZAI_TOKEN` bypasses guest initialization entirely. Without it, Z.AI's guest session typically only permits `glm-4.7`.
 - `LOG_LEVEL=debug` dumps every Z.AI request body, response status/headers, and SSE lines — useful for troubleshooting.

@@ -58,7 +58,7 @@
 // retirement discipline — delete after use, then refill — is unchanged, and
 // the "already gone" reply counts as a successful delete (idempotent GC).
 
-package main
+package zbridge
 
 import (
     "context"
@@ -110,6 +110,12 @@ type SessionBackend interface {
 // zaiSessionBackend implements SessionBackend against chat.z.ai.
 type zaiSessionBackend struct{}
 
+// NewZAIChatBackend returns the production SessionBackend: sessions are
+// client-generated chat IDs, deleted via DELETE /api/v1/chats/{id}. Run
+// attaches a pool built from it at startup; tests use it to exercise the
+// real delete path against a mock upstream.
+func NewZAIChatBackend() SessionBackend { return zaiSessionBackend{} }
+
 // CreateChatSession mints one fresh chat ID. Z.AI chats are identified by
 // client-generated UUIDs and only materialize server-side when a completion
 // first references one, so there is nothing to do upstream here — which also
@@ -130,14 +136,14 @@ func (zaiSessionBackend) DeleteChatSession(ctx context.Context, sessionIDs ...st
         if id == "" {
             continue
         }
-        if err := deleteZAIChat(ctx, id); err != nil && firstErr == nil {
+        if err := DeleteZAIChat(ctx, id); err != nil && firstErr == nil {
             firstErr = err
         }
     }
     return firstErr
 }
 
-// deleteZAIChat deletes one chat from the Z.AI account so its history does
+// DeleteZAIChat deletes one chat from the Z.AI account so its history does
 // not accumulate on the account:
 //
 //     DELETE {BASE_URL}/api/v1/chats/{chatID}   (authorization: Bearer <token>)
@@ -147,7 +153,7 @@ func (zaiSessionBackend) DeleteChatSession(ctx context.Context, sessionIDs ...st
 //
 // Deletion is idempotent: an "already gone" reply is treated as success so
 // the GC never gets stuck on a chat that was collected twice.
-func deleteZAIChat(ctx context.Context, chatID string) error {
+func DeleteZAIChat(ctx context.Context, chatID string) error {
     if chatID == "" {
         return nil
     }
@@ -445,7 +451,20 @@ var (
     poolWait = defaultPoolWait
 )
 
-// acquireStatelessSession returns a throwaway chat ID for one stateless
+// AttachSessionPool swaps the async session pool (and its acquire wait
+// window) used by stateless requests and returns a function that restores
+// the previous attachment. Passing nil detaches the pool, i.e. switches to
+// the sync (legacy per-request) flow. Run uses it once at startup; the
+// blackbox tests in tests/ use it to exercise both flows.
+func AttachSessionPool(p *SessionPool, wait time.Duration) func() {
+    oldPool, oldWait := sessionPool, poolWait
+    sessionPool, poolWait = p, wait
+    return func() {
+        sessionPool, poolWait = oldPool, oldWait
+    }
+}
+
+// AcquireStatelessSession returns a throwaway chat ID for one stateless
 // request. Async mode takes a pre-made session from the standing batch so no
 // per-request creation cost is paid; if a burst exhausts the batch the
 // request waits up to poolWait and then creates a session directly instead
@@ -453,7 +472,7 @@ var (
 //
 // The second return value reports whether the session is pool-owned (retired
 // through pool.Release) or on-demand (retired through gcSessions).
-func acquireStatelessSession(ctx context.Context) (chatID string, pooled bool, err error) {
+func AcquireStatelessSession(ctx context.Context) (chatID string, pooled bool, err error) {
     if sessionPool == nil {
         return randomUUID(), false, nil
     }
@@ -474,12 +493,12 @@ func acquireStatelessSession(ctx context.Context) (chatID string, pooled bool, e
     }
 }
 
-// releaseStatelessSession retires a used stateless chat session. It must be
+// ReleaseStatelessSession retires a used stateless chat session. It must be
 // called only after the response has been fully written and processed (or
 // definitively failed): the chat is deleted on Z.AI so its history never
 // outlives the request, and in async mode the pool immediately stocks a
 // replacement to keep the batch at full strength.
-func releaseStatelessSession(chatID string, pooled bool) {
+func ReleaseStatelessSession(chatID string, pooled bool) {
     if chatID == "" {
         return
     }

@@ -4,7 +4,7 @@
 // DeepseekFreeAPI reference implementation (internal/dsproxy/*_test.go) and
 // extended with GLM-Free-API dispatch/integration coverage.
 
-package main
+package zbridge
 
 import (
     "encoding/json"

@@ -37,7 +37,7 @@
 // below, which is converted back to OpenAI tool_calls on the way out (parsed
 // from the finished text, or incrementally while streaming).
 
-package main
+package zbridge
 
 import (
     "bytes"

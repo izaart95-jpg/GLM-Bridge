@@ -26,7 +26,7 @@
 // chatCompletionsHandler / anthropicStreamResponse, and assert what an
 // OpenAI-compatible client actually receives.
 
-package main
+package zbridge
 
 import (
 	"fmt"
