@@ -1,6 +1,6 @@
 module glm-free-api
 
-go 1.25.0
+go 1.26.6
 
 require (
 	github.com/charmbracelet/bubbletea v1.3.10

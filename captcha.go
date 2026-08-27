@@ -55,6 +55,11 @@ const (
     TokenCollectionTimeoutMs = 90000
     URL                      = "https://chat.z.ai"
 
+    // The model selector button's id encodes the selected model (e.g.
+    // model-selector-x-preview-l-button, model-selector-glm-4_7-button),
+    // so it is matched by prefix instead of a fixed id.
+    ModelSelectorButton = `button[id^="model-selector-"][id$="-button"]`
+
     // Parallel workers = parallel PAGES on a single browser (not parallel browsers)
     MaxParallel       = 3
     UnsafeMaxParallel = 5
@@ -873,7 +878,7 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
     wg.Add(2)
     go func() {
         defer wg.Done()
-        err1 = page.Locator("#model-selector-glm-4_7-button").WaitFor(
+        err1 = page.Locator(ModelSelectorButton).First().WaitFor(
             playwright.LocatorWaitForOptions{Timeout: playwright.Float(15000)},
         )
     }()
@@ -892,6 +897,82 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
         return nil, fmt.Errorf("textarea not found: %w", err2)
     }
     fmt.Println("✅ Model button & textarea found")
+    // --- Select the GLM-4.7 model ---
+    // The button id encodes the currently selected model (e.g.
+    // model-selector-x-preview-l-button → model-selector-glm-4_7-button
+    // after switching), so match by prefix, not a fixed id.
+    modelBtn := page.Locator(ModelSelectorButton).First()
+    modelBtnID, _ := modelBtn.GetAttribute("id")
+    if strings.Contains(modelBtnID, "glm-4_7") {
+        // glm-4.7 persisted from a previous batch — nothing to switch.
+        fmt.Println("✅ glm-4.7 already selected — skipping model switch")
+    } else {
+        if err := humanClick(page, modelBtn); err != nil {
+            return nil, fmt.Errorf("human click on model button: %w", err)
+        }
+        humanPause(150, 400)
+
+        // bits-ui/Radix-style menu — wait for the panel to actually open.
+        menu := page.Locator("[data-dropdown-menu-content][data-state='open']")
+        if err := menu.WaitFor(
+            playwright.LocatorWaitForOptions{Timeout: playwright.Float(10000)},
+        ); err != nil {
+            return nil, fmt.Errorf("model dropdown did not open: %w", err)
+        }
+
+        glmBtn := page.Locator(`button[data-value="glm-4.7"]`)
+        if err := glmBtn.WaitFor(
+            playwright.LocatorWaitForOptions{Timeout: playwright.Float(5000)},
+        ); err != nil {
+            return nil, fmt.Errorf("glm-4.7 option not found: %w", err)
+        }
+
+        // glm-4.7 is item 6 of 6 in a max-h-[292px] scroll list — clipped
+        // below the fold. Hover the cursor OVER the list (so the wheel scrolls
+        // the list, not the page body), then wheel down like a human until the
+        // option's box is fully inside the visible list area.
+        list := menu.Locator("div.overflow-y-auto")
+        listBox, err := list.BoundingBox()
+        if err != nil || listBox == nil {
+            return nil, fmt.Errorf("model list not measurable: %v", err)
+        }
+        _ = humanMouseTo(page, listBox.X+listBox.Width*jitter(0.3, 0.7), listBox.Y+listBox.Height*0.5)
+        humanPause(100, 250)
+
+        visible := func() bool {
+            gb, err := glmBtn.BoundingBox()
+            return err == nil && gb != nil &&
+                gb.Y >= listBox.Y+2 &&
+                gb.Y+gb.Height <= listBox.Y+listBox.Height-2
+        }
+        for i := 0; i < 8 && !visible(); i++ {
+            if err := page.Mouse().Wheel(0, jitter(90, 160)); err != nil {
+                return nil, fmt.Errorf("wheel scroll: %w", err)
+            }
+            humanPause(90, 220)
+        }
+        if !visible() {
+            // Fallback: programmatic scroll — still followed by a trusted click.
+            if err := glmBtn.ScrollIntoViewIfNeeded(
+                playwright.LocatorScrollIntoViewIfNeededOptions{Timeout: playwright.Float(3000)},
+            ); err != nil {
+                return nil, fmt.Errorf("scroll glm-4.7 into view: %w", err)
+            }
+            humanPause(100, 250)
+        }
+
+        if err := humanClick(page, glmBtn); err != nil {
+            return nil, fmt.Errorf("human click on glm-4.7: %w", err)
+        }
+        fmt.Println("✅ Model switched to glm-4.7")
+
+        // Menu closes on selection — give it a moment to settle.
+        _ = menu.WaitFor(playwright.LocatorWaitForOptions{
+            State:   playwright.WaitForSelectorStateHidden,
+            Timeout: playwright.Float(3000),
+        })
+        humanPause(200, 500)
+    }
 
     textarea := page.Locator("#chat-input")
 

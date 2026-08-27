@@ -10,7 +10,7 @@ An OpenAI- **and Anthropic-compatible** API proxy for [chat.z.ai](https://chat.z
 - **Pure HTTP** — No Playwright, no Selenium, no browser overhead at runtime
 - **Background captcha cache** — When agent mode is enabled, captcha params are pre-generated asynchronously (2 cached, 75 s TTL, auto-pauses after 3 min idle)
 - **Streaming + non-streaming** — Full SSE support with keep-alive pings every 5 s
-- **Agent mode** — Translates OpenAI tools / function-calling into a text contract that Z.AI can understand, then intercepts `<<<TOOL_CALL>>>` blocks from the model's output and rewrites them back into native `tool_calls` deltas
+- **Agent mode** — Translates OpenAI tools / function-calling into a text contract that Z.AI can understand, then intercepts `<<<TOOL_CALL>>>` blocks from the model's output and rewrites them back into native `tool_calls` deltas. Ships a **modern** XML-sectioned prompt shim (tolerant marker/fence/payload parsing, history summarization — the default) plus the original **legacy** `[ROLE: ...]` shim as an opt-in.
 - **Per-model feature resolution** — Features resolved per-model from Z.AI server capabilities, with user overrides stored per-model. `image_generation` is **always forced to `false`**.
 - **`reasoning_effort` support** — `high` / `max` values forwarded only when the model's capabilities explicitly allow it; `enable_thinking` is force-enabled when active
 - **Token pool** — Device tokens harvested via `captcha.go` and stored in `tokens.sqlite`. Consumed FIFO and removed after use (up to 5 retries per captcha computation)
@@ -26,15 +26,17 @@ Models are fetched live from Z.AI's `/api/models` (cached 5 min). The server kee
 
 | Model ID | Notes |
 |---|---|
-| `glm-5.2` | Flagship model, excels at coding and long-horizon tasks |
-| `GLM-5.1` | Previous flagship model |
+| `glm-5.3-flash` | Lightweight flagship model, premium quality, instant response. |
+| `glm-5.3` | Flagship model, excels at coding and long-horizon tasks |
+| `glm-5.2` | Previous flagship model |
+| `GLM-5.1` | Older flagship model |
 | `GLM-5-Turbo` | New model for chat, coding, and agentic tasks |
 | `GLM-5v-Turbo` | Vision model with evolved intelligence |
 | `glm-4.7` | Classic high-performance model |
 
 > **Note:**
 > - If you don't pass `model` in `/v1/chat/completions` or `/v1/messages`, the server defaults to `glm-5`.
-> - Z.AI's guest session (no `ZAI_TOKEN`) typically only allows `glm-4.7`. Use `glm-4.7` for tokenless testing.
+> - Z.AI's guest session (no `ZAI_TOKEN`) typically only allows `glm-5.3-flash` and `glm-4.7`. Use `glm-4.7` for fast tokenless testing.
 > - `/models` (plural) returns `{ models: [...], currentModel: "glm-5.2" }` for clients that expect that shape.
 
 ---
@@ -78,15 +80,18 @@ cd zai-api
 go mod init zai-api
 go mod tidy
 
-# 3. Generate the token database
+# 3. Install playwright  deps (Optional -> Only run when playwright dependencies not available)
+npx playwright install-deps
+
+# 4. Generate the token database
 go run captcha.go
 # Recommended: build first for better performance and faster startup:
 #   go build -o token-collector -trimpath -gcflags="all=-l=4" -ldflags="-s -w" captcha.go && ./token-collector
 
-# 4. Start the server
-go run main.go
+# 5. Start the server
+go run main.go agent.go
 # Recommended: build first for better performance and faster startup:
-#   go build -o zai-api -trimpath -gcflags="all=-l=4" -ldflags="-s -w" main.go && ./zai-api
+#   go build -o zai-api -trimpath -gcflags="all=-l=4" -ldflags="-s -w" main.go agent.go && ./zai-api
 ```
 
 On startup, you'll see a banner with your health URL, API endpoints, and auth token. The Z.AI session is initialised asynchronously — if guest init fails, the first chat request will retry it.
@@ -102,6 +107,7 @@ On startup, you'll see a banner with your health URL, API endpoints, and auth to
 | `--db-path` | `tokens.sqlite` | Path to the SQLite token database |
 | `--verbose` | `false` | Enable verbose captcha/debug logging (`logError` / `logInfo` are silent unless this is set) |
 | `--agent-mode` | `false` | Enable agent mode (translate tools & roles for Z.AI compatibility; also starts the background captcha cache) |
+| `--agent-mode-variant` | `modern` | Agent-mode shim variant: `modern` (XML-sectioned prompt, tolerant parsing — recommended) or `legacy` (the original `[ROLE: ...]` rewrite shim) |
 
 ### Environment Variables
 
@@ -112,7 +118,8 @@ On startup, you'll see a banner with your health URL, API endpoints, and auth to
 | `AUTH_TOKEN` | `Waguri` | Bearer / `x-api-key` token for client authentication |
 | `TIMEOUT` | `300000` | Request timeout in milliseconds |
 | `ZAI_TOKEN` | *(empty)* | Hardcoded Z.AI JWT — skips guest initialization |
-| `AGENT_MODE` | `false` | Enable agent mode (`1`/`true`/`yes`/`on` to enable) |
+| `AGENT_MODE` | `false` | Enable agent mode (`1`/`true`/`yes`/`on`/`modern` to enable with the modern shim, `legacy` to enable with the legacy shim) |
+| `AGENT_MODE_VARIANT` | `modern` | Agent-mode shim variant override: `modern` or `legacy` (takes precedence over the implicit variant of `AGENT_MODE`) |
 | `LOG_LEVEL` | `debug` | Log level (`debug` dumps every Z.AI request/response, SSE lines, and headers) |
 | `LOG_FORMAT` | `text` | Log format |
 
@@ -303,7 +310,34 @@ curl -X POST http://localhost:3001/features \
 
 Z.AI's unofficial `/api/v2/chat/completions` endpoint only accepts messages with `role="user"`. System, assistant, and tool roles cause `INTERNAL_ERROR`. OpenAI-style `tools` / `tool_calls` are also rejected.
 
-When `AGENT_MODE` is enabled (via `--agent-mode` flag or `AGENT_MODE=true` env), the server performs three transformations:
+When `AGENT_MODE` is enabled (via `--agent-mode` flag or `AGENT_MODE=true` env), the server translates OpenAI roles & tools into a user-only prompt and converts the model's `<<<TOOL_CALL>>>` blocks back into native `tool_calls` deltas (OpenAI) / `tool_use` content blocks (Anthropic).
+
+Two shim implementations are available (select with `--agent-mode-variant` or `AGENT_MODE_VARIANT`):
+
+### Modern shim (default, recommended)
+
+Ported from the [DeepseekFreeAPI](https://github.com/) reference implementation (`agent.go`). Instead of rewriting each message, it folds the entire conversation plus the tool contract into **one XML-sectioned prompt** sent as a single user message:
+
+```
+<system>          — compact output contract (pinned tool-call schema)
+<tools>           — available tool definitions (name, description, JSON schema)
+<history_summary> — older tool exchanges summarized (anti context-rot)
+<recent>          — recent turns verbatim, tool call→result pairs grouped in <tool_exchange>
+<current_task>    — the latest user message (recency anchor)
+<output_rules>    — output contract repeated at the very end (recency bias)
+```
+
+The modern shim is also tolerant where the legacy one was strict:
+
+- **Marker tolerance** — `<<<TOOL_CALL>>>` / `<<<END_TOOL_CALL>>>` are matched with 2–4 angle brackets per side, so models that miscount brackets (observed in the wild) don't leak the whole tool call as plain text.
+- **Fence tolerance** — ` ```json ` fences the model wraps around the block are stripped.
+- **Payload tolerance** — besides the canonical `{"name": ..., "arguments": {...}}`, flat payloads like `{"tool": "bash", "command": ...}` and alternate key spellings (`tool_name`, `function`, `parameters`, `args`, …) are accepted and normalized.
+- **Stream-safe interception** — a trailing hold-back window guarantees a marker split across upstream SSE chunks never leaks to the client.
+- **History summarization** — beyond the 6 most recent tool exchanges, older ones are compressed into a `<history_summary>` block, keeping long agent sessions focused on the current task.
+
+### Legacy shim (opt-in)
+
+The original implementation (select with `--agent-mode-variant=legacy` / `AGENT_MODE_VARIANT=legacy`), kept for backward compatibility:
 
 1. **Mandatory system prefix** — A user message is prepended explaining the prompt architecture (roles, tools, execution contract) so the model can interpret the rewritten conversation.
 
@@ -317,7 +351,7 @@ When `AGENT_MODE` is enabled (via `--agent-mode` flag or `AGENT_MODE=true` env),
    <<<END_TOOL_CALL>>>
    ```
 
-   The stream interceptor detects this token sequence in the assistant's output, parses the JSON, and rewrites the chunk into an OpenAI-style `tool_calls` delta (or Anthropic `tool_use` content block) with `finish_reason="tool_calls"` / `stop_reason="tool_use"`.
+In both variants the stream interceptor detects the tool-call token sequence in the assistant's output, parses the JSON, and rewrites the chunk into an OpenAI-style `tool_calls` delta (or Anthropic `tool_use` content block) with `finish_reason="tool_calls"` / `stop_reason="tool_use"`.
 
 Enabling agent mode also starts the **background captcha cache**, which pre-generates captcha verify params asynchronously (2 cached, 75 s TTL, auto-pauses after 3 minutes of inactivity) to reduce per-request latency.
 
@@ -538,7 +572,9 @@ CGO_ENABLED=0 GOAMD64=v3 go build -ldflags="-s -w" -trimpath -o token-collector 
 
 ```
 zai-api/
-├── main.go          # HTTP server, captcha generation, Z.AI bridge, OpenAI + Anthropic shims, agent mode
+├── main.go          # HTTP server, captcha generation, Z.AI bridge, OpenAI + Anthropic shims, legacy agent shim
+├── agent.go         # Modern agent-mode shim (XML-sectioned prompt, tolerant parsing, streaming interceptor)
+├── agent_test.go    # Tests for the modern agent shim + variant dispatch
 ├── captcha.go       # Seeds tokens.sqlite with device tokens (TUI + parallel collection)
 ├── tokens.sqlite    # Generated token pool (consumed at runtime)
 ├── go.mod
