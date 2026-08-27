@@ -873,7 +873,7 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
     wg.Add(2)
     go func() {
         defer wg.Done()
-        err1 = page.Locator("#model-selector-glm-4_7-button").WaitFor(
+        err1 = page.Locator("#model-selector-x-preview-l-button").WaitFor(
             playwright.LocatorWaitForOptions{Timeout: playwright.Float(15000)},
         )
     }()
