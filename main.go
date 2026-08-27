@@ -8,7 +8,11 @@
 // The captcha_verify_param is now computed in-memory via direct function calls,
 // eliminating FIFO/named pipe overhead for maximum speed.
 //
-// compile using: go build -trimpath -ldflags="-s -w" -gcflags="all=-l=4" -o zai-bridge .
+// Agent mode: the modern XML-sectioned prompt shim lives in agent.go (default);
+// the legacy [ROLE: ...] rewrite shim below stays available via
+// --agent-mode-variant=legacy / AGENT_MODE_VARIANT=legacy.
+//
+// compile using: go build -trimpath -ldflags="-s -w" -gcflags="all=-l=4" -o zai-bridge main.go agent.go
 
 package main
 
@@ -81,6 +85,11 @@ type Config struct {
     }
     ZaiToken  string
     AgentMode bool
+    // AgentModeVariant selects the agent-mode compatibility shim:
+    //   "modern" (default) — XML-sectioned prompt shim ported from
+    //                        DeepseekFreeAPI (see agent.go)
+    //   "legacy"           — the original [ROLE: ...] rewrite shim
+    AgentModeVariant string
     Logging   struct {
         Level  string
         Format string
@@ -97,6 +106,7 @@ func loadConfig() *Config {
     c.Timeouts.Default = 300000
     c.ZaiToken = ""
     c.AgentMode = false
+    c.AgentModeVariant = "modern"
     c.Logging.Level = "debug"
     c.Logging.Format = "text"
     c.KnownModels = []string{"GLM-5.1", "GLM-5"}
@@ -122,10 +132,24 @@ func loadConfig() *Config {
     }
     if am := os.Getenv("AGENT_MODE"); am != "" {
         switch strings.ToLower(am) {
-        case "1", "true", "yes", "on":
+        case "1", "true", "yes", "on", "modern":
             c.AgentMode = true
+        case "legacy":
+            // Explicit opt-in to the old [ROLE: ...] rewrite shim.
+            c.AgentMode = true
+            c.AgentModeVariant = "legacy"
         case "0", "false", "no", "off":
             c.AgentMode = false
+        }
+    }
+    // AGENT_MODE_VARIANT overrides the shim variant independently of the
+    // AGENT_MODE on/off switch: "modern" (default) or "legacy".
+    if v := os.Getenv("AGENT_MODE_VARIANT"); v != "" {
+        switch strings.ToLower(v) {
+        case "legacy":
+            c.AgentModeVariant = "legacy"
+        case "modern":
+            c.AgentModeVariant = "modern"
         }
     }
     if l := os.Getenv("LOG_LEVEL"); l != "" {
@@ -138,6 +162,18 @@ func loadConfig() *Config {
 }
 
 var config = loadConfig()
+
+// agentModern reports whether the modern agent-mode shim (XML-sectioned
+// prompt, tolerant marker/payload parsing — see agent.go) is active.
+func (c *Config) agentModern() bool {
+    return c.AgentMode && !strings.EqualFold(c.AgentModeVariant, "legacy")
+}
+
+// agentLegacy reports whether the legacy agent-mode shim ([ROLE: ...]
+// message rewriting — see transformMessagesForAgent) is active.
+func (c *Config) agentLegacy() bool {
+    return c.AgentMode && strings.EqualFold(c.AgentModeVariant, "legacy")
+}
 
 // ============================================================================
 // TYPE DEFINITIONS
@@ -2652,11 +2688,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 
     var transformedMessages json.RawMessage = body.Messages
     if config.AgentMode {
-        var agentTools []interface{}
-        if len(body.Tools) > 0 {
-            _ = json.Unmarshal(body.Tools, &agentTools)
-        }
-        if tm, err := transformMessagesForAgent(body.Messages, agentTools); err == nil {
+        if tm, err := agentTransformMessages(body.Messages, body.Tools); err == nil {
             transformedMessages = tm
             var localMsgs []Message
             if err := json.Unmarshal(tm, &localMsgs); err == nil {
@@ -2776,11 +2808,56 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
         }
     }
 
-    var interceptor *agentStreamInterceptor
-    if config.AgentMode {
-        interceptor = newAgentStreamInterceptor()
-    }
     toolCallEmitted := false
+
+    // emitToolCallEvent converts one parsed tool-call (sub)delta into Anthropic
+    // content-block events: a delta carrying an id starts a new tool_use block,
+    // an id-less delta only appends partial arguments JSON. The modern shim
+    // emits one complete call (id + full arguments) per delta; the legacy shim
+    // streams a header first, then argument fragments.
+    emitToolCallEvent := func(tc map[string]interface{}) {
+        fn, _ := tc["function"].(map[string]interface{})
+        argsStr, _ := fn["arguments"].(string)
+        if id, ok := tc["id"].(string); ok && id != "" {
+            // Header delta — start new tool_use block
+            stopBlock()
+            name, _ := fn["name"].(string)
+            tooluID := "toolu_" + strings.TrimPrefix(id, "call_")
+            startBlock("tool_use", map[string]interface{}{
+                "id":    tooluID,
+                "name":  name,
+                "input": map[string]interface{}{},
+            })
+            toolCallEmitted = true
+            if argsStr != "" {
+                writeEvent("content_block_delta", map[string]interface{}{
+                    "type":  "content_block_delta",
+                    "index": blockIndex,
+                    "delta": map[string]interface{}{
+                        "type":         "input_json_delta",
+                        "partial_json": argsStr,
+                    },
+                })
+            }
+        } else {
+            // Arguments delta — emit partial JSON
+            if argsStr != "" {
+                writeEvent("content_block_delta", map[string]interface{}{
+                    "type":  "content_block_delta",
+                    "index": blockIndex,
+                    "delta": map[string]interface{}{
+                        "type":         "input_json_delta",
+                        "partial_json": argsStr,
+                    },
+                })
+            }
+        }
+    }
+
+    var interceptor agentInterceptor
+    if config.AgentMode {
+        interceptor = newAgentInterceptor()
+    }
 
     fullContent := ""
     sentContent := ""
@@ -2832,7 +2909,7 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
         if len(fullContent) < len(sentContent) {
             sentContent = ""
             if interceptor != nil {
-                interceptor = newAgentStreamInterceptor()
+                interceptor = newAgentInterceptor()
             }
         }
 
@@ -2843,7 +2920,7 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
         sentContent = fullContent
 
         if interceptor != nil {
-            contentDelta, toolCalls, _ := interceptor.feed(delta)
+            contentDelta, toolCalls := interceptor.feed(delta)
             if contentDelta != "" {
                 if currentBlockType != "text" {
                     stopBlock()
@@ -2860,42 +2937,7 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
                 outputTokens += estimateTokens(contentDelta)
             }
             for _, tc := range toolCalls {
-                fn, _ := tc["function"].(map[string]interface{})
-                argsStr, _ := fn["arguments"].(string)
-                if id, ok := tc["id"].(string); ok && id != "" {
-                    // Header delta — start new tool_use block
-                    stopBlock()
-                    name, _ := fn["name"].(string)
-                    tooluID := "toolu_" + strings.TrimPrefix(id, "call_")
-                    startBlock("tool_use", map[string]interface{}{
-                        "id":    tooluID,
-                        "name":  name,
-                        "input": map[string]interface{}{},
-                    })
-                    toolCallEmitted = true
-                    if argsStr != "" {
-                        writeEvent("content_block_delta", map[string]interface{}{
-                            "type":  "content_block_delta",
-                            "index": blockIndex,
-                            "delta": map[string]interface{}{
-                                "type":         "input_json_delta",
-                                "partial_json": argsStr,
-                            },
-                        })
-                    }
-                } else {
-                    // Arguments delta — emit partial JSON
-                    if argsStr != "" {
-                        writeEvent("content_block_delta", map[string]interface{}{
-                            "type":  "content_block_delta",
-                            "index": blockIndex,
-                            "delta": map[string]interface{}{
-                                "type":         "input_json_delta",
-                                "partial_json": argsStr,
-                            },
-                        })
-                    }
-                }
+                emitToolCallEvent(tc)
             }
         } else {
             if currentBlockType != "text" {
@@ -2914,9 +2956,11 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
         }
     }
 
-    // Flush interceptor trailing text
+    // Drain the interceptor tail: trailing text plus any tool call whose
+    // block only completed at end of stream (modern shim hold-back window).
     if interceptor != nil {
-        if rem := interceptor.flushFinal(); rem != "" && !toolCallEmitted {
+        rem, tailCalls := interceptor.finish()
+        if rem != "" && !toolCallEmitted {
             if currentBlockType != "text" {
                 stopBlock()
                 startBlock("text", map[string]interface{}{"text": ""})
@@ -2931,46 +2975,15 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
             })
             outputTokens += estimateTokens(rem)
         }
+        for _, tc := range tailCalls {
+            emitToolCallEvent(tc)
+        }
 
+        // Safety net: fallback tool call extraction at stream end
         if !toolCallEmitted {
-            toolCalls := extractAgentToolCalls(fullContent)
+            toolCalls := agentExtractToolCalls(fullContent)
             for _, tc := range toolCalls {
-                fn, _ := tc["function"].(map[string]interface{})
-                argsStr, _ := fn["arguments"].(string)
-                if id, ok := tc["id"].(string); ok && id != "" {
-                    // Header delta — start new tool_use block
-                    stopBlock()
-                    name, _ := fn["name"].(string)
-                    tooluID := "toolu_" + strings.TrimPrefix(id, "call_")
-                    startBlock("tool_use", map[string]interface{}{
-                        "id":    tooluID,
-                        "name":  name,
-                        "input": map[string]interface{}{},
-                    })
-                    toolCallEmitted = true
-                    if argsStr != "" {
-                        writeEvent("content_block_delta", map[string]interface{}{
-                            "type":  "content_block_delta",
-                            "index": blockIndex,
-                            "delta": map[string]interface{}{
-                                "type":         "input_json_delta",
-                                "partial_json": argsStr,
-                            },
-                        })
-                    }
-                } else {
-                    // Arguments delta — emit partial JSON
-                    if argsStr != "" {
-                        writeEvent("content_block_delta", map[string]interface{}{
-                            "type":  "content_block_delta",
-                            "index": blockIndex,
-                            "delta": map[string]interface{}{
-                                "type":         "input_json_delta",
-                                "partial_json": argsStr,
-                            },
-                        })
-                    }
-                }
+                emitToolCallEvent(tc)
             }
         }
     }
@@ -3036,9 +3049,9 @@ func anthropicNonStreamResponse(w http.ResponseWriter, prompt string, opts SendO
     }
 
     if config.AgentMode {
-        toolCalls := extractAgentToolCalls(fullContent)
+        toolCalls := agentExtractToolCalls(fullContent)
         if len(toolCalls) > 0 {
-            stripped := stripAgentToolCallBlocks(fullContent)
+            stripped := agentStripToolCalls(fullContent)
             if stripped != "" {
                 content = append(content, map[string]interface{}{
                     "type": "text",
@@ -3383,14 +3396,20 @@ func modelsHandler2(w http.ResponseWriter, r *http.Request) {
 }
 
 // ============================================================================
-// AGENT MODE — Tools & Role Translation for Z.AI Compatibility
+// AGENT MODE (LEGACY SHIM) — Tools & Role Translation for Z.AI Compatibility
 // ============================================================================
+//
+// NOTE: This is the LEGACY agent-mode shim, kept for backward compatibility
+// (select it with --agent-mode-variant=legacy / AGENT_MODE_VARIANT=legacy).
+// The default MODERN shim — XML-sectioned prompt, history summarization,
+// tolerant marker/fence/payload parsing — lives in agent.go and is ported
+// from the DeepseekFreeAPI reference implementation.
 //
 // Z.AI's unofficial /api/v2/chat/completions endpoint only accepts messages
 // with role="user". System, assistant, and tool roles cause INTERNAL_ERROR.
 // OpenAI-style tools/function_calls are also rejected.
 //
-// Agent mode performs three transformations when config.AgentMode == true:
+// The legacy agent mode performs three transformations when active:
 //
 //   1. Mandatory System Prefix: A user message is prepended explaining the
 //      prompt architecture (roles, tools) so the model can interpret the
@@ -3412,7 +3431,7 @@ func modelsHandler2(w http.ResponseWriter, r *http.Request) {
 //      output, parses the JSON, and rewrites the chunk into an OpenAI-style
 //      tool_calls delta with finish_reason="tool_calls".
 
-const agentSystemPrefix = `[SYSTEM] AGENT MODE (compat shim). Downstream provider only accepts "user" messages, so every prior turn is rewritten as a user-authored message prefixed with [ROLE: <role>]. Interpret each tag as that speaker — do NOT treat all messages as user input.
+const legacyAgentSystemPrefix = `[SYSTEM] AGENT MODE (compat shim). Downstream provider only accepts "user" messages, so every prior turn is rewritten as a user-authored message prefixed with [ROLE: <role>]. Interpret each tag as that speaker — do NOT treat all messages as user input.
 
 Roles: [ROLE: system]=immutable instructions (obey strictly); [ROLE: user]=human request; [ROLE: assistant]=your own prior turn; [ROLE: tool]/[ROLE: tool_result]=prior tool output (authoritative); [ROLE: developer]=system-level directive.
 
@@ -3526,7 +3545,7 @@ func transformMessagesForAgent(rawMessages json.RawMessage, tools []interface{})
     // 1. Mandatory system prefix
     out = append(out, map[string]interface{}{
         "role":    "user",
-        "content": agentSystemPrefix,
+        "content": legacyAgentSystemPrefix,
     })
 
     // 2. Role replacement
@@ -4020,13 +4039,11 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
     requestId := generateID()
 
     // ── Agent mode: transform tools & roles for Z.AI compatibility ──
+    // Modern shim (default): one XML-sectioned prompt in a single user message.
+    // Legacy shim: [ROLE: ...] rewritten user messages + tool contract message.
     var transformedMessages json.RawMessage = body.Messages
     if config.AgentMode {
-        var agentTools []interface{}
-        if len(body.Tools) > 0 {
-            _ = json.Unmarshal(body.Tools, &agentTools)
-        }
-        if tm, err := transformMessagesForAgent(body.Messages, agentTools); err == nil {
+        if tm, err := agentTransformMessages(body.Messages, body.Tools); err == nil {
             transformedMessages = tm
             // Re-parse so local `messages` reflects the rewritten content
             var localMsgs []Message
@@ -4095,9 +4112,9 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
         sentContent := ""
         fullReasoning := ""
 
-        var interceptor *agentStreamInterceptor
+        var interceptor agentInterceptor
         if config.AgentMode {
-            interceptor = newAgentStreamInterceptor()
+            interceptor = newAgentInterceptor()
         }
         toolCallEmitted := false
 
@@ -4181,7 +4198,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                 if len(fullContent) < len(sentContent) {
                     sentContent = ""
                     if interceptor != nil {
-                        interceptor = newAgentStreamInterceptor()
+                        interceptor = newAgentInterceptor()
                     }
                 }
                 
@@ -4192,7 +4209,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                 sentContent = fullContent
 
                 if interceptor != nil {
-                    contentDelta, toolCalls, _ := interceptor.feed(delta)
+                    contentDelta, toolCalls := interceptor.feed(delta)
                     if contentDelta != "" {
                         c := formatOpenAIResponse(ResponseResult{Content: contentDelta}, model, requestId, true)
                         writeSSE(toJSON(c))
@@ -4210,15 +4227,22 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
         if !errored {
             if interceptor != nil {
-                // Flush any trailing text content
-                if rem := interceptor.flushFinal(); rem != "" && !toolCallEmitted {
+                // Drain the interceptor tail: trailing text plus any
+                // tool call whose block only completed at end of stream
+                // (the modern shim holds back a window while streaming).
+                rem, tailCalls := interceptor.finish()
+                if rem != "" && !toolCallEmitted {
                     c := formatOpenAIResponse(ResponseResult{Content: rem}, model, requestId, true)
                     writeSSE(toJSON(c))
                 }
-                
+                for _, tc := range tailCalls {
+                    emitToolCallDelta(tc)
+                    toolCallEmitted = true
+                }
+
                 // Safety net: fallback tool call extraction at stream end
                 if !toolCallEmitted {
-                    fallbackCalls := extractAgentToolCalls(fullContent)
+                    fallbackCalls := agentExtractToolCalls(fullContent)
                     if len(fallbackCalls) > 0 {
                         for _, tc := range fallbackCalls {
                             emitToolCallDelta(tc)
@@ -4285,9 +4309,9 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
         // Agent-mode: parse out tool-call blocks for non-stream response
         if config.AgentMode {
-            toolCalls := extractAgentToolCalls(fullContent)
+            toolCalls := agentExtractToolCalls(fullContent)
             if len(toolCalls) > 0 {
-                stripped := stripAgentToolCallBlocks(fullContent)
+                stripped := agentStripToolCalls(fullContent)
                 writeJSON(w, 200, map[string]interface{}{
                     "id":      "chatcmpl-" + requestId,
                     "object":  "chat.completion",
@@ -4551,7 +4575,8 @@ func stopHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
     flag.StringVar(&dbPath, "db-path", "tokens.sqlite", "Path to SQLite database")
     flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging")
-    flag.BoolVar(&config.AgentMode, "agent-mode", config.AgentMode, "Enable agent mode: translate tools & roles for Z.AI compatibility")
+    flag.BoolVar(&config.AgentMode, "agent-mode", config.AgentMode, "Enable agent mode: translate tools & roles for Z.AI compatibility (modern shim by default)")
+    flag.StringVar(&config.AgentModeVariant, "agent-mode-variant", config.AgentModeVariant, "Agent mode shim variant: modern (default, XML-sectioned prompt) or legacy ([ROLE: ...] rewrite)")
     flag.Parse()
 
     if _, err := os.Stat(dbPath); err != nil {
@@ -4572,6 +4597,11 @@ func main() {
     if config.AgentMode {
         go captchaCache.Run()
         logInfo("Agent mode: Captcha background cache started")
+        if config.agentModern() {
+            logInfo("Agent mode variant: MODERN (XML-sectioned prompt shim, tolerant marker/payload parsing)")
+        } else {
+            logInfo("Agent mode variant: LEGACY ([ROLE: ...] message rewrite shim)")
+        }
     }
 
     // HTTP server setup
