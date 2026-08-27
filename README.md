@@ -26,15 +26,17 @@ Models are fetched live from Z.AI's `/api/models` (cached 5 min). The server kee
 
 | Model ID | Notes |
 |---|---|
-| `glm-5.2` | Flagship model, excels at coding and long-horizon tasks |
-| `GLM-5.1` | Previous flagship model |
+| `glm-5.3-flash` | Lightweight flagship model, premium quality, instant response. |
+| `glm-5.3` | Flagship model, excels at coding and long-horizon tasks |
+| `glm-5.2` | Previous flagship model |
+| `GLM-5.1` | Older flagship model |
 | `GLM-5-Turbo` | New model for chat, coding, and agentic tasks |
 | `GLM-5v-Turbo` | Vision model with evolved intelligence |
 | `glm-4.7` | Classic high-performance model |
 
 > **Note:**
 > - If you don't pass `model` in `/v1/chat/completions` or `/v1/messages`, the server defaults to `glm-5`.
-> - Z.AI's guest session (no `ZAI_TOKEN`) typically only allows `glm-4.7`. Use `glm-4.7` for tokenless testing.
+> - Z.AI's guest session (no `ZAI_TOKEN`) typically only allows `glm-5.3-flash` and `glm-4.7`. Use `glm-4.7` for fast tokenless testing.
 > - `/models` (plural) returns `{ models: [...], currentModel: "glm-5.2" }` for clients that expect that shape.
 
 ---
