@@ -122,6 +122,7 @@ On startup, you'll see a banner with your health URL, API endpoints, and auth to
 | `AGENT_MODE_VARIANT` | `modern` | Agent-mode shim variant override: `modern` or `legacy` (takes precedence over the implicit variant of `AGENT_MODE`) |
 | `LOG_LEVEL` | `debug` | Log level (`debug` dumps every Z.AI request/response, SSE lines, and headers) |
 | `LOG_FORMAT` | `text` | Log format |
+| `STREAM_HOLDBACK` | `24` | Runes held back at the tail of a live stream so Z.AI `edit_content` tail-backtracks are absorbed before text reaches the client (`0` disables; see issue #23) |
 
 ---
 
@@ -503,6 +504,8 @@ print(resp.content[0].text)
 3. **Signature** — HMAC-SHA256 over `(sortedPayload | promptBase64 | timestamp)` with a salted bucket key derived from `SALT_KEY` and `timestamp / 300000`.
 
 4. **Streaming** — POST to `/api/v2/chat/completions` with `stream: true`, parse SSE chunks (`edit_content` with `edit_index`, `delta_content`, `content`, or OpenAI-style `choices[0].delta.content`), and forward as OpenAI-formatted SSE or Anthropic SSE events. Inline errors (HTTP 200 with `data.error`) are detected and surfaced. On `401`, the session is re-initialised and the request retried once.
+
+   Field semantics mirror the official Z.AI web frontend (`prod-fe` bundle): `edit_content` replaces the accumulated text from `edit_index` onward, where `edit_index` is a **UTF-16 code-unit offset** (JavaScript `String.substring` indexing — a missing `edit_index` defaults to `0`, i.e. full replacement); `content` is a **full replacement**; `delta_content` appends. Deltas forwarded to clients are always cut on rune boundaries and a small tail (`STREAM_HOLDBACK`) is kept pending, so trailing backtracks never surface as replacement-character garble (issue #23).
 
 ---
 

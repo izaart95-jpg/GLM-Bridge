@@ -45,6 +45,7 @@ import (
     "sync"
     "sync/atomic"
     "time"
+    "unicode/utf16"
     "unicode/utf8"
 
     _ "modernc.org/sqlite"
@@ -63,11 +64,14 @@ const (
     maxTokenRetries = 5
 
     // Z.AI direct config
-    BASE_URL           = "https://chat.z.ai"
     SALT_KEY           = "key-@@@@)))()((9))-xxxx&&&%%%%%"
     DEFAULT_FE_VERSION = "prod-fe-1.1.88"
     zaiUserAgent       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+
+// BASE_URL is a var (not const) only so tests can point the bridge at a
+// mock upstream; the default value is the production endpoint.
+var BASE_URL = "https://chat.z.ai"
 
 // ---------- Config struct (Z.AI) ----------
 
@@ -95,6 +99,13 @@ type Config struct {
         Format string
     }
     KnownModels []string
+    // StreamHoldback is the number of runes kept pending at the tail of the
+    // streamed content before it is forwarded to clients. Z.AI's stream is
+    // edit-based (edit_content can backtrack and rewrite the tail), and an
+    // append-only SSE client cannot take back text it already received.
+    // Holding back a small window lets ordinary trailing backtracks be
+    // absorbed invisibly. 0 disables the hold-back. See issue #23.
+    StreamHoldback int
 }
 
 func loadConfig() *Config {
@@ -110,6 +121,7 @@ func loadConfig() *Config {
     c.Logging.Level = "debug"
     c.Logging.Format = "text"
     c.KnownModels = []string{"GLM-5.1", "GLM-5"}
+    c.StreamHoldback = 24
 
     if p := os.Getenv("PORT"); p != "" {
         if n, err := strconv.Atoi(p); err == nil {
@@ -157,6 +169,11 @@ func loadConfig() *Config {
     }
     if f := os.Getenv("LOG_FORMAT"); f != "" {
         c.Logging.Format = f
+    }
+    if h := os.Getenv("STREAM_HOLDBACK"); h != "" {
+        if n, err := strconv.Atoi(h); err == nil && n >= 0 {
+            c.StreamHoldback = n
+        }
     }
     return c
 }
@@ -2163,14 +2180,160 @@ func statusFromError(errMsg string) int {
     }
 }
 
+// utf16IndexToByteIndex converts a UTF-16 code-unit offset — the indexing
+// semantics of JavaScript strings, used by the official Z.AI web frontend
+// (`content.substring(0, edit_index)`, see the prod-fe bundle) — into a
+// byte offset within s. It clamps at the end of s and never returns an
+// offset inside a multi-byte rune: an offset landing between the two
+// units of a surrogate pair is clamped to the start of that rune.
+func utf16IndexToByteIndex(s string, utf16Idx int) int {
+    if utf16Idx <= 0 {
+        return 0
+    }
+    byteIdx, units := 0, 0
+    for byteIdx < len(s) {
+        if units == utf16Idx {
+            return byteIdx
+        }
+        r, size := utf8.DecodeRuneInString(s[byteIdx:])
+        ru := utf16.RuneLen(r)
+        if ru < 0 {
+            ru = 1 // invalid byte: the JS frontend also sees one unit here
+        }
+        if units+ru > utf16Idx {
+            return byteIdx // inside a surrogate pair — clamp to rune start
+        }
+        units += ru
+        byteIdx += size
+    }
+    return len(s)
+}
+
+// commonPrefixLen returns the byte length of the longest common prefix of
+// a and b. The result is always on a rune boundary, so slicing either
+// string at that offset cannot produce invalid UTF-8.
+func commonPrefixLen(a, b string) int {
+    i := 0
+    for i < len(a) && i < len(b) {
+        ra, sa := utf8.DecodeRuneInString(a[i:])
+        rb, _ := utf8.DecodeRuneInString(b[i:])
+        if ra != rb {
+            break
+        }
+        i += sa
+    }
+    return i
+}
+
+// holdBackTail trims up to n runes from the end of s (rune-safe).
+func holdBackTail(s string, n int) string {
+    if n <= 0 || s == "" {
+        return s
+    }
+    i, count := len(s), 0
+    for i > 0 && count < n {
+        _, size := utf8.DecodeLastRuneInString(s[:i])
+        i -= size
+        count++
+    }
+    return s[:i]
+}
+
+// holdBackPartialDetailsTag trims a trailing fragment that could still be
+// the beginning of a <details> tag whose completion has not arrived yet,
+// so a tag streamed character by character never leaks to the client.
+// A COMPLETE "</details>" literal is kept (legitimate text); a complete
+// "<details" is held (waiting for its ">" to decide whether it is a tag).
+func holdBackPartialDetailsTag(s string) string {
+    i := strings.LastIndex(s, "<")
+    if i < 0 {
+        return s
+    }
+    suffix := s[i:]
+    if len(suffix) <= len("<details") && strings.HasPrefix("<details", suffix) {
+        return s[:i]
+    }
+    if len(suffix) < len("</details>") && strings.HasPrefix("</details>", suffix) {
+        return s[:i]
+    }
+    return s
+}
+
+// sseEmitter forwards snapshots of a growing (and occasionally rewritten)
+// text to an append-only consumer as rune-safe deltas. It tracks exactly
+// what the consumer has received so far and never emits a slice that
+// starts inside a multi-byte rune, so the consumer can never receive
+// invalid UTF-8 (which its JSON renderer would show as U+FFFD
+// replacement garble — the symptom reported in issue #23).
+type sseEmitter struct {
+    clientView string // exactly what the consumer has received so far
+}
+
+// delta returns the text to append to the consumer so it converges on
+// target as closely as possible, and updates the tracked view:
+//   - target extends the view   -> the new suffix (normal growth)
+//   - target is a prefix of the view (a deep edit truncated the text)
+//     -> "" — nothing can be taken back; the view is kept as-is so the
+//     following growth is not re-sent from a rewound base
+//   - target rewrote part of the view -> everything after the longest
+//     common prefix; the stale fragment in between stays on the consumer
+//     (unavoidable for append-only SSE, but it remains valid UTF-8)
+func (e *sseEmitter) delta(target string) string {
+    if target == e.clientView {
+        return ""
+    }
+    if strings.HasPrefix(target, e.clientView) {
+        delta := target[len(e.clientView):]
+        e.clientView = target
+        return delta
+    }
+    cp := commonPrefixLen(e.clientView, target)
+    if cp == len(target) {
+        return "" // consumer already has everything target contains
+    }
+    delta := target[cp:]
+    e.clientView += delta
+    return delta
+}
+
+// splitDetails extracts every complete <details ...>...</details> block
+// from raw: the block bodies (concatenated) become reasoning, everything
+// else becomes content. A trailing opener whose '>' has not arrived yet is
+// held pending (neither reasoning nor content) until more data arrives.
+func splitDetails(raw string) (reasoning, content string) {
+    var rb, cb strings.Builder
+    rest := raw
+    for {
+        idx := strings.Index(rest, "<details")
+        if idx < 0 {
+            cb.WriteString(rest)
+            break
+        }
+        cb.WriteString(rest[:idx])
+        tagEnd := strings.Index(rest[idx:], ">")
+        if tagEnd < 0 {
+            break // incomplete opener at the tail — hold pending
+        }
+        afterTag := rest[idx+tagEnd+1:]
+        closeIdx := strings.Index(afterTag, "</details>")
+        if closeIdx < 0 {
+            rb.WriteString(afterTag) // reasoning still streaming
+            break
+        }
+        rb.WriteString(afterTag[:closeIdx])
+        rest = afterTag[closeIdx+len("</details>"):]
+    }
+    return rb.String(), cb.String()
+}
+
 func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
     scanner := bufio.NewScanner(body)
     scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 
     // ── Accumulated state across SSE lines ──
-    var fullText strings.Builder
-    sentLen := 0
-    sentReasoning := 0
+    var fullText strings.Builder      // raw upstream content, verbatim
+    contentEmitter := &sseEmitter{}   // tracks what the client has received
+    reasoningEmitter := &sseEmitter{} // same for the reasoning channel
 
     // stripDetailsTags removes <details ...> and </details> wrappers
     // and leading "> " markdown-quote prefixes from each line.
@@ -2188,48 +2351,42 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
         return strings.TrimSpace(strings.Join(lines, "\n"))
     }
 
-    flush := func() {
+    // emitContent forwards the part of `target` the client has not seen
+    // yet. All slicing is rune-safe, so clients can never receive invalid
+    // UTF-8 (which their JSON renderer would show as U+FFFD replacement
+    // garble — the symptom reported in issue #23). FullText carries the
+    // authoritative upstream snapshot for non-stream consumers and for
+    // deep-edit re-sync detection in the handlers.
+    emitContent := func(target string) {
+        if delta := contentEmitter.delta(target); delta != "" {
+            ch <- ZAIResult{Chunk: delta, FullText: target}
+        }
+    }
+
+    flush := func(final bool) {
         raw := fullText.String()
 
         // Split <details ...> ... </details> into reasoning vs content
-        var reasoning, content string
-        if idx := strings.Index(raw, "<details"); idx >= 0 {
-            if tagEnd := strings.Index(raw[idx:], ">"); tagEnd >= 0 {
-                afterTag := raw[idx+tagEnd+1:]
-                if closeIdx := strings.Index(afterTag, "</details>"); closeIdx >= 0 {
-                    reasoning = afterTag[:closeIdx]
-                    content = raw[:idx] + afterTag[closeIdx+len("</details>"):]
-                } else {
-                    // <details> opened but not yet closed
-                    reasoning = afterTag
-                    content = raw[:idx]
-                }
-            } else {
-                content = raw // tag not complete yet
-            }
-        } else {
-            content = raw
-        }
-
+        reasoning, content := splitDetails(raw)
         if reasoning != "" {
             reasoning = stripDetailsTags(reasoning)
         }
 
-        // Emit content delta
-        if len(content) > sentLen {
-            ch <- ZAIResult{Chunk: content[sentLen:], FullText: content}
-            sentLen = len(content)
-        } else if len(content) < sentLen {
-            sentLen = len(content)
+        // Emit reasoning delta (prefix-aware, rune-safe)
+        if delta := reasoningEmitter.delta(reasoning); delta != "" {
+            ch <- ZAIResult{Reasoning: delta}
         }
 
-        // Emit reasoning delta
-        if len(reasoning) > sentReasoning {
-            ch <- ZAIResult{Reasoning: reasoning[sentReasoning:]}
-            sentReasoning = len(reasoning)
-        } else if len(reasoning) < sentReasoning {
-            sentReasoning = len(reasoning)
+        // While the stream is live, keep a small tail pending so ordinary
+        // trailing edit_content backtracks are absorbed invisibly, and
+        // never forward a fragment that could still grow into a <details>
+        // tag. The final flush releases everything.
+        target := content
+        if !final {
+            target = holdBackTail(target, config.StreamHoldback)
+            target = holdBackPartialDetailsTag(target)
         }
+        emitContent(target)
     }
 
     for scanner.Scan() {
@@ -2245,7 +2402,7 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
         }
         dataStr := trimmed[6:]
         if dataStr == "[DONE]" {
-            flush()
+            flush(true)
             return nil
         }
 
@@ -2267,59 +2424,41 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
 
         if data, ok := j["data"].(map[string]interface{}); ok {
             if phase, ok := data["phase"].(string); ok && phase == "done" {
-                flush()
+                flush(true)
                 return nil
             }
         }
 
         // ── Content accumulation ──
+        // Semantics mirror the official Z.AI web frontend (prod-fe bundle):
+        //   edit_content:  content = content.substring(0, edit_index) + edit_content
+        //                  where edit_index is a UTF-16 code-unit offset
+        //                  (JavaScript string indexing); a missing
+        //                  edit_index defaults to 0 (full replacement)
+        //   content:       full replacement of the accumulated text
+        //   delta_content: plain append
         if data, ok := j["data"].(map[string]interface{}); ok {
             if ec, ok := data["edit_content"].(string); ok && ec != "" {
-                // edit_content = FULL replacement starting at edit_index
-                editIndex := -1
+                editIndex := 0
                 if ei, ok := data["edit_index"].(float64); ok {
                     editIndex = int(ei)
                 }
                 current := fullText.String()
-                if editIndex >= 0 {
-                    // Convert rune-based edit_index to byte offset
-                    byteIdx := 0
-                    runeCount := 0
-                    for byteIdx < len(current) {
-                        if runeCount == editIndex {
-                            break
-                        }
-                        _, size := utf8.DecodeRuneInString(current[byteIdx:])
-                        byteIdx += size
-                        runeCount++
-                    }
-                    editIndex = byteIdx
-
-                    if editIndex <= len(current) {
-                        current = current[:editIndex] + ec
-                    } else {
-                        // Z.AI index beyond current length — pad
-                        for len(current) < editIndex {
-                            current += " "
-                        }
-                        current += ec
-                    }
-                } else {
-                    current += ec
-                }
+                byteIdx := utf16IndexToByteIndex(current, editIndex)
                 fullText.Reset()
-                fullText.WriteString(current)
+                fullText.WriteString(current[:byteIdx] + ec)
+            } else if tc, ok := data["content"].(string); ok && tc != "" {
+                fullText.Reset()
+                fullText.WriteString(tc)
             } else if dc, ok := data["delta_content"].(string); ok && dc != "" {
                 fullText.WriteString(dc)
-            } else if tc, ok := data["content"].(string); ok && tc != "" {
-                fullText.WriteString(tc)
             }
         }
 
-        flush()
+        flush(false)
     }
 
-    flush()
+    flush(true)
     return scanner.Err()
 }
 
@@ -2860,7 +2999,6 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
     }
 
     fullContent := ""
-    sentContent := ""
 
     ch, err := sendToZAI(prompt, opts)
     if err != nil {
@@ -2900,24 +3038,24 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
         }
 
         // Content delta
+        if result.FullText != "" && !strings.HasPrefix(result.FullText, fullContent) {
+            // A deep edit_content rewrite rewound text that was already
+            // forwarded: reset the stale agent interceptor (issue #23).
+            if interceptor != nil {
+                interceptor = newAgentInterceptor()
+            }
+        }
         if result.FullText != "" {
             fullContent = result.FullText
         } else {
             fullContent += result.Chunk
         }
 
-        if len(fullContent) < len(sentContent) {
-            sentContent = ""
-            if interceptor != nil {
-                interceptor = newAgentInterceptor()
-            }
-        }
-
-        if len(fullContent) <= len(sentContent) {
+        // The parser emits the exact rune-safe delta to forward.
+        delta := result.Chunk
+        if delta == "" {
             continue
         }
-        delta := fullContent[len(sentContent):]
-        sentContent = fullContent
 
         if interceptor != nil {
             contentDelta, toolCalls := interceptor.feed(delta)
@@ -3882,13 +4020,21 @@ func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCa
         relIdx := strings.Index(data[a.flushed:], agentToolCallStart)
         if relIdx < 0 {
             // No start marker. Emit everything except a tail that could
-            // be a partial marker (len-1 chars held back).
+            // be a partial marker (len-1 chars held back). The cut is
+            // pulled back to a rune boundary so a multi-byte character
+            // is never split across emissions (invalid UTF-8 would render
+            // as replacement-char garble on the client — issue #23).
             safe := len(data) - a.flushed
             tail := len(agentToolCallStart) - 1
             if safe > tail {
                 emit := safe - tail
-                contentDelta += data[a.flushed : a.flushed+emit]
-                a.flushed += emit
+                for emit > 0 && !utf8.RuneStart(data[a.flushed+emit]) {
+                    emit--
+                }
+                if emit > 0 {
+                    contentDelta += data[a.flushed : a.flushed+emit]
+                    a.flushed += emit
+                }
             }
             return
         }
@@ -4109,7 +4255,6 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
         writeSSE(toJSON(initChunk))
 
         fullContent := ""
-        sentContent := ""
         fullReasoning := ""
 
         var interceptor agentInterceptor
@@ -4188,25 +4333,25 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                     writeSSE(toJSON(rChunk))
                     continue
                 }
+                if result.FullText != "" && !strings.HasPrefix(result.FullText, fullContent) {
+                    // A deep edit_content rewrite rewound text that was
+                    // already forwarded: the agent interceptor's view of
+                    // the stream is stale, reset it (issue #23).
+                    if interceptor != nil {
+                        interceptor = newAgentInterceptor()
+                    }
+                }
                 if result.FullText != "" {
                     fullContent = result.FullText
                 } else {
                     fullContent += result.Chunk
                 }
-                
-                // Detect content shrinkage (e.g., edit_content truncated the text)
-                if len(fullContent) < len(sentContent) {
-                    sentContent = ""
-                    if interceptor != nil {
-                        interceptor = newAgentInterceptor()
-                    }
-                }
-                
-                if len(fullContent) <= len(sentContent) {
+
+                // The parser emits the exact rune-safe delta to forward.
+                delta := result.Chunk
+                if delta == "" {
                     continue
                 }
-                delta := fullContent[len(sentContent):]
-                sentContent = fullContent
 
                 if interceptor != nil {
                     contentDelta, toolCalls := interceptor.feed(delta)

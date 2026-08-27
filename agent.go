@@ -47,6 +47,7 @@ import (
     "fmt"
     "regexp"
     "strings"
+    "unicode/utf8"
 )
 
 const agentToolStart = "<<<TOOL_CALL>>>"
@@ -659,10 +660,11 @@ var (
 
 const agentFenceJSON = "```json"
 
-// agentStreamKeep is how many trailing bytes the streaming interceptor keeps
-// un-flushed while no marker has matched: enough to cover a fence line plus a
-// partially received marker at its worst tolerated spelling, so neither can
-// ever leak as content.
+// agentStreamKeep is the minimum number of trailing bytes the streaming
+// interceptor keeps un-flushed while no marker has matched: enough to cover
+// a fence line plus a partially received marker at its worst tolerated
+// spelling, so neither can ever leak as content. The actual cut is pulled
+// back to a rune boundary, so up to 3 extra bytes may be held.
 const agentStreamKeep = agentWorstMarkerLen + len("```json\n") + 5
 
 // NormalizeAgentFences removes fence lines adjacent to tool-call markers from
@@ -977,11 +979,20 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
             // Hold back a window big enough for a fence line + partial marker
             // so neither can leak as content while split across chunks. A
             // marker reported incomplete keeps its bytes inside this window,
-            // so nothing here can be part of a future match.
+            // so nothing here can be part of a future match. The cut is
+            // backed up to a rune boundary so a multi-byte character is
+            // never split across emissions (invalid UTF-8 would render as
+            // replacement-char garble on the client — issue #23).
             const keep = agentStreamKeep
             if len(rest) > keep {
-                content = append(content, rest[:len(rest)-keep])
-                in.offset = len(in.buffer) - keep
+                cut := len(rest) - keep
+                for cut > 0 && !utf8.RuneStart(rest[cut]) {
+                    cut--
+                }
+                if cut > 0 {
+                    content = append(content, rest[:cut])
+                    in.offset += cut
+                }
             }
             break
         }
