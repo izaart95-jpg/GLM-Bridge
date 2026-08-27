@@ -955,7 +955,7 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
 
     // Menu closes on selection — give it a moment to settle.
     _ = menu.WaitFor(playwright.LocatorWaitForOptions{
-        State:   playwright.WaitForStateHidden,
+        State:   playwright.WaitForSelectorStateHidden,
         Timeout: playwright.Float(3000),
     })
     humanPause(200, 500)
