@@ -12,7 +12,7 @@
 // the legacy [ROLE: ...] rewrite shim below stays available via
 // --agent-mode-variant=legacy / AGENT_MODE_VARIANT=legacy.
 //
-// compile using: go build -trimpath -ldflags="-s -w" -gcflags="all=-l=4" -o zai-bridge main.go agent.go
+// compile using: go build -trimpath -ldflags="-s -w" -gcflags="all=-l=4" -o zai-bridge main.go agent.go session_pool.go
 
 package main
 
@@ -38,12 +38,14 @@ import (
     "net/http"
     "net/url"
     "os"
+    "os/signal"
     "regexp"
     "sort"
     "strconv"
     "strings"
     "sync"
     "sync/atomic"
+    "syscall"
     "time"
     "unicode/utf16"
     "unicode/utf8"
@@ -106,6 +108,18 @@ type Config struct {
     // Holding back a small window lets ordinary trailing backtracks be
     // absorbed invisibly. 0 disables the hold-back. See issue #23.
     StreamHoldback int
+    // SyncMode disables the async session pool and restores the legacy
+    // synchronous flow: every request creates its own chat session first.
+    // Used sessions are still deleted on Z.AI after each response
+    // (throwaway sessions either way — see session_pool.go).
+    SyncMode bool
+    // SessionPoolSize is the standing batch of pre-made ready chat sessions
+    // kept by the async session pool (SESSION_POOL_SIZE, default 5).
+    SessionPoolSize int
+    // SessionAcquireTimeout bounds, in seconds, how long a request waits for
+    // a pooled session before creating one directly instead of stalling
+    // (SESSION_ACQUIRE_TIMEOUT, default 10; 0 waits indefinitely).
+    SessionAcquireTimeout int
 }
 
 func loadConfig() *Config {
@@ -122,6 +136,9 @@ func loadConfig() *Config {
     c.Logging.Format = "text"
     c.KnownModels = []string{"GLM-5.1", "GLM-5"}
     c.StreamHoldback = 24
+    c.SyncMode = false
+    c.SessionPoolSize = defaultPoolSize
+    c.SessionAcquireTimeout = int(defaultPoolWait / time.Second)
 
     if p := os.Getenv("PORT"); p != "" {
         if n, err := strconv.Atoi(p); err == nil {
@@ -173,6 +190,26 @@ func loadConfig() *Config {
     if h := os.Getenv("STREAM_HOLDBACK"); h != "" {
         if n, err := strconv.Atoi(h); err == nil && n >= 0 {
             c.StreamHoldback = n
+        }
+    }
+    // SYNC_MODE restores the legacy synchronous session flow (one chat
+    // created per request). Used sessions are still deleted after use.
+    if sm := os.Getenv("SYNC_MODE"); sm != "" {
+        switch strings.ToLower(sm) {
+        case "1", "true", "yes", "on":
+            c.SyncMode = true
+        case "0", "false", "no", "off":
+            c.SyncMode = false
+        }
+    }
+    if ps := os.Getenv("SESSION_POOL_SIZE"); ps != "" {
+        if n, err := strconv.Atoi(ps); err == nil && n >= 1 {
+            c.SessionPoolSize = n
+        }
+    }
+    if at := os.Getenv("SESSION_ACQUIRE_TIMEOUT"); at != "" {
+        if n, err := strconv.Atoi(at); err == nil && n >= 0 {
+            c.SessionAcquireTimeout = n
         }
     }
     return c
@@ -2822,7 +2859,18 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
     }
 
     stream := anthReq.Stream
-    chatID := randomUUID()
+    // Stateless request: run it on a THROWAWAY chat session (see
+    // chatCompletionsHandler / session_pool.go). The chat is deleted on
+    // Z.AI once the response is fully processed (deferred below).
+    chatID, pooled, err := acquireStatelessSession(r.Context())
+    if err != nil {
+        if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+            return // client gone; nothing to answer
+        }
+        writeJSON(w, 503, formatAnthropicError("api_error", err.Error()))
+        return
+    }
+    defer releaseStatelessSession(chatID, pooled)
     requestId := "msg_" + generateID()
 
     var transformedMessages json.RawMessage = body.Messages
@@ -3335,12 +3383,13 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
     }
 
     writeJSON(w, 200, map[string]interface{}{
-        "connected": session.Initialized,
-        "userName":  session.UserName,
-        "userId":    userIDPreview,
-        "feVersion": session.FeVersion,
-        "features":  session.Features,
-        "mode":      "direct",
+        "connected":   session.Initialized,
+        "userName":    session.UserName,
+        "userId":      userIDPreview,
+        "feVersion":   session.FeVersion,
+        "features":    session.Features,
+        "mode":        "direct",
+        "sessionPool": sessionPoolStatus(),
     })
 }
 
@@ -4181,7 +4230,22 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
         stream = *body.Stream
     }
 
-    chatID := randomUUID()
+    // Stateless request: run it on a THROWAWAY chat session (ported from the
+    // DeepseekFreeAPI reference). Async mode takes a pre-made session from
+    // the standing pool batch; sync mode mints one on the spot. Either way
+    // the chat is deleted on Z.AI once the response is fully processed
+    // (deferred below), so no server-side history survives the request —
+    // this is what keeps the account from accumulating dead sessions and
+    // stops stale server-side context from rotting later requests.
+    chatID, pooled, err := acquireStatelessSession(r.Context())
+    if err != nil {
+        if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+            return // client gone; nothing to answer
+        }
+        writeJSON(w, 503, formatOpenAIError(err.Error(), "server_error", "shutting_down"))
+        return
+    }
+    defer releaseStatelessSession(chatID, pooled)
     requestId := generateID()
 
     // ── Agent mode: transform tools & roles for Z.AI compatibility ──
@@ -4722,6 +4786,7 @@ func main() {
     flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging")
     flag.BoolVar(&config.AgentMode, "agent-mode", config.AgentMode, "Enable agent mode: translate tools & roles for Z.AI compatibility (modern shim by default)")
     flag.StringVar(&config.AgentModeVariant, "agent-mode-variant", config.AgentModeVariant, "Agent mode shim variant: modern (default, XML-sectioned prompt) or legacy ([ROLE: ...] rewrite)")
+    flag.BoolVar(&config.SyncMode, "sync-mode", config.SyncMode, "Legacy synchronous session flow: create a fresh chat per request instead of drawing from the pre-warmed session pool (used sessions are still deleted on Z.AI after each response)")
     flag.Parse()
 
     if _, err := os.Stat(dbPath); err != nil {
@@ -4794,11 +4859,71 @@ func main() {
         fetchModelsFromZAI()
     }()
 
+    // ── Session lifecycle (ported from the DeepseekFreeAPI reference) ─────
+    // Every stateless request runs on a throwaway chat session that is
+    // deleted on Z.AI right after its response is fully processed, so no
+    // server-side history outlives a request and the account never
+    // accumulates dead sessions. By default the async flow keeps a standing
+    // batch of pre-made sessions ready (SESSION_POOL_SIZE); --sync-mode
+    // restores the legacy per-request flow (still garbage-collected).
+    if config.SyncMode {
+        log.Println("[Startup] Session mode: SYNC (--sync-mode: fresh chat per request, deleted on Z.AI after use)")
+    } else {
+        poolWait = time.Duration(config.SessionAcquireTimeout) * time.Second
+        if config.SessionAcquireTimeout <= 0 {
+            poolWait = 0 // 0 => wait indefinitely for a pooled session
+        }
+        sessionPool = NewSessionPool(zaiSessionBackend{}, config.SessionPoolSize)
+        log.Printf("[Startup] Session mode: ASYNC (pre-made chat batch x%d, throwaway: deleted on Z.AI + refilled after each response)", sessionPool.Size())
+        log.Printf("[Startup]               SESSION_POOL_SIZE=%d SESSION_ACQUIRE_TIMEOUT=%ds", sessionPool.Size(), config.SessionAcquireTimeout)
+    }
+
     srv := &http.Server{
         Addr:    addr,
         Handler: handler,
     }
-    if err := srv.ListenAndServe(); err != nil {
-        log.Fatal(err)
+
+    // Start serving before blocking on signals.
+    serveErr := make(chan error, 1)
+    go func() {
+        serveErr <- srv.ListenAndServe()
+    }()
+
+    // Warm the standing session batch in the background; requests are served
+    // meanwhile (they simply queue on Acquire until sessions appear).
+    if sessionPool != nil {
+        sessionPool.Start()
+    }
+
+    // ── Graceful shutdown (ported from the DeepseekFreeAPI reference) ─────
+    // CTRL+C / SIGTERM stops accepting new connections, lets in-flight
+    // responses finish (10s drain deadline), then deletes every still-pooled
+    // chat session on Z.AI so nothing is left behind on the account. A
+    // second CTRL+C force-exits immediately (default handling is re-armed).
+    ctx, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+    defer stopSignal()
+
+    select {
+    case err := <-serveErr:
+        if err != nil && !errors.Is(err, http.ErrServerClosed) {
+            log.Fatal(err)
+        }
+    case <-ctx.Done():
+        stopSignal()
+        log.Println("[Shutdown] Graceful shutdown requested — draining connections and clearing all chat sessions...")
+
+        drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+        if err := srv.Shutdown(drainCtx); err != nil {
+            log.Printf("[Shutdown] drain deadline hit (%v); closing remaining connections", err)
+            _ = srv.Close()
+        }
+        cancel()
+
+        // Clear any sessions still pooled so nothing is left behind on the
+        // Z.AI account (checked-out ones are deleted by their own Release).
+        if sessionPool != nil {
+            sessionPool.Shutdown()
+        }
+        log.Println("[Shutdown] All chat sessions cleared. Goodbye.")
     }
 }

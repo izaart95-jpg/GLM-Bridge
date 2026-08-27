@@ -8,6 +8,9 @@ An OpenAI- **and Anthropic-compatible** API proxy for [chat.z.ai](https://chat.z
 
 - **Dual protocol** — OpenAI `/v1/chat/completions` + Anthropic `/v1/messages` on the same server
 - **Pure HTTP** — No Playwright, no Selenium, no browser overhead at runtime
+- **Throwaway chat sessions (context-rot guard)** — Every stateless request runs on a chat session that is **deleted on Z.AI the moment its response is fully processed** (`DELETE /api/v1/chats/{chat_id}`), so no server-side history outlives a request and the account never accumulates dead sessions
+- **Async session pool (default)** — A standing batch of pre-made sessions (`SESSION_POOL_SIZE`, default 5) is kept ready at all times; requests grab one instantly, and each consumed session is deleted upstream + replaced immediately, so the batch refills itself while the app runs. `--sync-mode` / `SYNC_MODE=true` restores the legacy per-request flow (still garbage-collected)
+- **Graceful shutdown** — CTRL+C / SIGTERM drains in-flight requests (10 s deadline), then deletes every remaining pooled chat session on Z.AI before exiting (a second CTRL+C force-exits)
 - **Background captcha cache** — When agent mode is enabled, captcha params are pre-generated asynchronously (2 cached, 75 s TTL, auto-pauses after 3 min idle)
 - **Streaming + non-streaming** — Full SSE support with keep-alive pings every 5 s
 - **Agent mode** — Translates OpenAI tools / function-calling into a text contract that Z.AI can understand, then intercepts `<<<TOOL_CALL>>>` blocks from the model's output and rewrites them back into native `tool_calls` deltas. Ships a **modern** XML-sectioned prompt shim (tolerant marker/fence/payload parsing, history summarization — the default) plus the original **legacy** `[ROLE: ...]` shim as an opt-in.
@@ -89,9 +92,9 @@ go run captcha.go
 #   go build -o token-collector -trimpath -gcflags="all=-l=4" -ldflags="-s -w" captcha.go && ./token-collector
 
 # 5. Start the server
-go run main.go agent.go
+go run main.go agent.go session_pool.go
 # Recommended: build first for better performance and faster startup:
-#   go build -o zai-api -trimpath -gcflags="all=-l=4" -ldflags="-s -w" main.go agent.go && ./zai-api
+#   go build -o zai-api -trimpath -gcflags="all=-l=4" -ldflags="-s -w" main.go agent.go session_pool.go && ./zai-api
 ```
 
 On startup, you'll see a banner with your health URL, API endpoints, and auth token. The Z.AI session is initialised asynchronously — if guest init fails, the first chat request will retry it.
@@ -108,6 +111,7 @@ On startup, you'll see a banner with your health URL, API endpoints, and auth to
 | `--verbose` | `false` | Enable verbose captcha/debug logging (`logError` / `logInfo` are silent unless this is set) |
 | `--agent-mode` | `false` | Enable agent mode (translate tools & roles for Z.AI compatibility; also starts the background captcha cache) |
 | `--agent-mode-variant` | `modern` | Agent-mode shim variant: `modern` (XML-sectioned prompt, tolerant parsing — recommended) or `legacy` (the original `[ROLE: ...]` rewrite shim) |
+| `--sync-mode` | `false` | Legacy synchronous session flow: create a fresh chat per request instead of drawing from the pre-warmed session pool (used sessions are still deleted on Z.AI after each response) |
 
 ### Environment Variables
 
@@ -123,6 +127,57 @@ On startup, you'll see a banner with your health URL, API endpoints, and auth to
 | `LOG_LEVEL` | `debug` | Log level (`debug` dumps every Z.AI request/response, SSE lines, and headers) |
 | `LOG_FORMAT` | `text` | Log format |
 | `STREAM_HOLDBACK` | `24` | Runes held back at the tail of a live stream so Z.AI `edit_content` tail-backtracks are absorbed before text reaches the client (`0` disables; see issue #23) |
+| `SYNC_MODE` | `false` | Restore the legacy synchronous session flow (one fresh chat per request, no pre-warmed pool). Used sessions are still deleted after use |
+| `SESSION_POOL_SIZE` | `5` | Standing batch of pre-made ready chat sessions kept by the async session pool |
+| `SESSION_ACQUIRE_TIMEOUT` | `10` | Seconds a request waits for a pooled session before creating one directly instead of stalling (`0` = wait indefinitely) |
+
+---
+
+## Session Lifecycle — Throwaway Sessions & the Session Pool
+
+OpenAI-compatible clients are **stateless**: they re-send the entire conversation (user + assistant turns) on every request. The bridge forwards that history to Z.AI inside a chat identified by `chat_id`, and every chat referenced by a completion materializes server-side under the bridge account (`ZAI_TOKEN`, or the guest identity) together with its full history.
+
+If those chats were left behind, two things would rot the experience:
+
+1. **Accumulation** — the account fills up with dead sessions, one per proxied request.
+2. **Context rot** — if a server-side chat outlives a single request, Z.AI's stored history stacks on top of the history the client already re-sent; the model sees duplicated/stale context and conversation quality degrades.
+
+So the bridge treats every stateless request as **throwaway** (ported from the [DeepseekFreeAPI](https://github.com/izaart95-jpg/DeepseekFreeAPI) session-pool design and adapted to Z.AI):
+
+- Each request draws a chat session, streams its response, and **the moment the response is fully written (or definitively failed)** the chat is deleted on Z.AI via `DELETE /api/v1/chats/{chat_id}`. Deletion is idempotent — Z.AI's `{"detail":"We could not find what you're looking for :/"}` reply counts as success, so the GC never jams on an already-collected chat.
+- Clients never see the `chat_id`; their conversation state lives entirely in their own `messages` array, so deleting the server-side chat is invisible to them.
+
+### Async mode (default)
+
+At startup the bridge pre-makes a standing batch of `SESSION_POOL_SIZE` (default **5**) sessions and keeps it warm:
+
+- A completion request **acquires** a ready session instantly (no per-request creation cost).
+- If a burst exhausts the batch, extra requests wait up to `SESSION_ACQUIRE_TIMEOUT` seconds (default **10**) and then create a session directly instead of stalling.
+- Only after a response has been **fully written and processed** is the consumed session deleted upstream and a replacement created — the batch refills itself for as long as the app runs.
+
+Z.AI chat IDs are client-generated UUIDs (a chat only materializes server-side when a completion first references it), so warmup is instant and local, and a session that is never consumed never touches the account at all.
+
+```bash
+# tune the async flow (optional)
+SESSION_POOL_SIZE=5            # standing ready-session batch size
+SESSION_ACQUIRE_TIMEOUT=10     # seconds to wait for a pooled session (0 = forever)
+```
+
+### Sync mode (legacy)
+
+`--sync-mode` (or `SYNC_MODE=true`) restores the legacy flow: every request creates its own session first, then completes, then the session is garbage-collected — no pre-warming. Used sessions are still deleted after each response.
+
+### Graceful shutdown
+
+Pressing CTRL+C (or sending SIGTERM) stops the bridge respectfully: it stops accepting new connections, lets in-flight responses finish (10 s drain deadline), prints `clearing all remaining sessions...`, deletes every still-pooled chat session on Z.AI so nothing is left behind, and only then exits. A second CTRL+C force-exits immediately.
+
+### Observability
+
+`GET /status` reports the live session-lifecycle state under `sessionPool`:
+
+```json
+{ "mode": "async", "throwaway": true, "gc_enabled": true, "size": 5, "ready": 5 }
+```
 
 ---
 
@@ -507,6 +562,8 @@ print(resp.content[0].text)
 
    Field semantics mirror the official Z.AI web frontend (`prod-fe` bundle): `edit_content` replaces the accumulated text from `edit_index` onward, where `edit_index` is a **UTF-16 code-unit offset** (JavaScript `String.substring` indexing — a missing `edit_index` defaults to `0`, i.e. full replacement); `content` is a **full replacement**; `delta_content` appends. Deltas forwarded to clients are always cut on rune boundaries and a small tail (`STREAM_HOLDBACK`) is kept pending, so trailing backtracks never surface as replacement-character garble (issue #23).
 
+5. **Session garbage collection** — Once the response is fully written (or definitively failed), the request's throwaway chat is deleted on Z.AI (`DELETE /api/v1/chats/{chat_id}`) in the background, and in async mode the pool immediately stocks a replacement. On shutdown, every still-pooled session is cleared the same way. See [Session Lifecycle](#session-lifecycle--throwaway-sessions--the-session-pool).
+
 ---
 
 ## Token Collection (`captcha.go`)
@@ -575,11 +632,13 @@ CGO_ENABLED=0 GOAMD64=v3 go build -ldflags="-s -w" -trimpath -o token-collector 
 
 ```
 zai-api/
-├── main.go          # HTTP server, captcha generation, Z.AI bridge, OpenAI + Anthropic shims, legacy agent shim
-├── agent.go         # Modern agent-mode shim (XML-sectioned prompt, tolerant parsing, streaming interceptor)
-├── agent_test.go    # Tests for the modern agent shim + variant dispatch
-├── captcha.go       # Seeds tokens.sqlite with device tokens (TUI + parallel collection)
-├── tokens.sqlite    # Generated token pool (consumed at runtime)
+├── main.go              # HTTP server, captcha generation, Z.AI bridge, OpenAI + Anthropic shims, legacy agent shim
+├── agent.go             # Modern agent-mode shim (XML-sectioned prompt, tolerant parsing, streaming interceptor)
+├── session_pool.go      # Throwaway chat sessions + async session pool + GC + graceful shutdown (ported from DeepseekFreeAPI)
+├── agent_test.go        # Tests for the modern agent shim + variant dispatch
+├── session_pool_test.go # Tests for the session pool, chat-delete client, and GC wiring
+├── captcha.go           # Seeds tokens.sqlite with device tokens (TUI + parallel collection)
+├── tokens.sqlite        # Generated token pool (consumed at runtime)
 ├── go.mod
 └── README.md
 ```
@@ -596,7 +655,7 @@ zai-api/
 - `image_generation` is **always `false`** and cannot be enabled via `/features` or per-request overrides.
 - The captcha step has a hard 90-second timeout; if it fails, the request returns `500`.
 - `--verbose` controls only the captcha subsystem's `logInfo` / `logError` output. Standard `log.*` calls (Z.AI bridge, SSE debug) are gated by `LOG_LEVEL=debug`.
-- Each request gets a fresh `chat_id` — there is no server-side conversation persistence across requests.
+- Each request gets a fresh `chat_id` — there is no server-side conversation persistence across requests. The chat is **deleted on Z.AI right after the response completes** (throwaway sessions), so the account never accumulates dead sessions; see [Session Lifecycle](#session-lifecycle--throwaway-sessions--the-session-pool).
 - Agent mode is **required** for tool-calling / function-calling to work. Without it, `tools` in the request body are ignored.
 - `reasoning_effort` (`"high"` / `"max"`) is only forwarded to Z.AI when the model's capabilities explicitly include `"reasoning_effort": true`. When active, `enable_thinking` is forced to `true`.
 
