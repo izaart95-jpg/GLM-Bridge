@@ -892,6 +892,22 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
         return nil, fmt.Errorf("textarea not found: %w", err2)
     }
     fmt.Println("✅ Model button & textarea found")
+    modelBtn := page.Locator("#model-selector-x-preview-l-button")
+    if err := humanClick(page, modelBtn); err != nil {
+        return nil, fmt.Errorf("human click on model button: %w", err)
+    }
+    humanPause(150, 400)
+    glmBtn := page.Locator(`button[data-value="glm-4.7"]`)
+    if err := glmBtn.WaitFor(
+        playwright.LocatorWaitForOptions{Timeout: playwright.Float(10000)},
+    ); err != nil {
+        return nil, fmt.Errorf("glm-4.7 option not found: %w", err)
+    }
+    if err := humanClick(page, glmBtn); err != nil {
+        return nil, fmt.Errorf("human click on glm-4.7: %w", err)
+    }
+    fmt.Println("✅ Model switched to glm-4.7")
+    humanPause(200, 500)
 
     textarea := page.Locator("#chat-input")
 
