@@ -1061,15 +1061,37 @@ func transformMessagesForAgentModern(rawMessages json.RawMessage, toolsRaw json.
 
 // agentTransformMessages rewrites the incoming OpenAI messages array for the
 // active agent shim, returning the JSON-encoded messages to send upstream.
+//
+// Both shims flatten message content to plain text, which drops the
+// image_url parts that processVisionMessages rewrote to uploaded Z.AI file
+// ids. Without those references the model never receives the pixels and
+// answers "I don't see any image" even though the files array is attached —
+// so the image parts are re-attached to the final user message afterwards.
 func agentTransformMessages(rawMessages, toolsRaw json.RawMessage) ([]byte, error) {
+    var out []byte
+    var err error
     if config.agentModern() {
-        return transformMessagesForAgentModern(rawMessages, toolsRaw)
+        out, err = transformMessagesForAgentModern(rawMessages, toolsRaw)
+    } else {
+        var tools []interface{}
+        if len(toolsRaw) > 0 {
+            _ = json.Unmarshal(toolsRaw, &tools)
+        }
+        out, err = transformMessagesForAgent(rawMessages, tools)
     }
-    var tools []interface{}
-    if len(toolsRaw) > 0 {
-        _ = json.Unmarshal(toolsRaw, &tools)
+    if err != nil {
+        return out, err
     }
-    return transformMessagesForAgent(rawMessages, tools)
+    if imageParts := extractImageParts(rawMessages); len(imageParts) > 0 {
+        attached, aerr := attachImageParts(out, imageParts)
+        if aerr == nil {
+            return attached, nil
+        }
+        // On attach failure fall through to the text-only transform: the
+        // request still completes (without vision) instead of erroring.
+        logError("agent vision attach failed: " + aerr.Error())
+    }
+    return out, nil
 }
 
 // agentExtractToolCalls parses tool-call blocks out of finished assistant text

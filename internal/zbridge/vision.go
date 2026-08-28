@@ -236,6 +236,97 @@ func processVisionMessages(ctx context.Context, raw json.RawMessage) (json.RawMe
     return rewritten, entries, nil
 }
 
+// extractImageParts returns every image_url content part found in an
+// OpenAI-formatted messages array, in message order. After
+// processVisionMessages has run, each returned part's "url" is the uploaded
+// Z.AI file id — the reference the model needs to actually receive the
+// pixels. Used to re-attach image references after transformations that
+// flatten message content to plain text (see agentTransformMessages).
+func extractImageParts(raw json.RawMessage) []map[string]interface{} {
+    var messages []map[string]json.RawMessage
+    if err := json.Unmarshal(raw, &messages); err != nil {
+        return nil
+    }
+    var parts []map[string]interface{}
+    for _, msg := range messages {
+        contentRaw, ok := msg["content"]
+        if !ok || len(contentRaw) == 0 {
+            continue
+        }
+        var msgParts []map[string]interface{}
+        if err := json.Unmarshal(contentRaw, &msgParts); err != nil {
+            continue // string (or non-array) content carries no images
+        }
+        for _, p := range msgParts {
+            if extractImageURL(p) != "" {
+                parts = append(parts, p)
+            }
+        }
+    }
+    return parts
+}
+
+// attachImageParts appends image_url parts to the LAST user message of a
+// transformed messages array, converting string content to the typed-parts
+// form when needed. Returns the re-encoded messages, or an error when the
+// input is not a messages array (in which case the caller keeps the original).
+func attachImageParts(transformed json.RawMessage, imageParts []map[string]interface{}) ([]byte, error) {
+    if len(imageParts) == 0 {
+        return transformed, nil
+    }
+    var messages []map[string]json.RawMessage
+    if err := json.Unmarshal(transformed, &messages); err != nil || len(messages) == 0 {
+        return nil, fmt.Errorf("attach image parts: not a messages array")
+    }
+
+    // Locate the last user message (fallback: the last message overall).
+    target := -1
+    for i := len(messages) - 1; i >= 0; i-- {
+        var role string
+        if raw, ok := messages[i]["role"]; ok {
+            _ = json.Unmarshal(raw, &role)
+        }
+        if role == "user" {
+            target = i
+            break
+        }
+    }
+    if target < 0 {
+        target = len(messages) - 1
+    }
+
+    msg := messages[target]
+    contentRaw := msg["content"]
+
+    var newParts []map[string]interface{}
+    trimmed := bytes.TrimSpace(contentRaw)
+    if len(trimmed) > 0 && trimmed[0] == '[' {
+        // Already a parts array — append to it.
+        if err := json.Unmarshal(trimmed, &newParts); err != nil {
+            return nil, fmt.Errorf("attach image parts: parse content array: %s", err.Error())
+        }
+    } else {
+        // String (or other scalar) content — promote to a text part first.
+        var s string
+        if err := json.Unmarshal(trimmed, &s); err == nil && s != "" {
+            newParts = []map[string]interface{}{{"type": "text", "text": s}}
+        }
+    }
+    newParts = append(newParts, imageParts...)
+
+    enc, err := json.Marshal(newParts)
+    if err != nil {
+        return nil, fmt.Errorf("attach image parts: encode content: %s", err.Error())
+    }
+    msg["content"] = enc
+
+    out, err := json.Marshal(messages)
+    if err != nil {
+        return nil, fmt.Errorf("attach image parts: encode messages: %s", err.Error())
+    }
+    return out, nil
+}
+
 // ============================================================================
 // IMAGE DETECTION & RESOLUTION
 // ============================================================================

@@ -35,7 +35,7 @@ func tinyPNGBytes(t *testing.T) []byte {
 }
 
 // modelsPayload is a mock /api/models response with a vision model, a text-only
-// model, and a model older than the (now removed) glm-4.7 cutoff.
+// model, and a model older than the glm-4.7 cutoff.
 const modelsPayload = `{
   "data": [
     {
@@ -81,10 +81,10 @@ const modelsPayload = `{
 }`
 
 // ─────────────────────────────────────────────────────────────────────────────
-// /v1/models — uncapped list + architecture object
+// /v1/models — glm-4.7-and-newer list + architecture object
 // ─────────────────────────────────────────────────────────────────────────────
 
-func TestModelsUncappedWithArchitecture(t *testing.T) {
+func TestModelsCappedWithArchitecture(t *testing.T) {
     upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         if r.URL.Path == "/api/models" {
             w.Header().Set("Content-Type", "application/json")
@@ -139,14 +139,18 @@ func TestModelsUncappedWithArchitecture(t *testing.T) {
         byID[m.ID] = i
     }
 
-    // The cap is gone: all three models (including one older than glm-4.7) appear.
-    if len(resp.Data) != 3 {
-        t.Fatalf("got %d models, want 3 (cap should be removed): %s", len(resp.Data), rec.Body.String())
+    // The list keeps every model from the newest down to glm-4.7 (inclusive)
+    // and cuts off anything older (see README "Models").
+    if len(resp.Data) != 2 {
+        t.Fatalf("got %d models, want 2 (newest..glm-4.7 inclusive): %s", len(resp.Data), rec.Body.String())
     }
-    for _, id := range []string{"glm-5v-turbo", "glm-4.7", "glm-4.6-legacy"} {
+    for _, id := range []string{"glm-5v-turbo", "glm-4.7"} {
         if _, ok := byID[id]; !ok {
-            t.Errorf("model %q missing from /v1/models (cap not removed?)", id)
+            t.Errorf("model %q missing from /v1/models", id)
         }
+    }
+    if _, ok := byID["glm-4.6-legacy"]; ok {
+        t.Errorf("model older than glm-4.7 must be cut off from /v1/models")
     }
 
     // Vision model: image input advertised.
@@ -421,13 +425,33 @@ func TestOpenAIVisionEndToEnd(t *testing.T) {
         t.Errorf("original download URL leaked into the upstream request body")
     }
     var comp struct {
-        Files []map[string]interface{} `json:"files"`
+        Files    []map[string]interface{} `json:"files"`
+        Messages []struct {
+            Role    string          `json:"role"`
+            Content json.RawMessage `json:"content"`
+        } `json:"messages"`
     }
     if err := json.Unmarshal(compBody, &comp); err != nil {
         t.Fatalf("parse upstream body: %v", err)
     }
     if len(comp.Files) != 2 {
         t.Fatalf("upstream files len = %d, want 2 (body=%s)", len(comp.Files), string(compBody))
+    }
+
+    // Regression (vision under agent mode): the upstream messages must still
+    // reference every uploaded image by file id. The agent shims flatten
+    // message content to plain text; if the image_url parts are dropped the
+    // model never receives the pixels and answers "I don't see any image"
+    // even though the files array is attached.
+    refs := upstreamImageRefs(t, comp.Messages)
+    if len(refs) != 2 {
+        t.Fatalf("upstream messages carry %d image refs, want 2 (body=%s)",
+            len(refs), string(compBody))
+    }
+    for _, id := range refs {
+        if _, ok := byID[id]; !ok {
+            t.Errorf("message image ref %q does not match any uploaded file id", id)
+        }
     }
 
     var refIDs, itemIDs []string
@@ -555,6 +579,158 @@ func TestAnthropicVisionEndToEnd(t *testing.T) {
     }
     if id, _ := comp.Files[0]["id"].(string); id == "" {
         t.Errorf("files entry missing id")
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Agent mode — image references must survive the prompt-shim rewrite
+// ─────────────────────────────────────────────────────────────────────────────
+
+// upstreamImageRefs extracts every image_url part url from an upstream
+// messages array (content may be a string or a typed-parts array).
+func upstreamImageRefs(t *testing.T, messages []struct {
+    Role    string          `json:"role"`
+    Content json.RawMessage `json:"content"`
+}) []string {
+    t.Helper()
+    var refs []string
+    for _, m := range messages {
+        var parts []map[string]interface{}
+        if err := json.Unmarshal(m.Content, &parts); err != nil {
+            continue // string content carries no image refs
+        }
+        for _, p := range parts {
+            if ty, _ := p["type"].(string); ty != "image_url" {
+                continue
+            }
+            if iu, ok := p["image_url"].(map[string]interface{}); ok {
+                if u, _ := iu["url"].(string); u != "" {
+                    refs = append(refs, u)
+                }
+            }
+        }
+    }
+    return refs
+}
+
+// TestAgentModeVisionImageRefsPreserved asserts that BOTH agent shim variants
+// keep the uploaded image references in the upstream messages, and that
+// text-only agent requests keep their plain-string body shape (no files, no
+// parts array). This is the exact regression behind the "I don't see any
+// image" reports on agent-mode deployments.
+func TestAgentModeVisionImageRefsPreserved(t *testing.T) {
+    for _, variant := range []string{"modern", "legacy"} {
+        t.Run(variant, func(t *testing.T) {
+            vm, cleanup := setupVisionE2E(t, []byte("unused"), "image/png")
+            defer cleanup()
+
+            cfg := zbridge.GetConfig()
+            oldVariant := cfg.AgentModeVariant
+            cfg.AgentModeVariant = variant
+            defer func() { cfg.AgentModeVariant = oldVariant }()
+
+            body := map[string]interface{}{
+                "model":  "glm-5v-turbo",
+                "stream": false,
+                "messages": []map[string]interface{}{
+                    {"role": "user", "content": []map[string]interface{}{
+                        {"type": "text", "text": "what is in this image"},
+                        {"type": "image_url", "image_url": map[string]interface{}{
+                            "url": "data:image/png;base64," + tinyPNGBase64,
+                        }},
+                    }},
+                },
+            }
+            bodyJSON, _ := json.Marshal(body)
+            req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(bodyJSON))
+            req.Header.Set("Content-Type", "application/json")
+            req.Header.Set("Authorization", "Bearer "+cfg.Auth.Token)
+            rec := httptest.NewRecorder()
+            zbridge.NewHandler().ServeHTTP(rec, req)
+
+            if rec.Code != 200 {
+                t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+            }
+
+            uploads := vm.getUploads()
+            if len(uploads) != 1 {
+                t.Fatalf("got %d uploads, want 1", len(uploads))
+            }
+
+            compBody := vm.getCompletionsBody()
+            var comp struct {
+                Files    []map[string]interface{} `json:"files"`
+                Messages []struct {
+                    Role    string          `json:"role"`
+                    Content json.RawMessage `json:"content"`
+                } `json:"messages"`
+            }
+            if err := json.Unmarshal(compBody, &comp); err != nil {
+                t.Fatalf("parse upstream body: %v", err)
+            }
+            if len(comp.Files) != 1 {
+                t.Fatalf("upstream files len = %d, want 1", len(comp.Files))
+            }
+            refs := upstreamImageRefs(t, comp.Messages)
+            if len(refs) != 1 {
+                t.Fatalf("upstream messages carry %d image refs, want 1 (body=%s)",
+                    len(refs), string(compBody))
+            }
+            if refs[0] != uploads[0].ID {
+                t.Errorf("image ref = %q, want uploaded file id %q", refs[0], uploads[0].ID)
+            }
+        })
+    }
+}
+
+// TestAgentModeTextOnlyBodyUnchanged asserts a text-only agent-mode request
+// still sends a plain-string message content and no "files" field — the
+// image re-attach path must not alter the common case.
+func TestAgentModeTextOnlyBodyUnchanged(t *testing.T) {
+    vm, cleanup := setupVisionE2E(t, []byte("unused"), "image/png")
+    defer cleanup()
+
+    cfg := zbridge.GetConfig()
+    body := map[string]interface{}{
+        "model":    "glm-5v-turbo",
+        "stream":   false,
+        "messages": []map[string]interface{}{{"role": "user", "content": "just text"}},
+    }
+    bodyJSON, _ := json.Marshal(body)
+    req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(bodyJSON))
+    req.Header.Set("Content-Type", "application/json")
+    req.Header.Set("Authorization", "Bearer "+cfg.Auth.Token)
+    rec := httptest.NewRecorder()
+    zbridge.NewHandler().ServeHTTP(rec, req)
+
+    if rec.Code != 200 {
+        t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+    }
+    if n := len(vm.getUploads()); n != 0 {
+        t.Fatalf("text-only request uploaded %d files", n)
+    }
+
+    compBody := vm.getCompletionsBody()
+    var comp struct {
+        Files    json.RawMessage `json:"files"`
+        Messages []struct {
+            Role    string          `json:"role"`
+            Content json.RawMessage `json:"content"`
+        } `json:"messages"`
+    }
+    if err := json.Unmarshal(compBody, &comp); err != nil {
+        t.Fatalf("parse upstream body: %v", err)
+    }
+    if len(comp.Files) != 0 {
+        t.Errorf("text-only request carries files field: %s", string(comp.Files))
+    }
+    if len(comp.Messages) == 0 {
+        t.Fatalf("upstream messages empty")
+    }
+    var s string
+    if err := json.Unmarshal(comp.Messages[len(comp.Messages)-1].Content, &s); err != nil {
+        t.Errorf("text-only content is not a plain string: %s",
+            string(comp.Messages[len(comp.Messages)-1].Content))
     }
 }
 
