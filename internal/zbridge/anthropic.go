@@ -9,6 +9,7 @@ import (
     "io"
     "encoding/json"
     "fmt"
+    "log"
     "net/http"
     "strings"
     "sync"
@@ -53,6 +54,93 @@ func extractAnthropicContent(content interface{}) string {
     }
     b, _ := json.Marshal(content)
     return string(b)
+}
+
+// anthropicContentToOpenAI converts an Anthropic content field to an OpenAI
+// content value. When the content carries no image blocks it collapses to a
+// plain string (preserving the long-standing text behavior exactly). When one
+// or more image blocks are present it returns an array of OpenAI content parts
+// (text + image_url) so the shared vision pipeline can pick the images up.
+func anthropicContentToOpenAI(content interface{}) interface{} {
+    arr, ok := content.([]interface{})
+    if !ok {
+        return extractAnthropicContent(content) // string / scalar path
+    }
+
+    hasImage := false
+    for _, item := range arr {
+        if mp, ok := item.(map[string]interface{}); ok {
+            if t, _ := mp["type"].(string); t == "image" {
+                hasImage = true
+                break
+            }
+        }
+    }
+    if !hasImage {
+        return extractAnthropicContent(content)
+    }
+
+    var parts []map[string]interface{}
+    for _, item := range arr {
+        mp, ok := item.(map[string]interface{})
+        if !ok {
+            continue
+        }
+        switch t, _ := mp["type"].(string); t {
+        case "text":
+            if txt, ok := mp["text"].(string); ok {
+                parts = append(parts, map[string]interface{}{
+                    "type": "text",
+                    "text": txt,
+                })
+            }
+        case "image":
+            if part := anthropicImageToOpenAI(mp); part != nil {
+                parts = append(parts, part)
+            }
+        }
+    }
+    if len(parts) == 0 {
+        return extractAnthropicContent(content)
+    }
+    return parts
+}
+
+// anthropicImageToOpenAI converts a single Anthropic image block into an
+// OpenAI image_url part, or nil if the block is malformed/unsupported.
+// base64 sources become data: URLs; url sources pass through.
+func anthropicImageToOpenAI(block map[string]interface{}) map[string]interface{} {
+    src, ok := block["source"].(map[string]interface{})
+    if !ok {
+        return nil
+    }
+    var imgURL string
+    switch srcType, _ := src["type"].(string); srcType {
+    case "base64":
+        data, _ := src["data"].(string)
+        if data == "" {
+            return nil
+        }
+        mediaType, _ := src["media_type"].(string)
+        if mediaType == "" {
+            mediaType = "image/png"
+        }
+        imgURL = "data:" + mediaType + ";base64," + data
+    case "url":
+        u, _ := src["url"].(string)
+        if u == "" {
+            return nil
+        }
+        imgURL = u
+    default:
+        return nil
+    }
+    return map[string]interface{}{
+        "type": "image_url",
+        "image_url": map[string]interface{}{
+            "url": imgURL,
+        },
+    }
 }
 
 // anthropicToOpenAIRequest converts an Anthropic /v1/messages request body
@@ -174,7 +262,7 @@ func anthropicToOpenAIRequest(bodyBytes []byte) ([]byte, error) {
 
             messages = append(messages, map[string]interface{}{
                 "role":    role,
-                "content": extractAnthropicContent(content),
+                "content": anthropicContentToOpenAI(content),
             })
         }
     }
@@ -280,6 +368,24 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+    // ── Vision: extract image_url parts (converted from Anthropic image ──
+    // blocks), upload them to Z.AI, and strip them from the messages.
+    // cleanedMessages is byte-identical to body.Messages when no images.
+    cleanedMessages, files, vErr := processVisionMessages(r.Context(), body.Messages)
+    if vErr != nil {
+        writeJSON(w, 400, formatAnthropicError("invalid_request_error", vErr.Error()))
+        return
+    }
+    if len(files) > 0 {
+        if !modelSupportsVision(model) {
+            log.Printf("[Vision] %d image(s) attached but model %q does not advertise vision support; forwarding anyway", len(files), model)
+        }
+        var localMsgs []Message
+        if err := json.Unmarshal(cleanedMessages, &localMsgs); err == nil {
+            messages = localMsgs
+        }
+    }
+
     stream := anthReq.Stream
     // Stateless request: run it on a THROWAWAY chat session (see
     // chatCompletionsHandler / session_pool.go). The chat is deleted on
@@ -295,9 +401,9 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
     defer ReleaseStatelessSession(chatID, pooled)
     requestId := "msg_" + generateID()
 
-    var transformedMessages json.RawMessage = body.Messages
+    var transformedMessages json.RawMessage = cleanedMessages
     if config.AgentMode {
-        if tm, err := agentTransformMessages(body.Messages, body.Tools); err == nil {
+        if tm, err := agentTransformMessages(cleanedMessages, body.Tools); err == nil {
             transformedMessages = tm
             var localMsgs []Message
             if err := json.Unmarshal(tm, &localMsgs); err == nil {
@@ -313,6 +419,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
         ChatID:            chatID,
         ClientMessagesRaw: transformedMessages,
         ReasoningEffort:   body.ReasoningEffort,
+        Files:             files,
     }
 
     if body.Reasoning != nil {

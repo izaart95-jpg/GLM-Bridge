@@ -13,8 +13,9 @@ import (
     "time"
 )
 
-// fetchModelsFromZAI retrieves models from Z.AI /api/models,
-// keeping only glm-4.7 and newer (the API returns newest-first).
+// fetchModelsFromZAI retrieves the full model list from Z.AI /api/models.
+// Every model the API returns is kept — including vision models and anything
+// older than glm-4.7 — so /v1/models mirrors the live upstream catalog.
 func fetchModelsFromZAI() []ModelInfo {
     modelsCacheMu.Lock()
     defer modelsCacheMu.Unlock()
@@ -66,10 +67,14 @@ func fetchModelsFromZAI() []ModelInfo {
 
     var apiResp struct {
         Data []struct {
-            ID   string `json:"id"`
-            Name string `json:"name"`
-            Info struct {
-                Name string `json:"name"`
+            ID      string `json:"id"`
+            Name    string `json:"name"`
+            Created int64  `json:"created"`
+            Info    struct {
+                Name   string `json:"name"`
+                Params struct {
+                    MaxTokens int64 `json:"max_tokens"`
+                } `json:"params"`
                 Meta struct {
                     Description  string                 `json:"description"`
                     Capabilities map[string]interface{} `json:"capabilities"`
@@ -89,15 +94,13 @@ func fetchModelsFromZAI() []ModelInfo {
     var filtered []ModelInfo
     for _, m := range apiResp.Data {
         filtered = append(filtered, ModelInfo{
-            ID:           m.ID,
-            Name:         m.Name,
-            Description:  m.Info.Meta.Description,
-            Capabilities: m.Info.Meta.Capabilities,
+            ID:            m.ID,
+            Name:          m.Name,
+            Description:   m.Info.Meta.Description,
+            Capabilities:  m.Info.Meta.Capabilities,
+            Created:       m.Created,
+            ContextLength: m.Info.Params.MaxTokens,
         })
-        // glm-4.7 is the cutoff — stop here (inclusive)
-        if m.ID == "glm-4.7" {
-            break
-        }
     }
 
     if len(filtered) > 0 {
@@ -166,19 +169,65 @@ func isValidReasoningEffort(value string) bool {
     }
 }
 
+// modelSupportsVision returns true only when the model's capabilities JSON
+// explicitly contains "vision": true. Models without the field (or with it
+// set to false) are treated as text-only.
+func modelSupportsVision(modelID string) bool {
+    if modelID == "" {
+        return false
+    }
+    caps := getModelCapabilities(modelID)
+    if caps == nil {
+        return false
+    }
+    v, ok := caps["vision"].(bool)
+    return ok && v
+}
+
+// architectureFor builds the OpenAI-style architecture object for a model.
+// Vision-capable models accept text+image input; everything is text-output.
+func architectureFor(caps map[string]interface{}) map[string]interface{} {
+    vision := false
+    if caps != nil {
+        if v, ok := caps["vision"].(bool); ok {
+            vision = v
+        }
+    }
+    inputModalities := []string{"text"}
+    modality := "text->text"
+    if vision {
+        inputModalities = []string{"text", "image"}
+        modality = "text+image->text"
+    }
+    return map[string]interface{}{
+        "modality":           modality,
+        "input_modalities":   inputModalities,
+        "output_modalities":  []string{"text"},
+    }
+}
+
 func modelsHandler(w http.ResponseWriter, r *http.Request) {
     now := time.Now().Unix()
     models := fetchModelsFromZAI()
     data := make([]map[string]interface{}, 0, len(models))
     for _, m := range models {
-        data = append(data, map[string]interface{}{
+        created := m.Created
+        if created == 0 {
+            created = now
+        }
+        entry := map[string]interface{}{
             "id":           m.ID,
             "object":       "model",
-            "created":      now,
+            "created":      created,
             "owned_by":     "z-ai",
             "display_name": m.Name,
             "description":  m.Description,
-        })
+            "architecture": architectureFor(m.Capabilities),
+        }
+        if m.ContextLength > 0 {
+            entry["context_length"] = m.ContextLength
+        }
+        data = append(data, entry)
     }
     writeJSON(w, 200, map[string]interface{}{
         "object": "list",

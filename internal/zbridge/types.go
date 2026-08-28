@@ -62,6 +62,10 @@ type SendOptions struct {
     Messages          []Message
     ClientMessagesRaw json.RawMessage
     ReasoningEffort   string // "high" or "max"; only forwarded if model supports it
+    // Files carries already-uploaded Z.AI file entries (see vision.go) to
+    // attach to the upstream completion request as the top-level "files"
+    // array. Empty for text-only requests (field then stays out of the body).
+    Files []map[string]interface{}
 }
 
 type ResponseResult struct {
@@ -146,10 +150,12 @@ var session = &SessionState{
 }
 
 type ModelInfo struct {
-    ID           string
-    Name         string
-    Description  string
-    Capabilities map[string]interface{}
+    ID            string
+    Name          string
+    Description   string
+    Capabilities  map[string]interface{}
+    Created       int64 // upstream "created" unix seconds (0 = unknown)
+    ContextLength int64 // upstream info.params.max_tokens (0 = unknown)
 }
 
 var (
@@ -165,7 +171,8 @@ var fallbackModels = []ModelInfo{
     {ID: "glm-5.2", Name: "GLM-5.2", Description: "Flagship model, excels at coding and long-horizon tasks"},
     {ID: "GLM-5.1", Name: "GLM-5.1", Description: "Previous flagship model"},
     {ID: "GLM-5-Turbo", Name: "GLM-5-Turbo", Description: "New model for chat, coding, and agentic task"},
-    {ID: "GLM-5v-Turbo", Name: "GLM-5V-Turbo", Description: "Vision model with evolved intelligence"},
+    {ID: "GLM-5v-Turbo", Name: "GLM-5V-Turbo", Description: "Vision model with evolved intelligence",
+        Capabilities: map[string]interface{}{"vision": true}},
     {ID: "glm-4.7", Name: "GLM-4.7", Description: "Classic high-performance model"},
 }
 

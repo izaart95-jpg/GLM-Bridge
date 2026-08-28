@@ -16,8 +16,9 @@ An OpenAI- **and Anthropic-compatible** API proxy for [chat.z.ai](https://chat.z
 - **Agent mode** — Translates OpenAI tools / function-calling into a text contract that Z.AI can understand, then intercepts `<<<TOOL_CALL>>>` blocks from the model's output and rewrites them back into native `tool_calls` deltas. Ships a **modern** XML-sectioned prompt shim (tolerant marker/fence/payload parsing, history summarization — the default) plus the original **legacy** `[ROLE: ...]` shim as an opt-in.
 - **Per-model feature resolution** — Features resolved per-model from Z.AI server capabilities, with user overrides stored per-model. `image_generation` is **always forced to `false`**.
 - **`reasoning_effort` support** — `high` / `max` values forwarded only when the model's capabilities explicitly allow it; `enable_thinking` is force-enabled when active
+- **Vision (image input)** — Accepts images on both endpoints (OpenAI `image_url` parts and Anthropic `image` blocks, via URL or base64). Each image is downloaded/decoded, uploaded to Z.AI's file endpoint, and attached to the completion as a `files` entry — the same shape the official web client sends. Up to **10 images / 50 MB each** per request. Requires a real account (`ZAI_TOKEN`); guest sessions get a `401` on upload.
 - **Token pool** — Device tokens harvested via the token collector (`cmd/token-collector`) and stored in `tokens.sqlite`. Consumed FIFO and removed after use (up to 5 retries per captcha computation)
-- **Live model list** — Models fetched from Z.AI `/api/models` (cached 5 min, falls back to a static list)
+- **Live model list** — Full model catalog fetched from Z.AI `/api/models` (cached 5 min, falls back to a static list) with OpenAI-style `architecture`/modality metadata on `/v1/models`
 - **Pure-Go SQLite** — Uses `modernc.org/sqlite` — no CGO required
 - **HTTP/2 + pooled connections** — Optimised transport for both Aliyun and Z.AI endpoints
 
@@ -25,7 +26,7 @@ An OpenAI- **and Anthropic-compatible** API proxy for [chat.z.ai](https://chat.z
 
 ## Supported Models
 
-Models are fetched live from Z.AI's `/api/models` (cached 5 min). The server keeps models from the newest down to `glm-4.7` (inclusive). The fallback list (used if Z.AI is unreachable) is:
+Models are fetched live from Z.AI's `/api/models` (cached 5 min). **Every model the upstream returns is exposed** — including vision models and anything older than `glm-4.7` — so `/v1/models` mirrors the live Z.AI catalog. The fallback list (used if Z.AI is unreachable) is:
 
 | Model ID | Notes |
 |---|---|
@@ -36,6 +37,27 @@ Models are fetched live from Z.AI's `/api/models` (cached 5 min). The server kee
 | `GLM-5-Turbo` | New model for chat, coding, and agentic tasks |
 | `GLM-5v-Turbo` | Vision model with evolved intelligence |
 | `glm-4.7` | Classic high-performance model |
+
+Each entry in `/v1/models` now carries an OpenAI-style `architecture` object derived from the model's server capabilities (`info.meta.capabilities`). Models whose capabilities include `"vision": true` advertise image input:
+
+```json
+{
+  "id": "GLM-5v-Turbo",
+  "object": "model",
+  "created": 1774521032,
+  "owned_by": "z-ai",
+  "display_name": "GLM-5V-Turbo",
+  "description": "Vision model with evolved intelligence",
+  "context_length": 128000,
+  "architecture": {
+    "modality": "text+image->text",
+    "input_modalities": ["text", "image"],
+    "output_modalities": ["text"]
+  }
+}
+```
+
+Text-only models report `"modality": "text->text"` and `"input_modalities": ["text"]`. `output_modalities` is always `["text"]`. `context_length` is included when Z.AI publishes `info.params.max_tokens`.
 
 > **Note:**
 > - If you don't pass `model` in `/v1/chat/completions` or `/v1/messages`, the server defaults to `glm-5`.
@@ -206,7 +228,7 @@ Anthropic clients authenticate via the `x-api-key` header (same value as `AUTH_T
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `model` | string | `glm-5` | Any model ID from `/v1/models` |
-| `messages` | array | *(required)* | OpenAI-style message array |
+| `messages` | array | *(required)* | OpenAI-style message array; `content` may be a string or a part array with `text` and `image_url` items |
 | `stream` | bool | `true` | SSE stream when true |
 | `reasoning` | bool | *(per-model)* | Enables `enable_thinking` for this request |
 | `thinking` | object | *(per-model)* | `{"type":"enabled"}` or `{"type":"disabled"}` → `enable_thinking` |
@@ -214,11 +236,36 @@ Anthropic clients authenticate via the `x-api-key` header (same value as `AUTH_T
 | `tools` | array | *(empty)* | OpenAI-style tools (requires agent mode) |
 | `webSearch` / `search` | bool | *(per-model)* | Toggle `auto_web_search` + `web_search` |
 
+#### Image input (vision)
+
+Both endpoints accept images. The bridge extracts every image, uploads it to Z.AI's file endpoint (`POST /api/v1/files/`), and attaches the returned file objects to the upstream completion as a top-level `files` array — the same payload the official chat.z.ai web client sends. The text of your messages is forwarded as usual; the pixels ride in `files`.
+
+- **OpenAI** (`/v1/chat/completions`): use `image_url` content parts. Both a remote URL and an inline base64 data URL are accepted:
+  ```json
+  {"role":"user","content":[
+    {"type":"text","text":"What is in this image?"},
+    {"type":"image_url","image_url":{"url":"https://example.com/photo.jpg"}},
+    {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw..."}}
+  ]}
+  ```
+- **Anthropic** (`/v1/messages`): use `image` content blocks. Both `base64` and `url` sources are accepted:
+  ```json
+  {"role":"user","content":[
+    {"type":"text","text":"What is in this image?"},
+    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw..."}},
+    {"type":"image","source":{"type":"url","url":"https://example.com/photo.jpg"}}
+  ]}
+  ```
+
+**Limits:** at most **10 images per request**, each at most **50 MB**. Exceeding either returns a `400` before any upload is attempted. Images are held in memory only (no temp files on disk). For best results use a vision-capable model (see `architecture.input_modalities` on `/v1/models`); attaching images to a non-vision model logs a warning and forwards anyway.
+
+> ⚠️ **Requires a real account (`ZAI_TOKEN`).** Image input uploads each file to Z.AI's `/api/v1/files/` endpoint, which **only accepts a logged-in account token**. If you run the bridge on a **guest session** (no `ZAI_TOKEN`), model listing and text completions still work, but the upload is rejected with `401` and the request fails with `400 {"message":"image processing failed: file upload unauthorized (401)"}`. To use vision, set `ZAI_TOKEN` to a logged-in Z.AI JWT (see [Getting `ZAI_TOKEN`](#getting-zai_token-optional-but-recommended)).
+
 #### `/v1/messages` body
 
 Standard Anthropic Messages API fields: `model`, `messages`, `system`, `max_tokens`, `temperature`, `top_p`, `stop_sequences`, `stream`, `thinking` (`{"type":"enabled"}`), `tools`, `reasoning_effort`.
 
-Tool-use content blocks (`tool_use` / `tool_result`) are translated to/from OpenAI format internally. Requires agent mode for tool calls to function.
+Tool-use content blocks (`tool_use` / `tool_result`) are translated to/from OpenAI format internally. Requires agent mode for tool calls to function. Image content blocks are converted to OpenAI `image_url` parts and handled by the shared vision pipeline (see above).
 
 #### Request headers
 
@@ -649,7 +696,8 @@ zai-api/
 │   ├── format.go                  # OpenAI response/error formatting
 │   ├── anthropic.go               # Anthropic-compatible endpoint + translation
 │   ├── middleware.go              # CORS, auth, JSON, misc handlers
-│   ├── models.go                  # Live model list + capabilities
+│   ├── models.go                  # Live model list + capabilities + architecture
+│   ├── vision.go                  # Image input: extract, download, upload, files payload
 │   ├── handlers.go                # /v1/chat/completions + admin handlers
 │   ├── agent.go                   # Modern agent-mode shim (XML-sectioned prompt)
 │   ├── agent_legacy.go            # Legacy [ROLE: ...] agent shim
@@ -660,7 +708,8 @@ zai-api/
 ├── cmd/token-collector/           # Standalone binary: seeds tokens.sqlite (TUI)
 ├── tests/                         # Blackbox tests (package tests)
 │   ├── session_pool_test.go       # Pool mechanics, chat-delete client, GC wiring
-│   └── integration_test.go        # End-to-end HTTP garble regression (issue #23)
+│   ├── integration_test.go        # End-to-end HTTP garble regression (issue #23)
+│   └── vision_test.go             # Vision e2e (upload + files), /v1/models, limits
 ├── tokens.sqlite                  # Generated token pool (consumed at runtime)
 ├── go.mod
 └── README.md
@@ -687,6 +736,7 @@ go test ./...
 - Each request gets a fresh `chat_id` — there is no server-side conversation persistence across requests. The chat is **deleted on Z.AI right after the response completes** (throwaway sessions), so the account never accumulates dead sessions; see [Session Lifecycle](#session-lifecycle--throwaway-sessions--the-session-pool).
 - Agent mode is **required** for tool-calling / function-calling to work. Without it, `tools` in the request body are ignored.
 - `reasoning_effort` (`"high"` / `"max"`) is only forwarded to Z.AI when the model's capabilities explicitly include `"reasoning_effort": true`. When active, `enable_thinking` is forced to `true`.
+- **Vision:** image input **requires a real account token (`ZAI_TOKEN`)** — the `/api/v1/files/` upload endpoint rejects guest sessions with `401` (the request then fails with `400 ... file upload unauthorized (401)`). Images are uploaded per request and are **not cached or deduplicated** — the same image sent twice is uploaded twice. Uploaded files are tied to the account and are not explicitly deleted by the bridge. Limits: 10 images / 50 MB each per request.
 
 ---
 

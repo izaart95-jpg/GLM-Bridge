@@ -6,6 +6,8 @@
 
 # Runtime artifacts (tokens.sqlite holds harvested device tokens — never commit)
 tokens.sqlite
+tokens.sqlite-shm
+tokens.sqlite-wal
 *.log
 
 # Local environment

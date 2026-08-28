@@ -40,3 +40,13 @@ func SeedCaptchaParam(value string) {
     })
     captchaCache.mu.Unlock()
 }
+
+// FlushModelsCache clears the cached model list so the next /v1/models (or
+// capability lookup) re-fetches from the current BASE_URL. Tests use it to
+// repopulate the cache from their mock upstream after pointing BASE_URL at it.
+func FlushModelsCache() {
+    modelsCacheMu.Lock()
+    modelsCache = nil
+    modelsCacheTime = time.Time{}
+    modelsCacheMu.Unlock()
+}
