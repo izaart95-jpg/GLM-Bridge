@@ -150,12 +150,11 @@ var session = &SessionState{
 }
 
 type ModelInfo struct {
-    ID            string
-    Name          string
-    Description   string
-    Capabilities  map[string]interface{}
-    Created       int64 // upstream "created" unix seconds (0 = unknown)
-    ContextLength int64 // upstream info.params.max_tokens (0 = unknown)
+    ID           string
+    Name         string
+    Description  string
+    Capabilities map[string]interface{}
+    Created      int64 // upstream "created" unix seconds (0 = unknown)
 }
 
 var (

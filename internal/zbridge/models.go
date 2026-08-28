@@ -71,10 +71,7 @@ func fetchModelsFromZAI() []ModelInfo {
             Name    string `json:"name"`
             Created int64  `json:"created"`
             Info    struct {
-                Name   string `json:"name"`
-                Params struct {
-                    MaxTokens int64 `json:"max_tokens"`
-                } `json:"params"`
+                Name string `json:"name"`
                 Meta struct {
                     Description  string                 `json:"description"`
                     Capabilities map[string]interface{} `json:"capabilities"`
@@ -94,12 +91,11 @@ func fetchModelsFromZAI() []ModelInfo {
     var filtered []ModelInfo
     for _, m := range apiResp.Data {
         filtered = append(filtered, ModelInfo{
-            ID:            m.ID,
-            Name:          m.Name,
-            Description:   m.Info.Meta.Description,
-            Capabilities:  m.Info.Meta.Capabilities,
-            Created:       m.Created,
-            ContextLength: m.Info.Params.MaxTokens,
+            ID:           m.ID,
+            Name:         m.Name,
+            Description:  m.Info.Meta.Description,
+            Capabilities: m.Info.Meta.Capabilities,
+            Created:      m.Created,
         })
     }
 
@@ -223,9 +219,6 @@ func modelsHandler(w http.ResponseWriter, r *http.Request) {
             "display_name": m.Name,
             "description":  m.Description,
             "architecture": architectureFor(m.Capabilities),
-        }
-        if m.ContextLength > 0 {
-            entry["context_length"] = m.ContextLength
         }
         data = append(data, entry)
     }

@@ -114,14 +114,13 @@ func TestModelsUncappedWithArchitecture(t *testing.T) {
     var resp struct {
         Object string `json:"object"`
         Data   []struct {
-            ID            string   `json:"id"`
-            Object        string   `json:"object"`
-            Created       int64    `json:"created"`
-            OwnedBy       string   `json:"owned_by"`
-            DisplayName   string   `json:"display_name"`
-            Description   string   `json:"description"`
-            ContextLength int64    `json:"context_length"`
-            Architecture  struct {
+            ID          string `json:"id"`
+            Object      string `json:"object"`
+            Created     int64  `json:"created"`
+            OwnedBy     string `json:"owned_by"`
+            DisplayName string `json:"display_name"`
+            Description string `json:"description"`
+            Architecture struct {
                 Modality          string   `json:"modality"`
                 InputModalities   []string `json:"input_modalities"`
                 OutputModalities  []string `json:"output_modalities"`
@@ -166,9 +165,6 @@ func TestModelsUncappedWithArchitecture(t *testing.T) {
     }
     if v.Description != "Vision model with evolved intelligence" {
         t.Errorf("vision description = %q", v.Description)
-    }
-    if v.ContextLength != 128000 {
-        t.Errorf("vision context_length = %d, want 128000", v.ContextLength)
     }
 
     // Text-only model: no image input.
