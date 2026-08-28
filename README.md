@@ -24,7 +24,7 @@ An OpenAI- **and Anthropic-compatible** API proxy for [chat.z.ai](https://chat.z
 
 ## Supported Models
 
-Models are fetched live from Z.AI `/api/models` (cached 5 min). **Every model the upstream returns is exposed** — including vision models and anything older than `glm-4.7`. Fallback list (used if Z.AI is unreachable):
+Models are fetched live from Z.AI's `/api/models` (cached 5 min). The server keeps models from the newest down to `glm-4.7` (inclusive). The fallback list (used if Z.AI is unreachable) is:
 
 | Model ID | Notes |
 |---|---|

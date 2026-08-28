@@ -13,9 +13,8 @@ import (
     "time"
 )
 
-// fetchModelsFromZAI retrieves the full model list from Z.AI /api/models.
-// Every model the API returns is kept — including vision models and anything
-// older than glm-4.7 — so /v1/models mirrors the live upstream catalog.
+// fetchModelsFromZAI retrieves models from Z.AI /api/models,
+// keeping only glm-4.7 and newer (the API returns newest-first).
 func fetchModelsFromZAI() []ModelInfo {
     modelsCacheMu.Lock()
     defer modelsCacheMu.Unlock()
@@ -97,8 +96,11 @@ func fetchModelsFromZAI() []ModelInfo {
             Capabilities: m.Info.Meta.Capabilities,
             Created:      m.Created,
         })
+        if m.ID == "glm-4.7" {
+            break
+        }
     }
-
+    
     if len(filtered) > 0 {
         modelsCache = filtered
         modelsCacheTime = time.Now()
