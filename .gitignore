@@ -12,3 +12,6 @@ tokens.sqlite-wal
 
 # Local environment
 .env
+
+# Local agent-team state
+.agent-teams/

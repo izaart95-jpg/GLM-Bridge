@@ -2,7 +2,7 @@
 
 An OpenAI- **and Anthropic-compatible** API proxy for [chat.z.ai](https://chat.z.ai). Drop it in front of any OpenAI/Anthropic-compatible tool and use Z.AI's GLM models — pure HTTP, no browser automation at runtime.
 
-**Hosted instance:** `https://api.lelouch.indevs.in/v1` — auth `Waguri` (Bearer or `x-api-key`), runs agent mode, supports `glm-5.2`. OpenAI endpoint recommended; Anthropic works but is primitive.
+**Hosted instance:** `https://glm.cognix.sryze.cc/v1` — auth `Waguri` (Bearer or `x-api-key`), runs agent mode, supports `glm-5.2` and `glm-5.3-flash`. OpenAI endpoint recommended; Anthropic works but is primitive.
 
 ---
 
@@ -232,7 +232,6 @@ Standard Anthropic fields: `model`, `messages`, `system`, `max_tokens`, `tempera
 | `POST` | `/features` | ✅ | Per-model feature overrides (below) |
 | `GET`  | `/features` | ✅ | Inspect resolved features / stored states |
 | `POST` | `/stop` | ✅ | Acknowledged no-op |
-| `GET`  | `/inject.js` | ❌ | `{"message":"Direct mode"}` |
 
 ---
 
@@ -281,7 +280,7 @@ Enabling agent mode also starts the background captcha cache (2 pre-generated pa
 
 ## Examples
 
-> Self-hosted examples use `glm-4.7` so they work **without** `ZAI_TOKEN`. For the hosted instance use base URL `https://api.lelouch.indevs.in/v1`, model `glm-5.2`, same auth.
+> Self-hosted examples use `glm-4.7` so they work **without** `ZAI_TOKEN`. For the hosted instance use base URL `https://glm.cognix.sryze.cc/v1`, model `glm-5.2` or `glm-5.3-flash`, same auth.
 
 ```bash
 # OpenAI — non-streaming
@@ -301,7 +300,7 @@ curl -N -X POST http://localhost:3001/v1/messages \
 ```
 
 ```python
-# Python — OpenAI SDK (self-hosted shown; hosted: base_url="https://api.lelouch.indevs.in/v1", model="glm-5.2")
+# Python — OpenAI SDK (self-hosted shown; hosted: base_url="https://glm.cognix.sryze.cc/v1", model="glm-5.3-flash" or "glm-5.2")
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:3001/v1", api_key="Waguri")
 resp = client.chat.completions.create(model="glm-4.7", messages=[{"role": "user", "content": "Hello!"}])

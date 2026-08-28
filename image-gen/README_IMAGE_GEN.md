@@ -11,8 +11,8 @@ built with **zero external dependencies** — only Node.js built-in modules.
 |---|---|
 | **Node.js** | v14 or higher (uses `URL`, `async/await`, optional chaining) |
 | **OS** | macOS, Linux, Windows (with a terminal that supports ANSI colors) |
-| **Network** | Outbound HTTPS access to `image.z.ai` |
-| **Account** | A valid session cookie from [image.z.ai](https://image.z.ai) |
+| **Network** | Outbound HTTPS access to `image.z.ai` (and to `chat.z.ai` when using `ZAI_TOKEN` auto-auth) |
+| **Account** | Either a session cookie from [image.z.ai](https://image.z.ai) (`TOKEN`) **or** a chat.z.ai bearer token (`ZAI_TOKEN`) for automatic OAuth |
 
 ---
 
@@ -32,12 +32,29 @@ chmod +x image-gen.js
 
 ## Getting Your Session Token
 
+### Recommended — `ZAI_TOKEN` automatic OAuth (no browser DevTools needed)
+
+The recommended way to authenticate — especially for **headless workflows**
+(CI, cron, containers, SSH) — is to set **`ZAI_TOKEN`**, your chat.z.ai bearer
+token, in the environment or in a `.env` file. The script then automatically
+performs the chat.z.ai OAuth flow to obtain the image.z.ai session token:
+
+1. `GET  image.z.ai/api/v1/z-image/auth/` → fetch the authorization URL
+2. `POST chat.z.ai/api/oauth/authorize` (with `Bearer <ZAI_TOKEN>`) → approve, receive an authorization code
+3. `POST image.z.ai/api/v1/z-image/auth` → exchange the code for the session token
+
+No browser, no DevTools, no manual cookie copying. If the session token expires
+while you are using the script, it is refreshed automatically the same way (see
+*Method 3* below). When both `TOKEN` and `ZAI_TOKEN` are set, `TOKEN` always wins.
+
+### Manual alternative — copy the `session` cookie
+
 1. Open [https://image.z.ai](https://image.z.ai) in your browser and log in.
 2. Open **DevTools** (`F12` or `Cmd+Option+I`).
 3. Go to **Application** → **Cookies** → `https://image.z.ai`.
 4. Find the cookie named **`session`** and copy its value.
 
-> ⚠️ Tokens expire. If you get a `401 Invalid access token` error, repeat the steps above to get a fresh cookie.
+> ⚠️ Tokens expire. If you get a `401 Invalid access token` error, repeat the steps above to get a fresh cookie — or switch to `ZAI_TOKEN`, which refreshes automatically.
 
 ---
 
@@ -63,7 +80,31 @@ Then just run:
 node image-gen.js
 ```
 
-### Method 3 — Interactive prompt (fallback)
+### Method 3 — Automatic OAuth via `ZAI_TOKEN` (headless)
+
+Instead of copying the `session` cookie by hand, provide a **chat.z.ai bearer
+token** as `ZAI_TOKEN` (inline or in `.env`). On startup the script runs the
+OAuth exchange automatically and derives the image.z.ai session token for you:
+
+```bash
+ZAI_TOKEN="eyJhbGci..." node image-gen.js
+```
+
+```dotenv
+ZAI_TOKEN="eyJhbGci..."
+```
+
+Notes:
+- Resolution order is **`TOKEN` → `ZAI_TOKEN` → interactive prompt**. A direct
+  `TOKEN` always takes precedence when both are present.
+- If the session expires mid-session (a `401` during generation), the script
+  automatically re-runs the OAuth flow once to refresh the session token and
+  retries the request.
+- On OAuth failure: in an interactive terminal it falls back to the manual
+  token prompt; in headless mode (no TTY) it prints a clear error and exits
+  with code `1`.
+
+### Method 4 — Interactive prompt (fallback)
 
 If no token is found in the environment or `.env`, the script will ask for it:
 
@@ -264,7 +305,11 @@ The file is saved in the **current working directory** (or the path you specifie
 
 | Error | Cause | Resolution |
 |-------|-------|------------|
-| `Token expired or invalid` | Session cookie has expired or is wrong | Re-copy the `session` cookie from DevTools |
+| `Token expired or invalid` | Session cookie has expired or is wrong | Re-copy the `session` cookie from DevTools (or set `ZAI_TOKEN` to auto-refresh) |
+| `OAuth authentication failed: ...` | `ZAI_TOKEN` expired/invalid or the OAuth exchange failed at startup | Refresh your chat.z.ai bearer token; on a TTY the script falls back to the manual prompt |
+| `ZAI_TOKEN was rejected by chat.z.ai: ...` | chat.z.ai refused the bearer token (expired/invalid) during OAuth | Get a fresh chat.z.ai token and update `ZAI_TOKEN` |
+| `Headless mode: cannot fall back to manual token entry` | OAuth failed and stdin is not a terminal, so no interactive fallback is possible | Fix `ZAI_TOKEN` (or provide `TOKEN`), or run the script in an interactive terminal |
+| `OAuth refresh failed: ...` / `Could not refresh session token` / `Token still rejected after OAuth refresh` | The session expired mid-run and the automatic OAuth refresh failed or was still rejected | Check that `ZAI_TOKEN` is still valid and that `chat.z.ai` is reachable, then restart |
 | `No prompt text after parsing commands` | Input contained only modifiers with no descriptive text | Add actual image description text |
 | `Unknown ratio "X"` | Unsupported ratio value used | Use one of the 7 supported values |
 | `Request timed out (120s)` | API took longer than 2 minutes | Retry — the API can be slow under load |
@@ -325,9 +370,16 @@ Generates a **9:16**, **1K**, **watermarked** image.
 
 ```
 startup
-  └─ scan process.env.TOKEN
-  └─ scan .env file for TOKEN="..."
-  └─ if not found → prompt user interactively
+  └─ scan process.env.TOKEN  /  .env TOKEN="..."
+  └─ if TOKEN found → use it as the session cookie
+  └─ else scan process.env.ZAI_TOKEN  /  .env ZAI_TOKEN="..."
+       └─ if ZAI_TOKEN found → run OAuth (no interaction):
+            GET  image.z.ai/api/v1/z-image/auth/        → authorization URL
+            POST chat.z.ai/api/oauth/authorize          → approve (Bearer ZAI_TOKEN)
+            POST image.z.ai/api/v1/z-image/auth         → exchange code → auth_token
+            use session=<auth_token>
+       └─ on OAuth failure → TTY: manual prompt · headless: exit 1
+  └─ else → prompt user interactively
 
 chat loop
   └─ read user input
@@ -337,11 +389,12 @@ chat loop
        { prompt, ratio, resolution, rm_label_watermark }
   └─ spinner while waiting (up to 120s)
   └─ on 200 → print URL → offer download
-  └─ on 401 → print token help → exit
+  └─ on 401 → if ZAI_TOKEN: re-run OAuth once, refresh session, retry request
+              else print token help → exit
   └─ on other error → print error → continue loop
 ```
 
-All networking uses Node.js `https` built-in.
+All networking uses Node.js `https`/`http` built-ins.
 All terminal interaction uses Node.js `readline` built-in.
 No npm packages. No `node_modules`. No installation step.
 
