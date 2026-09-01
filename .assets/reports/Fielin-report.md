@@ -50,6 +50,39 @@
   - [21.4 The dump (JSON)](#214-the-dump-json)
   - [21.5 Elided `upLang` i18n strings](#215-elided-uplang-i18n-strings)
   - [21.6 Corrections made to earlier sections by this dump](#216-corrections-made-to-earlier-sections-by-this-dump)
+- **Part II — Session-1 findings (§22–§27, consolidated reference)**
+  - [22 Session-1 summary — the fully verified pipeline](#22-session-1-summary--the-fully-verified-pipeline)
+    - [22.1 Pipeline (end-to-end, every step executed and verified)](#221-pipeline-end-to-end-every-step-executed-and-verified)
+    - [22.2 What was proven (byte-exact, executed — not assumed)](#222-what-was-proven-byte-exact-executed--not-assumed)
+    - [22.3 Live-run outcome — the crypto layer is server-validated](#223-live-run-outcome--the-crypto-layer-is-server-validated)
+  - [23 The 140-field payload map (condensed from analysis_fields.md)](#23-the-140-field-payload-map-condensed-from-analysis_fieldsmd)
+    - [23.1 Classification legend](#231-classification-legend)
+    - [23.2 The 31 non-empty fields](#232-the-31-non-empty-fields)
+    - [23.3 Refresh sets](#233-refresh-sets)
+    - [23.4 Field 43 (probe-timing log) + field 74 — semantics](#234-field-43-probe-timing-log--field-74--semantics)
+    - [23.5 Field 21, field 88, and the HC invariants](#235-field-21-field-88-and-the-hc-invariants)
+    - [23.6 Timestamp envelope (for synthetic tokens)](#236-timestamp-envelope-for-synthetic-tokens)
+  - [24 Key/IV hierarchy — final (from analysis_keys.md §6)](#24-keyiv-hierarchy--final-from-analysis_keysmd-6)
+    - [24.1 The 12-constant table](#241-the-12-constant-table)
+    - [24.2 ONE-IV proof (the word array IS the ASCII)](#242-one-iv-proof-the-word-array-is-the-ascii)
+    - [24.3 secretKey ≡ deviceConfig.key (resolved)](#243-secretkey--deviceconfigkey-resolved)
+    - [24.4 Live DeviceData params (the module defaults are wrong for this site)](#244-live-devicedata-params-the-module-defaults-are-wrong-for-this-site)
+  - [25 Session-1 live captures (from live_captures.md — session A)](#25-session-1-live-captures-from-live_capturesmd--session-a)
+    - [25.1 The live fetch example (InitCaptchaV3 request)](#251-the-live-fetch-example-initcaptchav3-request)
+    - [25.2 Response + DeviceConfig decrypt](#252-response--deviceconfig-decrypt)
+    - [25.3 The two live tokens](#253-the-two-live-tokens)
+    - [25.4 The payload diff + timing relations](#254-the-payload-diff--timing-relations)
+  - [26 Generator & validation assets (Session-1 code deliverables)](#26-generator--validation-assets-session-1-code-deliverables)
+    - [26.1 replay_template.py — the replay foundation](#261-replay_templatepy--the-replay-foundation)
+    - [26.2 device_token_gen.py — the complete generator (t3)](#262-device_token_genpy--the-complete-generator-t3)
+    - [26.3 live_validate.py — the end-to-end validator (t4)](#263-live_validatepy--the-end-to-end-validator-t4)
+    - [26.4 The validation audit — bugs found & fixed](#264-the-validation-audit--bugs-found--fixed)
+    - [26.5 Reproduce commands](#265-reproduce-commands)
+  - [27 Session 3 handoff](#27-session-3-handoff)
+    - [27.1 The F001→T001 gap (the only remaining problem)](#271-the-f001t001-gap-the-only-remaining-problem)
+    - [27.2 Fresh-session mint constraint](#272-fresh-session-mint-constraint)
+    - [27.3 Sign/verify flow notes](#273-signverify-flow-notes)
+    - [27.4 Session-1 deliverable pointers](#274-session-1-deliverable-pointers)
 
 ---
 
@@ -526,8 +559,8 @@ SG_WEB#3795d28242a11619bc25f786f84e53d4-h-1782531783720-ac9e47a76eee443087943a27
 |---|---|---|---|
 | `tF` | `WEB` | `SG_WEB` | region prefix |
 | `Q` | `null` → `` | `3795d2…-h-1782531783720-ac9e47…` | `uuid1 + "-h-" + Date.now() + "-" + uuid2` |
-| `w` | `null` → `` | 640-byte base64 blob | encrypted collected-data payload |
-| `tC` | `0` | `524` | `b["GatherCost"]` (truthy branch) |
+| `w` | `null` → `` | 640-byte base64 blob (§12 capture; live session: 656-byte ct — byte-count model in §15.2) | encrypted collected-data payload (140 `#`-fields) |
+| `tC` | `0` | `524` | `b["GatherCost"]` (truthy branch) — **per-SESSION constant** (4058 in both live tokens; 3496 §21.4; 524 here), NOT max(log costs) |
 | `p` | md5 | `d769460d…` | `MD5([tF,Q,w,tC,secret].join('#'))` — **verified** |
 
 Why they differ:
@@ -541,6 +574,12 @@ Why they differ:
 2. **`Q`** — the machine builds it as `[id1, "h", Date.now(), id2].join("-")` (`tv=Date[…]()`, `Q=tm`, array state `…,"h",tH,K`); the two 32-hex values are device/session identifiers (one persisted device id, one per-session id), timestamp = epoch millis.
 3. **`w`** — the machine's payload state is `w = rY(JSON.stringify(b))` where `b` is the collected device-data object; in the sandbox `b` was empty so `w` stayed `null`. In the browser `w` = the 640-byte encrypted blob — AES-128-CBC of the `#`-joined collected-data string (see §15, live-decrypted in §21).
 4. **`tC = 524`** — `b["GatherCost"]` is truthy in the browser (cost/counter of gathered data, here 524); the machine takes the `h truthy → tC = h` branch instead of the forced `h=0` path.
+
+**SESSION-2-VERIFIED refresh model (live_captures.md §4 + analysis_fields.md §4.2/§5):**
+
+- **`tC` is a per-SESSION constant, not max(log costs).** Both live tokens minted 26 s apart in the same session carry **tC = 4058** — T1 and T2 identical — while field-43 log entry `81-13514` and entry-93 `594050` are both much larger. Observed range across all known sessions: 524 (§12.1), 3496 (§21.4), 4058 (live ×2). It is an independent collector metric frozen at collection time; pick once per session (500–5000 ms envelope), never recompute per token.
+- **Payload fields 93/94 are EMPTY STRINGS** — the `93-594050`/`94-594065` values are log ENTRIES inside field 43 (`probeId-cost` pairs), not standalone payload fields (analysis_fields.md §3 rows 92–108; validator-confirmed, validation_report.md §1).
+- **Entry-93/94 update-in-place per re-mint.** The live T1→T2 payload diff is **exactly fields 43 and 74, nothing else**: field 43's tail moves `93-594050|94-594065` → `93-620724|94-620733` (13→13 entries, ids unchanged) and field 74 moves `1788008311383` → `1788008338057`. Arithmetic: **entry-93 cost == f74 − f72 exactly** (both tokens verify: `1788008311383 − 594050 = 1788007717333 = f72`), **entry-94 = entry-93 + 9..15 ms** (T1 +15, T2 +9) — live_captures.md §4, analysis_fields.md §4.2/§4.3.
 
 ---
 
@@ -606,6 +645,12 @@ In case of our test call it was like this:
 ]
 ```
 
+**Session-2 note — the generator is proven byte-exact and live-validated (device_token_gen.py / replay_template.py / live_validate.py self-tests + validation_report.md):**
+
+- `replay_template.py`/`device_token_gen.py` **reproduce both live tokens byte-exactly** (TOKEN1 and TOKEN2, live_captures.md §4): md5 verifies with `daye,raolewoba!`, `w` decrypts under `682efd18149e39a6` to the same 140 fields, re-encryption of the decrypted payload reproduces each token's `w` byte-for-byte, and the re-assembled 5-field tokens match the originals including the md5 (replay_template.py checks 1–3; validator-reproduced, validation_report.md §1/§4).
+- The synthetic same-session re-mint differs from TOKEN1 **only in fields 43 and 74** (entries 93/94 refreshed per the §11 refresh model) — exactly the live T1→T2 signature (device_token_gen.py self-test; validator 56-check adversarial harness, validation_report.md §5.5).
+- **Live server run (live_validate.py --live, Session-2 final validation):** InitCaptchaV3 returned **`Success: true`** with a fresh DeviceConfig + CertifyId; the synthetic token minted from that session was **processed end-to-end by the live server** — VerifyCaptchaV3 answered **F001 (risk-policy rejection)**, not a crypto/format error: F002 (empty CaptchaVerifyParam), F003 (illegal format) and F014 (no init record) were all **absent**, i.e. the token was parsed, decrypted and structure-validated successfully — only the risk layer said no (classification semantics: live_validate.py `_VERIFY_CODE_MEANINGS`; F001 = suspected-attack risk rejection, a flow/risk outcome that still proves the crypto layer was exercised and accepted).
+
 ---
 
 ## 13 THE VARS IN THE ARRAY:
@@ -656,6 +701,8 @@ tR = t8['sessionId']
 
 **Resolved by the live dump (§21):** the token's `Q` is byte-identical to the server-issued `deviceConfig.deviceConfig.sessionId` (`f[2]` of the RES-encrypted deviceConfig), whose format is `<appKey>-h-<server ts ms>-<per-session uuid>` — `uuid1` = **appKey**. `rm(ACCESS_SEC, t8.sessionId)` is the client-side decrypt of the same value; the `[id1,"h",tH,K].join("-")` states build the format, not a competing source.
 
+**Session-2 verified — Q/serverTs linkage (live_captures.md §3/§4, both live sessions + §21.4 reference):** `Q == DeviceConfig f[2]` exactly, and Q's embedded ts == **serverTs − 1** in both sessions (live: `1788007723938 = 1788007723939−1`; ref §21.4: `1787994141656 = 1787994141657−1`). Q and serverTs come from the same server response — always take them together from the one decrypted DeviceConfig, never generate them independently (hard constraint HC1, analysis_fields.md §5.0).
+
 ### 13.3 w = rg(T, N)
 
 ```js
@@ -694,7 +741,7 @@ e.call(4,91,20) = 'bind', e.apply(9, [2, 10]) = 'apply'
 - `rm('FqJB6iRNVYdEGpwb', 'NLAoqT6K03oLbQXW2VS3zA==')` → `daye,raolewoba!` (the SALT/md5 secret — §15.5)
 - `rm('FqJB6iRNVYdEGpwb', 'FNW8NwwxZBD3Dagg4V6FIu3Oc2SCmhWgMjILaT1lE9Y=')` → `e42318c6b13e57fc` (= T above)
 
-So `T` is a **decrypted 16-char AES key** (16 UTF-8 bytes → AES-128) and `w = rg(T, N)` is AES-128-CBC **encryption** of the payload `N` — rg is rm's encrypt counterpart, agreeing with the browser-verified blob cipher (§15.2: key = session key from deviceConfig.key). Open correlation: `t8.secretKey` (the `FNW8…` blob — per-session material; the sandbox-session value is shown above) vs `deviceConfig.key` (§15.6) — both deliver a 16-char lowercase-hex session key; same key under two wrappers or two distinct keys is not yet pinned down. The traced `e42318c6b13e57fc` does **not** decrypt the §12 captures (verified negative, §15.2) — those blobs belong to a browser session whose key material was not captured.
+So `T` is a **decrypted 16-char AES key** (16 UTF-8 bytes → AES-128) and `w = rg(T, N)` is AES-128-CBC **encryption** of the payload `N` — rg is rm's encrypt counterpart, agreeing with the browser-verified blob cipher (§15.2: key = session key from deviceConfig.key). ~~Open correlation: `t8.secretKey` (the `FNW8…` blob — per-session material; the sandbox-session value is shown above) vs `deviceConfig.key` (§15.6) — both deliver a 16-char lowercase-hex session key; same key under two wrappers or two distinct keys is not yet pinned down.~~ — **RESOLVED (Session 2, analysis_keys.md §3):** they are **the same key under two wrappers.** `t8.secretKey` is the client's ACCESS_SEC-encrypted local **cache** of the server-issued session key: the giant machine (feilin.pretty.js:51653/52708 region, string-table citations verified) computes `tF = { secretKey: rg(t1, tR), sessionId: rg(t8.ACCESS_SEC, k.sessionId) }` with `t1 = t8.ACCESS_SEC`, `tR = k.key = deviceConfig.deviceConfig.key`, and merges it into `t8`. The `FNW8Nwwx…` blob shown above was simply **the sandbox session's own `k.key` cache** — `rg(ACCESS_SEC, 'e42318c6b13e57fc')` reproduces it byte-exactly and `rm(ACCESS_SEC, blob)` returns the key (round-trip proven, analysis_keys.md §3, validator-re-verified). The traced `e42318c6b13e57fc` does **not** decrypt the §12 captures (verified negative, §15.2) — those blobs belong to a browser session whose key material was not captured.
 
 ### 13.4 tC = h
 
@@ -705,6 +752,10 @@ r = b
 
 h = b.GatherCost // 0 if b.gatherCost undefined
 ```
+
+**Session-2-verified model (live_captures.md §4, analysis_fields.md §4.2/§5.0 HC3):** `tC` is read once per session from the collector's `GatherCost` and then stays **constant across every re-mint within that session** — both live tokens minted 26 s apart carry `tC = 4058`. It is **NOT** max(field-43 log costs) (live entry `81-13514` and entry-93 `594050` are both larger) and not a function of token-mint time. Observed values: 524 (§12.1), 3496 (§21.4), 4058 (live ×2); synthetic range 500–5000. Choose it once per session; never recompute per token.
+
+Related correction: the `93-…`/`94-…` values seen in the token payload are **log ENTRIES inside field 43** (`probeId-cost` pairs) — payload fields at index 93/94 are empty strings. Entry-93 cost == field74 − field72 exactly; entry-94 = entry-93 + 9..15 ms; both update-in-place per re-mint (the live T1→T2 diff is exactly fields {43, 74} — analysis_fields.md §1/§4.2–§4.3).
 
 ### 13.5 p = nK(F)[(tn(), tn)(1, 33)]() p = constant for md5 gen
 
@@ -779,7 +830,7 @@ Notes: keys are call-site-specific (e.g. `nV(48,12)` → `e[3]` key 48, `nV(50,3
 
 ### 15.1 Structure
 
-- `base64 -d` → exactly **640 bytes**, 16-byte aligned (**40 AES-sized blocks**).
+- `base64 -d` → **640 bytes for the §12/§21.4 sessions**, 16-byte aligned (**40 AES-sized blocks**); the live session-A tokens are **656 B ct** (41 blocks; see the byte-count model in §15.2). `w` is always `16·k` bytes — PKCS7-padded, block-aligned ciphertext.
 - Statistical uniformity: 36.7% printable bytes ≈ expected for uniform random (95/256 ≈ 37%) — no text, no JSON (`{"`, `",`, `null`, `true` all absent).
 - First 8 bytes `5b 70 12 3e…` — not `Salted__` (so not standard CryptoJS/OpenSSL salted format).
 - No zlib/gzip/brotli magic; not plain base64-of-JSON.
@@ -791,6 +842,8 @@ Notes: keys are call-site-specific (e.g. `nV(48,12)` → `e[3]` key 48, `nV(50,3
 - **Key** = the session key from `AliyunCaptcha.prototype.deviceConfig.deviceConfig.key` — a base64 value whose decode is the 16-char ASCII session key (example `93e513a51c987af1`; 16 UTF-8 bytes → AES-128). Note the possible double encoding: `btoa('93e513a51c987af1') = 'OTNlNTEzYTUxYzk4N2FmMQ=='`, `btoa('5ea5a0dd4e774105') = 'NWVhNWEwZGQ0ZTc3NDEwNQ=='`.
 - **IV** = the fixed literal `0123456789ABCDEF` — its 16 **UTF-8 bytes** (`30 31 32 … 46`), **not** hex-decoded. Same IV as every other AES use in the bundle (§15.5, §15.6, §13.3).
 - Verified live (§21): decrypting the token's `w` field with that session's key yields the collected-data payload — a **`#`-joined field string (140 fields in the live capture), NOT JSON** (see §21.2 for the decrypted field map).
+- **Session-2-verified field 21 (analysis_fields.md §4.1):** for session B the 16-byte value is **byte-verified** as `AES-128-CBC(sessionKey, IV, PKCS7(uuid2[-8:]))` — decrypting §21.4's field 21 with skB yields `80ca9125` (= exactly the last 8 hex chars of B's uuid2) and re-encryption reproduces the observed blob byte-for-byte. Session A's 8-byte value is **opaque** — the full negative-result ledger is in analysis_fields.md Appendix B; replay the template bytes for same-session replay, or regenerate via the B-rule on a fresh session.
+- **Session-2-verified byte-count model (analysis_fields.md §5.0 HC4, live_captures.md §4):** payload **648 B plaintext + 8 B PKCS7 → 656 B ciphertext** (live session A; `w` = 876 b64 chars; 139 `#` separators → 140 fields); §21.4's B session: 625 + 15 → 640 B ct. If a regenerated payload changes length, re-check the template's field lengths.
 
 Why the report's own captures still resist: the key is **per-session**, and the §12 captures' session key was not captured. Verified negative in Node: both captured blobs (§12.2's and §12.6's) fail AES-128-CBC/PKCS7 under `93e513a51c987af1`, `5ea5a0dd4e774105`, `e42318c6b13e57fc`, `87f879f135f27da7`, `FqJB6iRNVYdEGpwb`, `daye,raolewoba!` (each as UTF-8 key; the 16-char examples also as hex) — all `bad decrypt`.
 
@@ -805,7 +858,7 @@ The §12.2 blob and the §12.6-array blob are both 640 bytes and share their **f
 - `rm('FqJB6iRNVYdEGpwb', 'NLAoqT6K03oLbQXW2VS3zA==')` → `daye,raolewoba!` (the md5 secret — §15.5)
 - `rm('FqJB6iRNVYdEGpwb', 'FNW8NwwxZBD3Dagg4V6FIu3Oc2SCmhWgMjILaT1lE9Y=')` → `e42318c6b13e57fc` (= T, §13.3)
 
-(both with IV `0123456789ABCDEF` UTF-8, PKCS7) — therefore **`rg` = the AES-128-CBC encrypt counterpart**, and `w = AES-128-CBC(key T, fixed IV, PKCS7(N))`, agreeing with §15.2 (browser-verified key = the session key from deviceConfig). Open correlation: `t8.secretKey` (the `FNW8…` blob — per-session material; the traced sandbox session's value is shown in §13.3) vs `deviceConfig.key` (§15.6) — both deliver a 16-char lowercase-hex session key; whether they are the same key under two wrappers (ACCESS_SEC- vs RES-encrypted) or two distinct keys is not yet pinned down. The traced value `e42318c6b13e57fc` does **not** decrypt the §12 captures (verified negative, §15.2) — those blobs belong to a browser session whose key material was not captured.
+(both with IV `0123456789ABCDEF` UTF-8, PKCS7) — therefore **`rg` = the AES-128-CBC encrypt counterpart**, and `w = AES-128-CBC(key T, fixed IV, PKCS7(N))`, agreeing with §15.2 (browser-verified key = the session key from deviceConfig). ~~Open correlation: `t8.secretKey` (the `FNW8…` blob — per-session material; the traced sandbox session's value is shown in §13.3) vs `deviceConfig.key` (§15.6) — both deliver a 16-char lowercase-hex session key; whether they are the same key under two wrappers (ACCESS_SEC- vs RES-encrypted) or two distinct keys is not yet pinned down.~~ — **RESOLVED (Session 2, analysis_keys.md §3):** same key, two wrappers. `t8.secretKey = rg(ACCESS_SEC, deviceConfig.deviceConfig.key)` — the client's local cache of the server-issued session key (built in the giant machine and merged into `t8`); the token machine later reads it back via `T = rm(ACCESS_SEC, t8.secretKey)`, which is the same 16-char key the `n5(...)` entry path receives directly as `k.key`. §13.3's `FNW8…` blob was the sandbox session's own `k.key` cache. The traced value `e42318c6b13e57fc` does **not** decrypt the §12 captures (verified negative, §15.2) — those blobs belong to a browser session whose key material was not captured.
 
 ### 15.5 SALT origin — the md5 secret is itself encrypted in the bundle
 
@@ -849,6 +902,11 @@ function decryptDeviceConfig(blobB64) {
 
 (Snippet roundtrip-verified mechanically in Node; field semantics browser-verified.) `AliyunCaptcha.prototype.deviceConfig.deviceConfig.key` is the runtime property carrying the session key (§15.2). Key-hierarchy separation verified: the RES key does **not** decrypt the SALT or `t8.secretKey` blobs (both `bad decrypt`), and `ACCESS_SEC` does not decrypt deviceConfig's blob — each layer has its own key.
 
+**Session-2 additions (analysis_keys.md §1/§2, live_captures.md §2/§3):**
+
+- **ONE-IV proof:** the `generate_device_data.py` "word-array IV" and this report's `'0123456789ABCDEF'` IV are **the same 16 bytes** — the words `[808530483, 875902519, 943276354, 1128547654]` pack to `30313233343536373839414243444546` = ASCII `0123456789ABCDEF` (analysis_keys.md §1). The bundle builds it via a double-encoding chain (feilin.pretty.js:14462–14469): `t8.AES_IV` = hex `d35db7e39ebbf3d001083105` → `Hex.parse` → `Base64.stringify` → the 16-char string → `Utf8.parse` → the IV bytes. Exactly **one IV everywhere**: DeviceData, DeviceConfig, `w`, and every `rm()`/`rg()` call. Any reimplementation that hex-decodes the `d35d…` constant directly, or treats `0123456789ABCDEF` as hex, gets the wrong IV.
+- **Live DeviceConfig decrypt (live_captures.md §2/§3):** the live fetch-example response blob decrypts under the RES key to the same 10-field structure — f[0] = `NjgyZWZkMTgxNDllMzlhNg==` → sessionKey `682efd18149e39a6`, f[2] = sessionId, f[7] = serverTs `1788007723939`, f[8] = ip `106.219.217.208` — re-verified independently on the §21.4 blob as well (validator, 21/21 checks — validation_report.md §3).
+
 ### 15.7 Key/IV map
 
 | material | value (example) | role |
@@ -857,9 +915,11 @@ function decryptDeviceConfig(blobB64) {
 | `ACCESS_SEC` | `FqJB6iRNVYdEGpwb` (16B) | decrypts SALT blob → md5 secret; decrypts `t8.secretKey` → session key T |
 | RES key | `87f879f135f27da7` (16B) | decrypts deviceConfig (InitCaptchaV3 response) → session key + device fields |
 | SALT blob | `NLAoqT6K03oLbQXW2VS3zA==` | AES blob → `daye,raolewoba!` |
-| `t8.secretKey` | `FNW8NwwxZBD3Dagg4V6FIu3Oc2SCmhWgMjILaT1lE9Y=` | AES blob → 16-char key T (`e42318c6b13e57fc`, sandbox-session example) |
-| session key (deviceConfig.key / f[0]) | `93e513a51c987af1` / `5ea5a0dd4e774105` (examples) | encrypts the 640-byte blob `w` |
-| md5 secret | `daye,raolewoba!` | `p = MD5([tF,Q,w,tC,secret].join('#'))` |
+| `t8.secretKey` | `FNW8NwwxZBD3Dagg4V6FIu3Oc2SCmhWgMjILaT1lE9Y=` | AES blob → 16-char key T (`e42318c6b13e57fc`, sandbox-session example) — **RESOLVED (Session 2, analysis_keys.md §3/§6 #11): this is `rg(ACCESS_SEC, sessionKey)`, the client's local cache of the session key — same key as the row below, two wrappers** |
+| session key (deviceConfig.key / f[0]) | `93e513a51c987af1` / `5ea5a0dd4e774105` / `682efd18149e39a6` (live) / `57ad9f73260d1d46` (§21.4) (examples) | encrypts the 640-byte blob `w` |
+| md5 secret | `daye,raolewoba!` | `p = MD5([tF,Q,w,tC,secret].join('#'))` — session-independent (verified across all 4 known tokens: sandbox + §12 SG + §21.4 + both live, analysis_keys.md §6 #6) |
+
+*(Session-2 note: the full 12-constant key/IV table — including the DeviceData-layer KEY_O `c175a358550d02e2` / KEY_HE `45f8ac1e1de14397` pair and the t8 member map — lives in analysis_keys.md §6; the residual material there is delivery-layer context for token generation, which needs only the sessionKey above.)*
 
 ### 15.8 Decrypt recipe (pure Node)
 
@@ -950,39 +1010,55 @@ Two routes, in order of preference:
 
 ```js
 const crypto = require('crypto');
-const IV = Buffer.from('0123456789ABCDEF', 'utf8');        // fixed IV — UTF-8 bytes, not hex
+const IV = Buffer.from('0123456789ABCDEF', 'utf8');        // fixed IV — UTF-8 bytes, not hex; the ONE IV (§15.6)
 const secret = 'daye,raolewoba!';                          // rm(ACCESS_SEC, SALT blob) — §15.5
 const WEB_REGION = { CN: 'WEB', SG: 'SG_WEB' };            // extend with other regions if seen
 
-function encryptBlob(payloadStr, sessionKey) {              // rg() — §15.4; payloadStr = "#"-joined fields
+function encryptBlob(payloadStr, sessionKey) {              // rg() — §15.4; payloadStr = "#"-joined 140 fields
   const c = crypto.createCipheriv('aes-128-cbc', Buffer.from(sessionKey, 'utf8'), IV);
   return Buffer.concat([c.update(Buffer.from(payloadStr, 'utf8')), c.final()]).toString('base64');
 }
 
-function makeToken({ region = 'CN', uuid1, uuid2, tC, w }) {
+function makeToken({ region = 'SG', sessionId, tC, w }) {   // sessionId = DeviceConfig f[2] (HC1 — never fabricate)
   const tF = WEB_REGION[region];
-  const Q = [uuid1, 'h', Date.now(), uuid2].join('-');
-  const p = crypto.createHash('md5').update([tF, Q, w, tC, secret].join('#')).digest('hex');
-  return [tF, Q, w, tC, p].join('#');
+  const p = crypto.createHash('md5').update([tF, sessionId, w, tC, secret].join('#')).digest('hex');
+  return [tF, sessionId, w, tC, p].join('#');
 }
 
-// full synthetic flow:
+// full synthetic flow (per the FINAL VERIFIED REFRESH CONTRACT below; working reference: device_token_gen.py):
 // 1. InitCaptchaV3 → response deviceConfig blob
-// 2. sessionKey = base64-decode(decryptDeviceConfig(blob)[0])   (§15.6; or use t8.secretKey → rm(ACCESS_SEC, ·))
-// 3. payload = your collected-data string (140 `#`-fields per §21.2 — replay a captured decrypt or synthesize; keep GatherCost consistent)
-// 4. w = encryptBlob(b, sessionKey); tC = b["GatherCost"]       (§15.4)
-// 5. token = Buffer.from(makeToken({ region, uuid1, uuid2, tC, w })).toString('base64')
+// 2. fields = decryptDeviceConfig(blob) → sessionKey = b64-decode(f[0]); Q = f[2]; serverTs = f[7]; ip = f[8]  (§15.6, HC1)
+// 3. payload = 140 `#`-fields from a replay template, refreshed per-session (21/42/72/87/43) and per-token (74 + 93/94)
+// 4. w = encryptBlob(payload.join('#'), sessionKey); tC = per-session GatherCost, 500–5000 (HC3)
+// 5. token = Buffer.from(makeToken({ region, sessionId: Q, tC, w })).toString('base64')
 ```
 
-Requirements, in order of dependency:
+FINAL VERIFIED REFRESH CONTRACT (Session-2, analysis_fields.md §5 — verified end-to-end in the executed refresh simulation, analysis_fields.md §5.4, and independently re-run by the validator, validation_report.md §2):
 
-1. **`w` (the payload field)** — now fully fabricable: `w = AES-128-CBC-encrypt(sessionKey, fixed IV, PKCS7, payload)` where the payload is the `#`-joined collected-data string (140-field schema in §21.2 — not JSON, see §21.6). For a **server-accepted** token the sessionKey must be the one the server issued for that session (InitCaptchaV3 → deviceConfig `f[0]`); any other 16-char key still yields a structurally valid token (md5 verifies) whose blob the server cannot decrypt.
-2. **`b` (the input data)** — the plaintext JSON the real collector builds from browser probes (replay captured `b` values or synthesize; the token is structurally valid either way).
-3. **`tC`** — `b["GatherCost"]`; keep consistent with the payload (524 in the capture, `0` when `b` is empty).
-4. **`uuid1`/`uuid2`** — your own ids; format 8-4-4-4-12 hex without dashes; `Date.now()` is automatic.
-5. **`tF`/region** — match the endpoint region (`ap-southeast` → `SG`).
+**Per-session refresh** (a new DeviceConfig from a fresh InitCaptchaV3):
 
-Completeness checklist: identical `w` transform (AES-128-CBC + session key + fixed IV + PKCS7), identical `b` field schema, `GatherCost` consistency, md5 with the secret — the token is then indistinguishable from a real one.
+| point | rule |
+|---|---|
+| field 21 | B-rule (byte-verified): `AES-128-CBC(sessionKey, IV, PKCS7(uuid2[-8:]))` — or replay the template's bytes verbatim for same-session replay |
+| field 42 | `= DeviceConfig f[8]` (ip) — hard invariant, verified both sessions |
+| field 72 | `= now_ms − ~5.5 s` (client initTime; must keep `72 < 87` with a 4–7 s gap — HC2; live 6606 ms, ref 4126 ms) |
+| field 87 | `= DeviceConfig f[7]` (serverTs) — hard invariant, verified both sessions |
+| field 43 | rebase all fixed-entry costs: `cost_i' = cost_i + (f72_old − f72_new)` (preserves spacing; sound only for small ΔinitTime — for a fresh session hours later, synthesize a live-A-shaped schedule instead, per the validator's BUG-2 analysis, validation_report.md §5.2/§5.3) |
+| Q (outer) | `= DeviceConfig f[2]`; embedded ts == f[7] − 1 — take from the same response, never independent |
+| tC (outer) | pick 500–5000 ms once per session (HC3; observed 524/3496/4058) — never recompute per token |
+
+**Per-token refresh** (each getToken within one session — the live T1→T2 signature):
+
+| point | rule |
+|---|---|
+| field 74 | `= now_ms` (snapshot/generation time) |
+| field 43, log entry 93 | `cost = f74 − f72` **exactly** (verified both live tokens) |
+| field 43, log entry 94 | `cost = entry-93 + 9..15` ms jitter (live: T1 +15, T2 +9) |
+| token string | **unique per VerifyCaptchaV3 request** — mint a fresh token per verify (per-token refresh guarantees this) |
+
+**Global invariants:** log costs **monotonic non-decreasing** within a session, and **entry-93 ≥ max fixed log cost** (a fast mint after init emits non-monotonic logs — mint ≥ max fixed cost after initTime, or use a B-style snapshot without 93/94); **ONE-IV everywhere** (utf8 `0123456789ABCDEF`, analysis_keys.md §1); DeviceData params for the live site: **region `sgp`, prefix `no8xfe`, appKey `3795d28242a11619bc25f786f84e53d4`** — NOT the module defaults (the `ab034e…` static appKey is the bundle's fallback seed, analysis_keys.md §5.4; byte-exact reproduction verified against the live capture, analysis_keys.md §2a).
+
+Completeness checklist: identical `w` transform (AES-128-CBC + session key + fixed IV + PKCS7), identical `b` field schema (140 `#`-fields per §21.2), `GatherCost` consistency (per-session constant, HC3), md5 with the secret — the token is then indistinguishable from a real one. *(Working reference implementations of this contract: `device_token_gen.py` (build_payload/build_payload_live enforcing HC1–HC4) and `live_validate.py` — see §12.6.)*
 
 ---
 
@@ -1016,13 +1092,13 @@ Harness gotchas (reproduced intentionally for future runs):
 
 | constant | value | role |
 |---|---|---|
-| IV (all AES ops) | `0123456789ABCDEF` (16 UTF-8 bytes, **not** hex-decoded) | fixed IV for every AES use in the bundle |
+| IV (all AES ops) | `0123456789ABCDEF` (16 UTF-8 bytes, **not** hex-decoded) | fixed IV for every AES use in the bundle — **ONE-IV proven (Session 2, analysis_keys.md §1)**: also the DeviceData layer's word-array IV; double-encoded in-bundle as hex `d35db7e39ebbf3d001083105` → b64 → utf8 |
 | `ACCESS_SEC` | `FqJB6iRNVYdEGpwb` (16B) | AES key: decrypts SALT blob → md5 secret; decrypts `t8.secretKey` → session key T (§15) |
 | RES key | `87f879f135f27da7` (16B) | AES key: decrypts deviceConfig blob (InitCaptchaV3) → session key + device fields (§15.6) |
 | `SALT` | `NLAoqT6K03oLbQXW2VS3zA==` (16B decoded) | AES blob → decrypts to `daye,raolewoba!` (§15.5) |
-| `t8.secretKey` | `FNW8NwwxZBD3Dagg4V6FIu3Oc2SCmhWgMjILaT1lE9Y=` (32B) | AES blob → decrypts (ACCESS_SEC) to 16-char key T, e.g. `e42318c6b13e57fc` (§13.3) |
-| session key | 16-char lowercase-hex, e.g. `93e513a51c987af1` / `5ea5a0dd4e774105` | encrypts the 640-byte blob `w`; arrives via deviceConfig.key (and/or t8.secretKey) |
-| secret | `daye,raolewoba!` | md5 mixing constant (hidden in `F`); = decrypted SALT blob |
+| `t8.secretKey` | `FNW8NwwxZBD3Dagg4V6FIu3Oc2SCmhWgMjILaT1lE9Y=` (32B) | AES blob → decrypts (ACCESS_SEC) to 16-char key T, e.g. `e42318c6b13e57fc` (§13.3) — **resolved (analysis_keys.md §3): same session key as the row below, cached as `rg(ACCESS_SEC, sessionKey)`** |
+| session key | 16-char lowercase-hex, e.g. `682efd18149e39a6` (live) / `57ad9f73260d1d46` (§21.4) | encrypts the 640-byte blob `w`; arrives via deviceConfig.key — the SAME key as `t8.secretKey` under two wrappers |
+| secret | `daye,raolewoba!` | md5 mixing constant (hidden in `F`); = decrypted SALT blob — session-independent (verified across all 4 known tokens: sandbox + §12 SG + §21.4 + both live, analysis_keys.md §6 #6) |
 | `WEB_REGION[CN]` | `WEB` | token prefix |
 | `WEB_REGION[SG]` | `SG_WEB` | token prefix (via `rR()` endpoints) |
 
@@ -1067,6 +1143,8 @@ For the full generator (encrypt-capable `w`), see §17; for the decryptors, §15
 
 A live `AliyunCaptcha.prototype` dump (region sgp / `TRACELESS` / SceneId `didk33e0`, feilin build `1.5.1/feilin000.d030213aa…`). **Every crypto claim of this report has been re-verified against this dump in pure Node** — it doubles as a reverse-engineering reference: the field you need for each step of §16/§17 is pointed out inline. Full JSON at the end of this section.
 
+**Session-2 additions anchored on this dump:** a second live session (feilin build `1.5.1/feilin001.874f974c…`, live_captures.md §2/§3 — session key `682efd18149e39a6`, ip `106.219.217.208`, sessionId `…-h-1788007723938-9472a56a…`) extends this dump to a third verified data point: both live tokens decrypt with their session key to the same 140-field schema, the cross-session payload diff is exactly **fields {21, 42, 43, 72, 74, 87}** (analysis_fields.md §1), and the working generator (device_token_gen.py + live_validate.py) reproduces both live tokens byte-exactly and processed a synthetic token end-to-end on the live server (§12.6).
+
 ### 21.1 What this dump proves (all verified)
 
 | # | claim | verification |
@@ -1080,8 +1158,10 @@ A live `AliyunCaptcha.prototype` dump (region sgp / `TRACELESS` / SceneId `didk3
 | 7 | `f[3]` = bundle version | `1.5.1/feilin000.d030213aa…` — matches `deviceConfig.deviceConfig.version` |
 | 8 | Q's first uuid = **appKey** | `Q.split('-h-')[0] === deviceConfig.appKey` (`3795d28242a11619bc25f786f84e53d4`) |
 | 9 | region → `tF` | `ENDPOINTS[0]` contains `ap-southeast` → `tF = SG_WEB` (rR logic, §11.1) |
-| 10 | `tC` = GatherCost | `3496` (ms of collection cost; §12 captures: 524 / sandbox: 0) |
+| 10 | `tC` = GatherCost | `3496` (ms of collection cost; §12 captures: 524 / sandbox: 0; live session-A: **4058 in both tokens** — per-SESSION constant, §11) |
 | 11 | payload cross-links | contains `saf-captcha` (appName), `768*1366` (screen), `desktop`, `223.188.28.68` (IP), `1787994137531` (initTime), `1787994141657` (dc timestamp), the `logs` array `#`-joined with `\|` separators |
+| 12 | field 21 B-rule (Session-2, analysis_fields.md §4.1) | decrypt of this session's field 21 under skB = `80ca9125` + 8×`\x08` = **PKCS7(uuid2[-8:])** — `80ca9125` is exactly the last 8 hex chars of this session's uuid2; re-encrypt reproduces the blob **byte-exactly** |
+| 13 | field 43 snapshot semantics (Session-2, analysis_fields.md §4.2) | this payload's 10 log entries == the dump's `deviceConfig.logs` array minus its later-appended 11th entry (`81-7061`) — field 43 is a **live-growing snapshot**; entries 93/94 (token-mint probes) are log ENTRIES inside field 43, and payload fields 93/94 are empty strings |
 
 ### 21.2 Decrypted payload field map (`w` plaintext, 140 `#`-fields)
 
@@ -1287,7 +1367,7 @@ W.10054#####Linux armv81#Chrome#149.0.0.0#############8#OctQh1Jw4wxqnL2N0DHmXA==
 | session key (decrypt/encrypt `w`) | `deviceConfig.deviceConfig.key` (or `DeviceConfig` blob `f[0]` → b64-decode) | AES-128-CBC, IV `0123456789ABCDEF`, PKCS7 (§15.8) |
 | Q | `deviceConfig.deviceConfig.sessionId` | use as-is (server-issued; `uuid1` = appKey) |
 | tF | `deviceConfig.ENDPOINTS[0]` | `includes('ap-southeast') → 'SG_WEB'` else `'WEB'` (rR, §11.1) |
-| tC | measured GatherCost | ms of collection (3496 here) |
+| tC | measured GatherCost | ms of collection (3496 here; **per-SESSION constant** — 4058 in both live tokens; §11/§13.4) |
 | SALT | bundle `t8.SALT` blob | `rm(ACCESS_SEC, SALT)` → `daye,raolewoba!` (§15.5) |
 | p | compute | `md5([tF,Q,w,tC,SALT].join('#'))` |
 
@@ -1423,4 +1503,368 @@ W.10054#####Linux armv81#Chrome#149.0.0.0#############8#OctQh1Jw4wxqnL2N0DHmXA==
 2. **§13.2 — resolved.** `Q = tm` where `tm = rm(tN, tR)` = `rm(ACCESS_SEC, t8.sessionId)` is the *client-side decrypt path*; the live dump shows the server ALSO returns the same sessionId plaintext in `deviceConfig.deviceConfig.sessionId`, and the token's Q equals it byte-for-byte. The `[id1,"h",ts,K].join('-')` machine states are the *format* (appKey + `-h-` + ts + per-session uuid), not a competing source: `Q`'s `uuid1` = **appKey** (3795d2…), `uuid2` = per-session id (52b528da…).
 3. **§15.2 example keys** — `93e513a51c987af1` / `5ea5a0dd4e774105` were other sessions' keys; this dump's live key is `57ad9f73260d1d46` (delivered as `f[0] = NTdhZDlmNzMyNjBkMWQ0Ng==`, base64 of the key — confirming the "double encoding" note).
 4. **Salt is session-independent** — the same `daye,raolewoba!` verifies this 2026-06 live capture exactly as it did the §12 captures and the sandbox token.
+5. **(Session 2, live_captures.md §3) — DeviceConfig f[3] version note.** The live session-A blob carries version `1.5.1/feilin001.874f974c…` while this dump's is `feilin000.d030213aa…` — the field maps the collector build; the 140-field schema and all crypto invariants are identical across both builds.
+6. **(Session 2, analysis_fields.md §4.1/§5) — field 21 is 8 or 16 raw bytes across sessions, and only the B-rule is cryptographically confirmed.** This dump's 16-byte value follows the B-rule exactly (§21.1 #12); the live session-A's 8-byte value matches no tested hypothesis (Appendix-B ledger, analysis_fields.md) — replay it verbatim for same-session replay or regenerate via the B-rule on a fresh session.
+7. **(Session 2, validation_report.md §5) — the earlier "tC = b['GatherCost'] max log cost" intuition is superseded:** tC is a per-SESSION constant (4058 in both live tokens, 26 s apart), independent of the log costs (live entry `81-13514` > tC 4058) and of token-mint time. The refresh contract in §17 reflects this.
+
+---
+---
+
+# Part II — Session-1 findings (§22–§27)
+
+**Team devicetoken-reverse (Session 1) consolidated this Part from its own verified deliverables: `analysis_fields.md` (t1, payload), `analysis_keys.md` (t2, crypto), `replay_template.py` + `device_token_gen.py` (t3, generator), `live_validate.py` (t4, live validation), `validation_report.md` (t5, adversarial audit). Every claim below was executed against real captured material — never assumed; each subsection cites its source. Part I (§1–§21) carries the section-level corrections; Part II is the consolidated Session-1 reference Session 3 should build on.**
+
+## 22 Session-1 summary — the fully verified pipeline
+
+### 22.1 Pipeline (end-to-end, every step executed and verified)
+
+```
+generate_device_data.generate_device_data(sceneId='didk33e0', prefix='no8xfe',
+                                          region='sgp', app_key='3795d2…')   ── DeviceData request param
+        │  two AES-128-CBC layers: inner KEY_O ('c175a358550d02e2') over
+        │  'W.10001.c#saf-captcha#didk33e0#captcha-normal#no8xfe#sgp',
+        │  outer KEY_HE ('45f8ac1e1de14397') over the 6-part '#'-array
+        ▼
+InitCaptchaV3 (HMAC-SHA1 POP-signed POST)  ──► response: Success, CertifyId, DeviceConfig blob
+        │
+        ▼  AES-128-CBC decrypt: RES key '87f879f135f27da7', IV utf8('0123456789ABCDEF'), PKCS7
+DeviceConfig → 10 '#'-fields:
+   f[0] = b64(sessionKey) ──b64-decode──► sessionKey (16-char, e.g. '682efd18149e39a6')
+   f[2] = sessionId  (= token Q)   f[7] = serverTs   f[8] = session ip
+        │
+        ▼  build_payload: 140-field '#'-joined payload (replay template refreshed per §23)
+        │
+        ▼  w = AES-128-CBC-encrypt(sessionKey, IV, PKCS7(payload))  → base64
+        │
+        ▼  p = MD5([tF, Q, w, tC, 'daye,raolewoba!'].join('#'))      tF = SG_WEB (ap-southeast)
+token = btoa([tF, Q, w, tC, p].join('#'))
+        │
+        ▼  VerifyCaptchaV3: CaptchaVerifyParam JSON {certifyId, data, deviceToken, sceneId}
+           (data = RC4-like generate_arg(certifyId) + ali_hash track JSON + zlib + b64 + encrypt)
+```
+
+The pipeline is a single IV everywhere and a strict key hierarchy (§24); the session fields are never fabricated independently (HC1).
+
+### 22.2 What was proven (byte-exact, executed — not assumed)
+
+| proof | evidence |
+|---|---|
+| **TOKEN1 and TOKEN2 reproduce byte-exactly** at the full-string level | md5 verifies; `w` decrypts to 648 B / 140 fields; **re-encrypting the decrypted payload reproduces each token's `w` byte-for-byte; the re-assembled 5-field token (md5 included) equals the original string exactly** (replay_template.py checks 1–3, validator-reproduced — validation_report.md §1/§4) |
+| **The T1→T2 refresh signature is the natural per-token delta** | same-session payload diff is **exactly fields {43, 74}**; only the 93/94 log entries inside 43 and the f74 timestamp move; everything else byte-identical (live_captures.md §4, analysis_fields.md §1) |
+| **The refresh model is executable** | §5.4 executed simulation in analysis_fields.md: rebased initTime −6000 ms, f74 = init+700000 ms, entry-93 = 74−72, entry-94 = 93+12 → rebuilt token md5 self-verifies, AES decrypt byte-exact, diff vs TOKEN1 = exactly {43, 72, 74}, token length 1340 chars |
+| **The generator reproduces the live DeviceData param byte-exactly** | `generate_device_data.generate_device_data('didk33e0','no8xfe','sgp', app_key='3795d2…')` === the live fetch-example DeviceData (analysis_keys.md §2a; validator: own two-layer re-encrypt reproduces it byte-exactly) |
+| **Same-session re-mint and per-mint uniqueness hold** | 5 consecutive mints → 5 distinct tokens; consecutive mints differ only in {43,74} with Q/session key constant — exactly the live FACT 1/FACT 2 signatures (validation_report.md §5.5) |
+| **F001 rejection is not a crypto failure** | live VerifyCaptchaV3 answered F001 with **zero** format/crypto complaint codes (F002/F003/F014 absent) — §22.3 |
+
+### 22.3 Live-run outcome — the crypto layer is server-validated
+
+The Session-1 `live_validate.py --live` run (one InitCaptchaV3 → one fresh mint → one VerifyCaptchaV3):
+
+- **InitCaptchaV3 returned `Success: true`** with a fresh DeviceConfig + CertifyId — the DeviceData param, POP signing, and request format are all server-accepted as-is.
+- The synthetic token minted from that fresh session **was processed end-to-end**: the server answered **VerifyCode F001** — *suspected attack (risk-policy rejection)* — with **F002 (CaptchaVerifyParam empty), F003 (illegal format) and F014 (no init record) all absent**. Per the official VerifyCode semantics (client V3 architecture docs), F002/F003 would indicate an our-side assembly bug and F014 an expired/missing init — none were returned.
+- **Conclusion:** the token was parsed, decrypted under the server's own session key, and structure-validated successfully — **the reverse-engineered crypto layer is live-server-validated.** The remaining F001 is the **risk/flow layer**, not crypto: a verdict on behavioral heuristics.
+- **F001 → T001 therefore requires beating the risk heuristics, not fixing crypto** (open items in §27.1). `classify_verify_response` in live_validate.py encodes this tiering: F002/F003 → exit 4 (crypto-shaped, iterate t3); F001/F008–F015/T-codes → exit 3 (flow/risk outcome, crypto layer exercised and accepted); VerifyResult true → exit 0 (ACCEPTED).
+
+## 23 The 140-field payload map (condensed from analysis_fields.md)
+
+Full table with per-field values for both sessions: analysis_fields.md §3 (deleted post-consolidation — this section preserves the operative content; §21.2 keeps the B-session field dump).
+
+### 23.1 Classification legend
+
+- **C** — constant-across-sessions (bundle/device-class constant; replay verbatim)
+- **D** — device-probe-replayable (same physical device ⇒ same value; replay from template)
+- **S** — per-session-dynamic (refresh from the new DeviceConfig / session context)
+- **T** — per-token-dynamic (changes on every getToken call within one session)
+- **E** — empty (reserved probe slot; always `''`)
+
+### 23.2 The 31 non-empty fields
+
+Non-empty indices (of 140): `0, 5, 6, 7, 20, 21, 22, 32, 34, 36, 37, 42, 43, 44, 47, 49, 67, 68, 71, 72, 73, 74, 75, 76, 78, 87, 88, 89, 90, 91, 109`.
+
+| idx | class | meaning |
+|---|---|---|
+| 0 | C | `W.10054` collector format tag |
+| 5/6/7 | D | platform / browser / version (`Linux armv81` / `Chrome` / `149.0.0.0`) |
+| 20 | D | fontsNum (`8`, == `preCollectData.fontsNum`) |
+| 21 | **S** | opaque probe value — B-rule or replay (§23.5) |
+| 22 | C | probe class flag (`4`) |
+| 32 | D | 32-hex device fingerprint digest #1 (canvas/webgl-class) |
+| 34 | C | second count (`8`) |
+| 36/37 | D | os / cpu arch |
+| 42 | **S** | session ip == DeviceConfig f[8] |
+| 43 | **S+T** | probe-timing log — §23.4 |
+| 44 | C | bool probe (`true`) |
+| 47 | D | screen (`768*1366`) |
+| 49 | D | timezone offset hours (`5`) |
+| 67 | C | appName (`saf-captcha`) |
+| 68 | C | flag (`0`) |
+| 71 | C/D | collector id #1 (40-char) |
+| 72 | **S** | initTime (client collector-load ts) |
+| 73 | C/D | collector id #2 (42-char) |
+| 74 | **T** | payload snapshot/generation ts — §23.4 |
+| 75 | D | device type (`desktop`) |
+| 76 | C | bool probe (`false`) |
+| 78 | D | 32-hex device fingerprint digest #2 |
+| 87 | **S** | serverTs == DeviceConfig f[7] |
+| 88 | C | feature bitmask (§23.5) |
+| 89/90/91/109 | C | flags/bool probes (`1`/`1`/`true`/`0`) |
+| 93–139 (except the above) | E | reserved — **payload indices 93/94 are EMPTY STRINGS** (the `93-…`/`94-…` values live inside field 43) |
+
+### 23.3 Refresh sets
+
+- **Per-session refresh set: {21, 42, 43, 72, 87}** (+ outer-token Q and tC; live cross-session diff A↔B = exactly {21, 42, 43, 72, 74, 87} — 74 differs because the sessions snapshotted at different times).
+- **Per-token refresh set: {74, field-43 entry-93, field-43 entry-94} + unique token string per verify** (live T1↔T2 diff = exactly {43, 74}).
+- Everything else is session-static or device-static: replay verbatim (25 non-empty constants on the same device).
+
+### 23.4 Field 43 (probe-timing log) + field 74 — semantics
+
+- Format: `<probeId>-<costMs>` pairs joined by `|`; cost = elapsed ms **from field 72 (initTime)**. Observed probe ids: 10, 20, 11, 23, 30, 40, 41, 70, 71, 80, 81 (fixed) + 93, 94 (per-token).
+- **Field 43 is a snapshot of a live-growing array** (`deviceConfig.logs` uses the identical `id-cost` string format): the §21.4 payload holds the first 10 entries of that session's dump `logs`, whose 11th entry (`81-7061`) was appended after the snapshot (analysis_fields.md §4.2).
+- **Update-in-place per re-mint:** the 93/94 entries are recomputed each mint (13→13 entries, ids unchanged) — never appended as new pairs, never touching the fixed entries.
+- **Costs are monotonic non-decreasing** within a session (both live sessions verified).
+- **Entry-93 is the token-generation probe: cost == field74 − field72 exactly** (verified on both live tokens: `1788008311383 − 594050 = 1788007717333 = f72`; `1788008338057 − 620724 = 1788007717333`). **Entry-94 = entry-93 + 9..15 ms** (T1 +15, T2 +9).
+- **Field 74 = wall-clock at the payload snapshot:** when getToken runs it equals entry-93 completion (A tokens, minted ~9.8 min after load); when the payload is snapshotted at load time it equals the last completed probe (§21.4 B: f74−f72 = 5824 == entry-70 cost exactly; js-load + 80 ms). f74−f87 is unbounded in real usage (live: 587,444 ms).
+
+### 23.5 Field 21, field 88, and the HC invariants
+
+**Field 21** — the only opaque payload field:
+
+- **Session-B rule (CONFIRMED cryptographically, 16/16-byte ct match):** `field21 = AES-128-CBC(key = sessionKey, IV = utf8('0123456789ABCDEF'), pt = PKCS7(uuid2[-8:]))`. Decrypting §21.4's value yields `80ca9125` = exactly the last 8 hex chars of that session's uuid2; re-encryption reproduces the blob byte-for-byte (analysis_fields.md §4.1).
+- **Session-A opacity (8-byte value `1361451d35306367`):** matches NO structured hypothesis — full negative ledger (AES-CBC/ECB over all 8-char uuid2 substrings × 4 keys × 3 IVs, md5/sha1/sha256 raw/text/prefix/suffix of ~15 inputs, RC4-like, XOR, BE/LE timestamps, double-base64) in analysis_fields.md Appendix B. Handling: replay the template's 8 bytes verbatim for same-session replay, or regenerate via the B-rule on a fresh session — both self-consistent; the B-rule is the only structure the server has demonstrably round-tripped.
+
+**Field 88** — feature bitmask: b64 of a `#`-joined 23-group bit string `0#0#0#0#0#0#0#0#0#1#0#0#0#0#0#0#0#0#0#1#1#0#11111110111111111111111111` (22 single bits + one 26-bit run; three 1s in the single-bit section). Identical across all 3 data points (same device + bundle) ⇒ replay constant; regenerate only if the device/browser class changes (analysis_fields.md §4.4).
+
+**HC1–HC4 hard constraints** (violating any produces a detectably-broken token — analysis_fields.md §5.0; enforced in code by `device_token_gen._assert_payload_invariants` / `live_validate.build_payload_live`):
+
+| HC | constraint |
+|---|---|
+| HC1 | Q/serverTs/ip/sessionId come from the **same DeviceConfig**: `Q == f[2]`, `f87 == f[7]`, `f42 == f[8]`, Q's embedded ts == serverTs − 1 — never derive or fabricate independently |
+| HC2 | `f72 < serverTs` by **4–7 s** (live 6606 ms, ref 4126 ms) — client init precedes the init round-trip; a violated gap is a replay fingerprint |
+| HC3 | **tC is a per-SESSION constant** — reuse the session's tC for replay; pick 500–5000 ms once for synthetic (observed 4058/3496/524); never recompute per token; NOT max(log costs) |
+| HC4 | **w byte count**: 648 B pt + 8 B PKCS7 → 656 B ct (A); 625 + 15 → 640 (B) — 139 `#` separators, 140 fields; re-check field lengths if the payload length changes |
+
+### 23.6 Timestamp envelope (for synthetic tokens)
+
+```
+f72 (initTime)  <  f87 (serverTs)  ≤  f74 (snapshot/gen time)
+     └── gap 4–7 s ──┘                    └── unbounded in real usage ──┘
+```
+
+- f72→f87 gap is **tight (4–7 s)** in both observed sessions — keep it realistic (HC2).
+- f74−f87 is **unbounded** (live minted ~9.8 min after init with correspondingly large log-93/94 costs — server-accepted); a fresh synthetic token should still target the **1–10 s** range to look like a normal interaction.
+- **Q's embedded ts == serverTs − 1 always** (both sessions) — take Q and serverTs together from the one DeviceConfig.
+
+## 24 Key/IV hierarchy — final (from analysis_keys.md §6)
+
+### 24.1 The 12-constant table
+
+| # | constant | value | role |
+|---|---|---|---|
+| 1 | **IV** (all layers) | `utf8('0123456789ABCDEF')` = bytes `30313233343536373839414243444546` | CBC IV for every AES op — DeviceData, DeviceConfig, `w`, all `rm()/rg()`; NOT hex-decoded; bundle stage: hex `d35db7e39ebbf3d001083105` → `Hex.parse` → `Base64.stringify` → `Utf8.parse` |
+| 2 | **ACCESS_SEC** | `FqJB6iRNVYdEGpwb` (16B) | feilin unwrap key: decrypts SALT blob, `t8.secretKey`/`t8.sessionId` caches, WEB_AES_SECRET_KEY.* blobs |
+| 3 | **RES key** | `87f879f135f27da7` (16B) | decrypts the DeviceConfig blob (InitCaptchaV3 response) → session fields |
+| 4 | **sessionKey** | 16-char lowercase hex (live `682efd18149e39a6`; §21.4 `57ad9f73260d1d46`) | encrypts/decrypts the deviceToken `w`; `= b64-decode(DeviceConfig f[0])` = `deviceConfig.deviceConfig.key`; also cached as `t8.secretKey` |
+| 5 | **SALT blob** | `NLAoqT6K03oLbQXW2VS3zA==` | `rm(ACCESS_SEC, SALT)` → md5 secret |
+| 6 | **md5 secret** | `daye,raolewoba!` | `p = MD5([tF,Q,w,tC,secret].join('#'))` — session-independent (all 4 known tokens) |
+| 7 | **KEY_O** | `c175a358550d02e2` (16B) | DeviceData inner layer: encrypts `W.10001.c#appName#sceneId#captcha-normal#prefix#region` |
+| 8 | **KEY_HE** | `45f8ac1e1de14397` (16B) | DeviceData outer layer: encrypts the 6-part `#`-array `[appKey,'W',<KEY_O ct>,'W20220202','CLOUD','']`; ≡ feilin `nX` |
+| 9 | **nX/nW/c8/c6/c5/rN** | (runtime-decrypted) | feilin machine aux keys: `rg(nX, A)` DeviceData-form, upload layer, c8≡KEY_O, c6≡rN HMAC-SHA1 signing — not needed for token generation |
+| 10 | **rN / ACCESS_KEY.SECRET** | (runtime blob) | HMAC-SHA1 POP key for the background Aliyun RPC — distinct from the user AccessKeySecret that signs InitCaptchaV3/VerifyCaptchaV3 |
+| 11 | **t8.secretKey blob** | e.g. `FNW8NwwxZBD3Dagg4V6FIu3Oc2SCmhWgMjILaT1lE9Y=` | `= rg(ACCESS_SEC, sessionKey)` — the client's local cache of #4 (§24.3) |
+| 12 | **static fallback appKey** | `ab034ec0643f91399eb33e062dc7fae1` | nQ-table literal `tn(10,10)` — the bundle's fallback sessionId seed; live sessions use `3795d2…` (§24.4) |
+
+Key-domain separation is proven by negatives (analysis_keys.md §2b): RES ✗ SALT, RES ✗ secretKey, ACCESS_SEC ✗ DeviceConfig, KEY_O ✗ DeviceData-outer, KEY_HE ✗ DeviceConfig — every layer's key is in its own domain.
+
+### 24.2 ONE-IV proof (the word array IS the ASCII)
+
+There is exactly **one IV in the entire stack** — the `generate_device_data.py` "word-array IV" and the report's `'0123456789ABCDEF'` are the same 16 bytes (analysis_keys.md §1):
+
+```
+808530483  = 0x30313233 = "0123"          b''.join(w.to_bytes(4,'big') for w in words)
+875902519  = 0x34353637 = "4567"          == b"0123456789ABCDEF"
+943276354  = 0x38394142 = "89AB"          (hex 30313233343536373839414243444546)
+1128547654 = 0x43444546 = "CDEF"
+```
+
+The bundle's own construction chain (feilin.pretty.js:14462–14469, string-table citations verified): `rs = Base64.stringify(Hex.parse(t8.AES_IV))` with `t8.AES_IV` = hex `d35db7e39ebbf3d001083105`, then `rf.iv = Utf8.parse(rs)` → the 16 IV bytes. Cross-check: `b64encode(bytes.fromhex('d35db7e39ebbf3d001083105')) == '0123456789ABCDEF'`. The double-encoding is the trap: hex-decoding `d35d…` directly (12 bytes) or treating `0123456789ABCDEF` as hex (7.5 bytes) yields the wrong IV — the only correct form is the **UTF-8 bytes of the 16-character ASCII string**. (generate_device_data.py's `_IV_WORDS`/`_build_iv` are correct; its hex comment's 5th group `43434346` is stale — code right, comment wrong.)
+
+### 24.3 secretKey ≡ deviceConfig.key (resolved)
+
+`t8.secretKey` is the client's ACCESS_SEC-encrypted **cache of the same server-issued session key** delivered in deviceConfig — one key, two wrappers (analysis_keys.md §3; code-cited in the giant machine, feilin.pretty.js:51653/52708 region):
+
+- On deviceConfig arrival the machine builds `tF = { secretKey: rg(t1, tR), sessionId: rg(t8.ACCESS_SEC, k.sessionId) }` with `t1 = t8.ACCESS_SEC` and `tR = k.key = deviceConfig.deviceConfig.key`, merging both into `t8`.
+- The token machine reads the cache back: `T = rm(ACCESS_SEC, t8.secretKey)` → the session key; and `Q = rm(ACCESS_SEC, t8.sessionId)` → the sessionId.
+- Round-trip proven: `rg(ACCESS_SEC, 'e42318c6b13e57fc')` reproduces §13.3's `FNW8…` blob byte-exactly (it was the sandbox session's own `k.key` cache), and `rm(ACCESS_SEC, blob)` returns the key.
+- The decisive entry path passes `k.key` directly: `n5(payload, k.key, k.sessionId)` — an implementation only ever needs `sessionKey = b64-decode(DeviceConfig f[0])`.
+
+### 24.4 Live DeviceData params (the module defaults are wrong for this site)
+
+Decrypting the live fetch-example DeviceData (KEY_HE → KEY_O, analysis_keys.md §2a) yields the inner plaintext `W.10001.c#saf-captcha#didk33e0#captcha-normal#no8xfe#sgp` — i.e. the live-site parameters:
+
+| param | live value | note |
+|---|---|---|
+| sceneId | `didk33e0` | |
+| prefix | `no8xfe` | |
+| region | **`sgp`** | the DeviceData `region` field is `sgp` (§21.4 dump's `deviceConfig.region`) — NOT `'sg'`/`'cn'` |
+| appKey | **`3795d28242a11619bc25f786f84e53d4`** | must be passed explicitly — the `ab034e…` APP_KEY baked into generate_device_data.py is the bundle's FALLBACK (nQ-table literal), wrong for this site |
+
+Byte-exact reproduction verified: `generate_device_data.generate_device_data('didk33e0','no8xfe','sgp', app_key='3795d2…')` === the live captured DeviceData param, byte-for-byte (validator: own two-layer re-encrypt, identical result).
+
+## 25 Session-1 live captures (from live_captures.md — session A)
+
+*(live_captures.md is the retained session-material file; this section is the report-embedded record. TOKEN strings: 1340 chars each — re-read from file, never hand-copy: a single mis-copied b64 char garbles a plaintext block and breaks the md5.)*
+
+### 25.1 The live fetch example (InitCaptchaV3 request)
+
+*(full verbatim body — single line, unbroken — in live_captures.md §1; the line-wrapped form below is illustrative. Always re-read the file programmatically, never hand-copy: a single mis-copied b64 char garbles a plaintext block and breaks the md5.)*
+
+```
+POST https://no8xfe.captcha-open-southeast.aliyuncs.com/
+Content-Type: application/x-www-form-urlencoded; charset=UTF-8
+
+AccessKeyId=LTAI5tSEBwYMwVKAQGpxmvTd&SignatureMethod=HMAC-SHA1&SignatureVersion=1.0
+&Format=JSON&Timestamp=2026-08-29T12%3A48%3A37Z&Version=2023-03-05&Action=InitCaptchaV3
+&SceneId=didk33e0&Language=en&Mode=popup&UpLang=true
+&DeviceData=TEQYvgJq1LrMqFaBybfIzPxz2ygFyAct7X%2Fw%2BLacfXWd9rGSwE%2Fx6ZCONucD1fehS2Qpig6tUVsFK
+111d9wIk5pWp6rwYjzFCRgL7pNp8bzGsvOSdUXgQTopQm90YPSdCiRAlgENdODLvY7P8jrfO9eC15tPCPwLxcRIrcsp
+VvQYqVfk9%2FyFeIlePKmTRjkM&SignatureNonce=aae91cc7-685b-4193-887a-ca47f3ee1d00&Signature=…
+```
+
+The unencoded DeviceData param is a 6-part array `['3795d2…', 'W', '<KEY_O ct>', 'W20220202', 'CLOUD', '']` under KEY_HE — reproduced byte-exactly by generate_device_data (§24.4).
+
+### 25.2 Response + DeviceConfig decrypt
+
+Response: `{ Success: true, CertifyId: "QOpv38o7Qs", CaptchaType: "TRACELESS", StaticPath: "3.29.0/pe.064…", DeviceConfig: "wN32kvF2iZuLdXqR9SvIIDy5WLu2p9xz…" }` (full blob in live_captures.md §2).
+
+RES-key decrypt of the DeviceConfig blob (captain-verified, re-verified by t2/t5):
+
+| f | value |
+|---|---|
+| f[0] | `NjgyZWZkMTgxNDllMzlhNg==` → **sessionKey `682efd18149e39a6`** |
+| f[1] | `MQ==` (switch = 1) |
+| f[2] | **sessionId** `3795d28242a11619bc25f786f84e53d4-h-1788007723938-9472a56a25dc49bc8d669b22c6db0142` |
+| f[3] | version `1.5.1/feilin001.874f974c24cb17ca9480aadc03f6652a9f7e071628b484381d9efc0060379b50` |
+| f[4..6] | empty |
+| f[7] | serverTs `1788007723939` |
+| f[8] | ip `106.219.217.208` |
+| f[9] | `0` |
+
+### 25.3 The two live tokens
+
+Both md5-verified; `w` decrypts with `682efd18149e39a6` (full strings in live_captures.md §4 — 1340 chars each):
+
+| field | TOKEN1 | TOKEN2 |
+|---|---|---|
+| tF | `SG_WEB` | `SG_WEB` |
+| Q | `3795d2…-h-1788007723938-9472a56a…` | same |
+| w | 876-char b64, 656-byte ct | 876-char b64, 656-byte ct |
+| tC | `4058` | `4058` |
+| p | `af43429c68693e9a7b5f232c598edec5` | `5128c347ec1452d926cb8ee25b4e0161` |
+
+Plaintext inside `w`: **648 B after PKCS7-strip** (656 B ciphertext; 139 `#` separators → 140 fields) — full plaintext in live_captures.md Appendix and §21.2 (B-session analogue).
+
+### 25.4 The payload diff + timing relations
+
+**TOKEN1 → TOKEN2 diff — exactly fields {43, 74}, nothing else** (validator-verified: no other index differs):
+
+- field 43 tail: `…|81-13514|93-594050|94-594065` → `…|81-13514|93-620724|94-620733`
+- field 74: `1788008311383` → `1788008338057` (T2−T1 = 26,674 ms)
+
+Timing relations (validator-measured across both live + §21.4 reference sessions):
+
+- **Q's embedded ts == serverTs − 1**: `1788007723938 == 1788007723939 − 1` (ref: `1787994141656 == 1787994141657 − 1`) — Q and serverTs come from the same server response; never independent (HC1).
+- **f72 < serverTs by 4–7 s** (live 6606 ms; ref 4126 ms) — HC2.
+- **f74 unbounded vs serverTs** (ref +1698 ms; live +587,444 ms ≈ 9.8 min — page left open between init and mint) — large f74−f72 and log-93/94 costs are legitimate; fresh synthetics should still target 1–10 s.
+- **tC session-constant**: 4058 in both tokens (26 s apart); NOT max(log costs) (entry `81-13514` > 4058); NOT a function of mint time.
+- **Entry-93 arithmetic**: T1 `1788008311383 − 594050 = 1788007717333 = f72`; T2 `1788008338057 − 620724 = 1788007717333` — entry-93 == f74 − f72 exactly; entry-94 = entry-93 + 9..15 ms.
+
+## 26 Generator & validation assets (Session-1 code deliverables)
+
+### 26.1 replay_template.py — the replay foundation
+
+The frozen replay template derived from live_captures.md TOKEN1 by a builder script (nothing hand-copied):
+
+- **Exports:** `REPLAY_FIELDS` (TOKEN1's 140-field payload), `REPLAY_SESSION` (its session dict: sessionKey/sessionId/serverTs/ip/initTime/tC), `AES_IV`, `MD5_SECRET`, `RES_KEY`, `N_FIELDS`, and helpers `encrypt_payload`, `assemble_token`, `md5_hex`.
+- **Import-safe `_validate()`** runs at import: structural + HC1–HC4 hard-constraint checks, no crypto, no file reads.
+- **Self-test (6 checks, all PASS):** REPLAY_FIELDS == TOKEN1 decrypt; re-encrypt == TOKEN1's `w` byte-exact; re-assembled token == TOKEN1 byte-exact incl. md5; DeviceConfig↔session HC1 linkage.
+
+### 26.2 device_token_gen.py — the complete generator (t3)
+
+No browser, no Node — pure Python (python3.11 + pycryptodome + requests). Pipeline: `generate_init_params` → `fetch_device_config` → `decrypt_device_config` → `build_payload` → `generate_device_token`, plus `verify_token` for round-trip proof:
+
+- **`generate_init_params(access_key, secret, scene_id, region='sgp', prefix='no8xfe', app_key='3795d2…')`** — the fully-signed InitCaptchaV3 param set (signature_gen.py semantics; optional DeviceToken for re-init).
+- **`fetch_device_config(...)`** — POSTs the signed request (primary + `-b` fallback endpoint), returns the parsed response; RuntimeError on non-Success.
+- **`decrypt_device_config(blob)`** — RES-key decrypt → `{sessionKey, sessionId, serverTs, ip, version}` (HC1 linkage).
+- **`build_payload(session, base=REPLAY_FIELDS, now_ms, entry94_jitter_ms)`** — the 140-field payload: per-session refresh (21 B-rule on fresh sessions / 42 / 72 / 87 / 43) + per-token refresh (74, entry-93 == 74−72, entry-94 = 93+jitter); same-session replay at TOKEN1's mint time is byte-exact. Enforces HC1/HC2/HC4 + entry-93 non-negativity and **monotonicity (entry-93 ≥ max fixed cost)** via `_assert_payload_invariants`.
+- **`generate_device_token(session, gather_cost_ms, payload=None)`** — full token assembly (HC3: tC 500–5000, per-session constant) with automatic round-trip verification.
+- **`verify_token(token_b64, session_key)`** — structural check, md5, AES decrypt → 140 fields.
+- **Self-test (no network, 21 checks, all PASS):** re-verifies both live tokens end-to-end; mints a synthetic same-session token and proves it differs from TOKEN1 only in {43,74}; DeviceData param == live capture byte-exact.
+
+### 26.3 live_validate.py — the end-to-end validator (t4)
+
+Two modes, both strict (any assertion drift → FAIL, exit 1):
+
+- **`--dry-run` (default, no network):** 7 stages — [1] fetch-example DeviceConfig RES-decrypt (sessionKey/sessionId/serverTs/ip strictly == live_captures.md §3); [2] signed InitCaptchaV3 param construction (DeviceData byte-exact vs the live capture); [3] TOKEN1/TOKEN2 re-verification (md5 + AES + 140 fields + diff == [43,74]); [4] mint D1 from the replayed session (diff vs TOKEN1 == {43,74}); [5] mint D2 +26,674 ms later — mirrors the live T2−T1 gap, proving unique-w/unique-p per mint (FACT 1/2); [6] **fresh-session payload path** — the exact `--live` code path offline (random sessionKey/uuid2-shaped values; diff vs template == {21,42,43,72,74,87}; field-21 B-rule recomputed independently; log costs non-negative + monotonic); [7] readiness summary.
+- **`--live` (real network):** ONE InitCaptchaV3 (fresh DeviceConfig + CertifyId) → decrypt → mint ONE fresh token at initTime+~15 s (monotonic log, normal envelope; a defensive re-mint handles the monotonicity guard) → ONE VerifyCaptchaV3 via ver_test.py's primitives (RC4-like `generate_arg(certifyId)`, ali_hash track JSON, zlib, encrypt; CaptchaVerifyParam JSON carries the deviceToken). Response JSON printed verbatim and classified (§22.3): exit 0 = VerifyResult true (ACCEPTED); 3 = flow/risk outcome incl. F001 (crypto layer exercised and accepted); 4 = crypto-shaped rejection (F002/F003 — iterate t3); 1 = our-side signing/network failure.
+- **`build_payload_live`** — the fresh-session builder used by `--live`: keeps the template's fixed log entries verbatim (A's cadence is a valid fresh-session shape), appends freshly computed 93/94, regenerates field 21 via the B-rule, and is held to the SAME invariants via device_token_gen's own enforcer (single source of truth). Exists because `build_payload`'s fresh-session branch had a regression (§26.4).
+
+### 26.4 The validation audit — bugs found & fixed
+
+The independent adversarial audit (validation_report.md — 56-check harness beyond the 21-check self-test; every claim re-executed with the auditor's own code + an independent Node cross-check) found, and the fixes were applied for:
+
+1. **`build_query_string` NameError (BLOCKER for --live):** the generator iterated `for k, _ in sorted(params.items())` but the body referenced `v` — any call raised NameError **before any network I/O**, so the live request could never be sent; never caught because the self-test never serialized a body. Fixed (`for k, v in …`); live_validate.py additionally carries its own parity-proven builder (verified byte-identical to ver_test.py's reference).
+2. **Template-aliasing no-op rebase (HIGH, correctness of the §5.1 refresh rule):** `build_payload` aliased the caller's template and read `old_init` **after** overwriting `fields[72]`, making the rebase shift always 0 — the "rebase all log costs" step silently did nothing. Harmless for same-session replay (which is why the self-test passed), but a fresh session emitted non-monotonic logs when minted < 13.5 s after init (entry-93 < entry-81's 13514). Fixed: copy before mutation, read old values first, and enforce entry-93 ≥ max fixed cost + non-negativity in `_assert_payload_invariants`.
+3. **Fresh-session 93/94 regression:** the fresh-session branch stripped field 43's trailing 93/94 placeholders, then rejected the payload for not ending in 93/94 (ValueError) — the self-test only covered same-session replays. Fixed in device_token_gen (placeholders re-appended); `build_payload_live` in live_validate implements the verified-live alternative (fixed entries verbatim + appended 93/94) and is the path `--live` uses.
+
+Everything else passed the adversarial harness 56/56: FACT 1 (5 mints → 5 distinct tokens) and FACT 2 (consecutive mints differ only in {43,74}) hold and mirror live behavior; cross-session mints preserve spacing; f21 B-rule regenerates byte-exactly; HC negatives all rejected (100 ms init gap, fabricated sessionId/serverTs, tC=200); structure/encoding (140 fields, indices 93/94 empty, 876-char w, standard b64, md5 with the secret, IV as utf-8 not hex); network error paths; `decrypt_device_config` malformed-blob rejection. Verdict: **CONDITIONAL GO** — no unproven crypto remains; the residual uncertainty is the server's risk heuristics, which only a live run can probe (and did — §22.3).
+
+### 26.5 Reproduce commands
+
+```bash
+cd /root/fielin
+/usr/bin/python3.11 replay_template.py    # replay foundation self-test: 6/6 PASS (byte-exact TOKEN1)
+/usr/bin/python3.11 device_token_gen.py   # generator self-test: 21/21 PASS (no network)
+/usr/bin/python3.11 live_validate.py      # dry-run: 7 stages, all strict assertions (no network)
+/usr/bin/python3.11 live_validate.py --live   # real InitCaptchaV3 + mint + VerifyCaptchaV3
+                                           # (exit 0 accepted / 3 flow-risk outcome / 4 crypto-shaped)
+```
+
+Use `/usr/bin/python3.11` — the default `python3` (3.14) has pycryptodome but **lacks `requests`** (verified: `import requests` fails on 3.14, succeeds on 3.11).
+
+## 27 Session 3 handoff
+
+### 27.1 The F001→T001 gap (the only remaining problem)
+
+The crypto pipeline is done and server-validated (§22.3); **T001 (client verification PASSED) requires beating the risk layer, not fixing crypto.** The F001 "suspected attack" verdict is a behavioral/heuristic judgment over the request context. Candidate directions, ranked by the audit's residual-risk list (validation_report.md §6b):
+
+- **Real probe events / js-load telemetry:** the §21.4 dump records `logInfo` milestones (`mInit` INIT_SUCCESS rt=1253, `js` DYNAMICJS_LOADED rt=644, hrt, cId, initialRequestTime, initBeginTime, overTime…) — a real page emits a bundle of behavioral signals (dynamicJS fetch, static-path load, timing) that a synthetic one-shot flow does not. Reverse the client's post-init reporting (log upload path — `logUploaded: true`, the upload layer key `nW`) and decide which of these the risk engine weighs.
+- **Page context:** the verify request originates from page JS with a real CertifyId lifecycle, `TRACELESS` mode's silent-pass path (T001 can also arrive via `verifyType`/whitelist policies — T005/T006 codes exist), and consistent ip↔UA↔geo (f42 comes from the session itself, so a fresh InitCaptchaV3 from the real network path keeps it consistent — R3).
+- **Timing realism:** mint at a realistic delay (≥ a few seconds after init; entry-93 encodes it), avoid instant init→mint→verify chains (R6); device digests 32/78 + collector ids 71/73 are device-bound replays — fine for single runs, a scale risk only (R5).
+- **What NOT to chase:** the md5 secret, IV, key hierarchy, payload schema, or refresh arithmetic — all proven byte-exact; any remaining F001 is purely the risk layer's opinion of the *context*, and §21.4's `verifyResult: true` (T001 with the real browser token) shows the same scene does pass when the full page context is present.
+
+### 27.2 Fresh-session mint constraint
+
+For a fresh session (new DeviceConfig), the field-43 log strategy must stay live-shaped: either the **A-shape** (template's fixed costs verbatim + mint-time 93/94 — requires minting ≥ max fixed cost, i.e. ≥ ~13.5 s after initTime, so entry-93 ≥ 13514 keeps monotonicity) or the **B-shape** (load-time snapshot costs, optionally without 93/94 — §21.4's 10-entry snapshot was server-accepted). `live_validate.py --live` mints at initTime+~15 s and holds both shapes to the same invariants via device_token_gen's enforcer. Rebase-by-ΔinitTime (§17 per-session table) is only sound for small Δ (≤ 60 s in code) — never across hours (day-scale/negative costs no live capture shows, and the `id-cost` format cannot encode negatives).
+
+### 27.3 Sign/verify flow notes
+
+- **Unique token per verify (FACT 1):** one VerifyCaptchaV3 per minted token, one CertifyId cycle per verify run — never replay a token string; the per-token refresh (74 + 93/94) already guarantees uniqueness.
+- **No re-init between mints (FACT 2):** same session, same key/sessionId — only f74 and the 93/94 entries move, exactly the live T1→T2 signature.
+- **signature_gen.py import trap:** its module level fires a live `make_captcha_request(...)` POST — importing it sends a real request (and its hardcoded `device_token` is a placeholder). live_validate/device_token_gen carry the identical, parity-proven signing logic without the import-time side effect; do not `import signature_gen`.
+- **The verify request itself:** VerifyCaptchaV3 params must carry CertifyId (from the same init) + CaptchaVerifyParam (JSON with certifyId/data/deviceToken/sceneId), HMAC-SHA1-signed like init; `data` = ver_test.py's chain (RC4-like `generate_arg(certifyId)` → track JSON with ali_hash salt `0000` → zlib → b64 → `encrypt`). The background Aliyun RPC's rN/ACCESS_KEY.SECRET signature (§24 #10) is a *different* signing domain — do not conflate.
+
+### 27.4 Session-1 deliverable pointers
+
+| file | content |
+|---|---|
+| `live_captures.md` | the two live tokens (1340-char b64), fetch example, DeviceConfig decrypt, timing invariants — **RETAINED** (canonical session data; runtime-parsed by the three offline regression commands — replay_template/device_token_gen self-tests and the live_validate dry-run — so they keep running with zero exceptions) — **always parse programmatically, never hand-copy** |
+| `device_token_gen.py` | the complete generator (init→decrypt→payload→token; self-test 21/21) |
+| `live_validate.py` | dry-run + `--live` validator (strict 7-stage dry-run; live classification exit 0/3/4) |
+| `replay_template.py` | frozen replay foundation (REPLAY_FIELDS/REPLAY_SESSION + byte-exact self-test 6/6) |
+| `generate_device_data.py` | DeviceData request-param generator (KEY_O/KEY_HE two-layer; live params region `sgp`/prefix `no8xfe`/appKey explicit) |
+| `signature_gen.py` | reference POP-signing logic (**module-level live request — do not import**; device_token_gen carries the identical logic import-safely) |
+| `ver_test.py` | VerifyCaptchaV3 integration tester (RC4-like arg, ali_hash, zlib, encrypt, verify flow) |
+| `validation_report.md` | the adversarial audit: step-1 re-verification, t1/t2 audits, the 2 blocker bugs + fixes, 56/56 harness, GO/NO-GO verdict — **deleted by the Session-2 cleanup after consolidation; its operative content is preserved in §26.4 (bugs, harness, verdict) and §27.1 (residual-risk rankings)** |
+| `analysis_fields.md` / `analysis_keys.md` | Session-1 analysis deliverables (140-field spec + refresh rules; key/IV hierarchy + code citations) — **deleted by the Session-2 cleanup after consolidation; their operative content is preserved in Part II (§23/§24) and §11–§21** |
+| `feilin.pretty.js` / `feilin087.…js` | the deobfuscated / raw bundle (source for all code citations) |
 
