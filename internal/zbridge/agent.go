@@ -1039,10 +1039,11 @@ func isASCIISpace(b byte) bool {
 // SHIM DISPATCH GLUE — lets the request handlers stay variant-agnostic
 // ============================================================================
 //
-// The two agent-mode implementations (modern in this file, legacy in main.go)
-// expose slightly different APIs. These thin adapters/dispatchers present one
-// uniform surface so chatCompletionsHandler / anthropicMessagesHandler pick
-// the active shim purely from config.
+// The two agent-mode implementations (modern in this file, legacy in
+// agent_legacy.go) expose slightly different APIs. These thin
+// adapters/dispatchers present one uniform surface so
+// chatCompletionsHandler / anthropicMessagesHandler pick the active shim
+// purely from config.
 
 // transformMessagesForAgentModern folds the whole conversation + tool contract
 // into one XML-sectioned prompt and wraps it as a single Z.AI user message.
@@ -1137,7 +1138,7 @@ func (m *modernAgentInterceptor) finish() (string, []map[string]interface{}) {
 // legacyAgentInterceptor adapts the legacy agentStreamInterceptor
 // (incremental argument streaming) to the agentInterceptor interface. Its
 // finish returns only trailing content; end-of-stream tool calls are caught
-// by the caller's extractAgentToolCalls safety net, as before.
+// by the caller's extractAgentToolCalls safety net.
 type legacyAgentInterceptor struct{ in *agentStreamInterceptor }
 
 func (l *legacyAgentInterceptor) feed(chunk string) (string, []map[string]interface{}) {

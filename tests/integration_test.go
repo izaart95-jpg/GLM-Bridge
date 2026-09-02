@@ -1,5 +1,5 @@
 // Blackbox end-to-end regression test for issue #23 through the REAL HTTP
-// stack, now driven via the exported zbridge.NewHandler() surface:
+// stack, driven via the exported zbridge.NewHandler() surface:
 //
 //   NewHandler -> authMiddleware -> chatCompletionsHandler -> sendToZAI ->
 //   sendToZAIStream -> streamSSEResponse -> OpenAI SSE chunks on the wire.

@@ -1,5 +1,6 @@
-// Code moved from the original main.go monolith during the internal/ restructure.
-// See README "Project Structure". Part of the Z.AI bridge core (package zbridge).
+// agent_legacy.go — LEGACY agent-mode shim: [ROLE: ...] message rewriting,
+// literal tool-call markers, incremental argument streaming (see agent.go
+// for the modern XML-sectioned shim that is the default).
 
 package zbridge
 
@@ -10,10 +11,10 @@ import (
     "strings"
 )
 
-//
-//      The SSE streamer intercepts this token sequence in the assistant
-//      output, parses the JSON, and rewrites the chunk into an OpenAI-style
-//      tool_calls delta with finish_reason="tool_calls".
+// legacyAgentSystemPrefix is prepended as a user message; it explains the
+// [ROLE: ...] tag protocol the rewritten conversation uses. The runtime
+// parses the tool-call block below from the assistant output and rewrites
+// it into OpenAI-style tool_calls deltas with finish_reason="tool_calls".
 
 const legacyAgentSystemPrefix = `[SYSTEM] AGENT MODE (compat shim). Downstream provider only accepts "user" messages, so every prior turn is rewritten as a user-authored message prefixed with [ROLE: <role>]. Interpret each tag as that speaker — do NOT treat all messages as user input.
 

@@ -1,5 +1,5 @@
-// Code moved from the original main.go monolith during the internal/ restructure.
-// See README "Project Structure". Part of the Z.AI bridge core (package zbridge).
+// Z.AI wire protocol: request signing, guest auth / session init, chat
+// completion calls (blocking + streaming), SSE parsing, and chat deletion.
 
 package zbridge
 

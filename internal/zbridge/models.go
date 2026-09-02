@@ -1,6 +1,3 @@
-// Code moved from the original main.go monolith during the internal/ restructure.
-// See README "Project Structure". Part of the Z.AI bridge core (package zbridge).
-
 package zbridge
 
 import (
@@ -245,35 +242,3 @@ func modelsHandler2(w http.ResponseWriter, r *http.Request) {
         "currentModel": currentModel,
     })
 }
-
-// ============================================================================
-// AGENT MODE (LEGACY SHIM) — Tools & Role Translation for Z.AI Compatibility
-// ============================================================================
-//
-// NOTE: This is the LEGACY agent-mode shim, kept for backward compatibility
-// (select it with --agent-mode-variant=legacy / AGENT_MODE_VARIANT=legacy).
-// The default MODERN shim — XML-sectioned prompt, history summarization,
-// tolerant marker/fence/payload parsing — lives in agent.go and is ported
-// from the DeepseekFreeAPI reference implementation.
-//
-// Z.AI's unofficial /api/v2/chat/completions endpoint only accepts messages
-// with role="user". System, assistant, and tool roles cause INTERNAL_ERROR.
-// OpenAI-style tools/function_calls are also rejected.
-//
-// The legacy agent mode performs three transformations when active:
-//
-//   1. Mandatory System Prefix: A user message is prepended explaining the
-//      prompt architecture (roles, tools) so the model can interpret the
-//      rewritten conversation correctly.
-//
-//   2. Role Replacement: Every non-user message is rewritten as a user
-//      message with a [ROLE: <original_role>] tag prepended to its content.
-//      e.g. system message "Do X" becomes user message "[ROLE: system] Do X".
-//
-//   3. Tool Translation & Simulation: OpenAI tools JSON is rendered into a
-//      user message with a strict contract: the model MUST emit any tool
-//      invocation as a fenced JSON block of the form
-//
-//          <<<TOOL_CALL>>>
-//          {"name":"<tool_name>","arguments":{...}}
-//          <<<END_TOOL_CALL>>>

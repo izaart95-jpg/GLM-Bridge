@@ -40,7 +40,6 @@ def generate_signature(params, secret_key):
     return base64.b64encode(signature.digest()).decode("utf-8")
 
 
-# Device Token removed
 def make_captcha_request(access_key_id, secret_key, scene_id):
     nonce = generate_nonce()
     timestamp = get_timestamp()

@@ -1,5 +1,7 @@
-// Code moved from the original main.go monolith during the internal/ restructure.
-// See README "Project Structure". Part of the Z.AI bridge core (package zbridge).
+// Anthropic /v1/messages protocol support: request translation, SSE event
+// conversion, and error envelopes. Auth: Anthropic clients send the API key
+// via x-api-key header (handled in checkAuth); the anthropic-version header
+// is allowed via CORS.
 
 package zbridge
 
@@ -15,9 +17,6 @@ import (
     "sync"
     "time"
 )
-
-// Auth: Anthropic clients send the API key via x-api-key header (handled in
-// checkAuth). The anthropic-version header is allowed via CORS.
 
 // formatAnthropicError builds an Anthropic-style error envelope.
 func formatAnthropicError(errType, message string) interface{} {

@@ -1,6 +1,3 @@
-// Code moved from the original main.go monolith during the internal/ restructure.
-// See README "Project Structure". Part of the Z.AI bridge core (package zbridge).
-
 package zbridge
 
 import (

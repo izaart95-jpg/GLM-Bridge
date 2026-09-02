@@ -1,7 +1,7 @@
 // cmd/token-collector/main.go
 //
 // Standalone binary that seeds tokens.sqlite with device tokens harvested
-// from chat.z.ai (formerly the root-level captcha.go).
+// from chat.z.ai.
 //
 // Build commands (pick one):
 //

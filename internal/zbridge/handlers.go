@@ -1,6 +1,3 @@
-// Code moved from the original main.go monolith during the internal/ restructure.
-// See README "Project Structure". Part of the Z.AI bridge core (package zbridge).
-
 package zbridge
 
 import (
@@ -117,7 +114,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
     prompt := messagesToPrompt(messages)
 
-    // Features are now resolved per-model inside sendToZAI.
+    // Features are resolved per-model inside sendToZAI.
     // Per-request overrides are only set if explicitly provided in the body.
     opts := SendOptions{
         Model:             model,

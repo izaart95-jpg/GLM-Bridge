@@ -1,6 +1,3 @@
-// Code moved from the original main.go monolith during the internal/ restructure.
-// See README "Project Structure". Part of the Z.AI bridge core (package zbridge).
-
 package zbridge
 
 import (
@@ -91,13 +88,3 @@ func formatOpenAIError(message, errType string, code interface{}) interface{} {
         },
     }
 }
-
-// ============================================================================
-// ANTHROPIC /v1/messages PROTOCOL SUPPORT  [ANTHROPIC_PROTOCOL_PATCHED]
-// ============================================================================
-//
-// Exposes the Anthropic Messages API at /v1/messages. Feeds directly on the
-// ZAIResult stream produced by sendToZAI — the same stream powering the
-// OpenAI handler — and converts each chunk to Anthropic SSE events on the
-// fly with zero intermediate allocations beyond the event JSON itself.
-//
