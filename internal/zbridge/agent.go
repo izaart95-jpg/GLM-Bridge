@@ -912,11 +912,35 @@ func StripAgentToolCalls(text string) string {
 // AgentStreamInterceptor incrementally separates ordinary text from tool-call
 // blocks. It retains a short suffix so a marker split across upstream chunks
 // is never leaked to the client.
+//
+// Tool calls STREAM like the OpenAI / Anthropic APIs: as soon as the block's
+// {"name": ..., "arguments": { has arrived the interceptor emits the header
+// delta (index + id + type + function.name), then forwards the arguments
+// object byte-by-byte as id-less fragments while the model is still writing
+// it — the client sees live tool-call SSE instead of a long silence followed
+// by one buffered blob. Payload shapes that cannot be streamed safely
+// (non-object arguments, flat payloads, a name that never resolves) fall
+// back to the old behaviour: the whole block is buffered between the markers
+// and emitted as one complete call.
 type AgentStreamInterceptor struct {
     buffer     string
     offset     int
     callIndex  int
     pendingSep bool // a tool-call block just closed: watch for a stray fence
+
+    // ── incremental tool-call streaming state ──
+    inCall         bool   // between the opening and closing markers
+    tcBlockStart   int    // offset of the opening marker (for leak-as-content)
+    tcName         string // resolved tool name, once complete
+    tcNameFound    bool
+    tcArgsFound    bool // the arguments value's opening '{' was located
+    tcArgsPos      int  // absolute offset of that '{' in buffer
+    tcArgsStreamed int  // bytes of the arguments object already emitted
+    tcBraceDepth   int  // brace depth while scanning arguments
+    tcInString     bool // inside a JSON string while scanning arguments
+    tcEscapeNext   bool // next byte is escaped while scanning arguments
+    tcArgsDone     bool // the arguments object's closing '}' was emitted
+    tcFallback     bool // un-streamable shape: buffer the block, parse at the end
 }
 
 type AgentParsedChunk struct {
@@ -937,6 +961,185 @@ func (in *AgentStreamInterceptor) Finish() AgentParsedChunk {
     parsed := in.drain(true)
     in.offset = len(in.buffer)
     return parsed
+}
+
+// finishCall closes the current tool-call block: scanning resumes after it
+// and the pendingSep pass swallows a stray fence the model may append.
+func (in *AgentStreamInterceptor) finishCall() {
+    in.inCall = false
+    in.pendingSep = true
+    in.tcName = ""
+    in.tcNameFound = false
+    in.tcArgsFound = false
+    in.tcArgsPos = 0
+    in.tcArgsStreamed = 0
+    in.tcBraceDepth = 0
+    in.tcInString = false
+    in.tcEscapeNext = false
+    in.tcArgsDone = false
+    in.tcFallback = false
+}
+
+// jsonStringValueAt reads a `"key": "value"` string value starting the scan
+// at pos (just past the quoted key). ok is false when the value is not a
+// string or its closing quote has not arrived yet.
+func jsonStringValueAt(s string, pos int) (string, bool) {
+    for pos < len(s) && isASCIISpace(s[pos]) {
+        pos++
+    }
+    if pos >= len(s) || s[pos] != ':' {
+        return "", false
+    }
+    pos++
+    for pos < len(s) && isASCIISpace(s[pos]) {
+        pos++
+    }
+    if pos >= len(s) || s[pos] != '"' {
+        return "", false
+    }
+    pos++
+    start := pos
+    for pos < len(s) {
+        switch s[pos] {
+        case '\\':
+            pos += 2
+            continue
+        case '"':
+            return s[start:pos], true
+        }
+        pos++
+    }
+    return "", false
+}
+
+// agentStreamExtractName resolves the tool name from partial block body text,
+// accepting the same key spellings as agentExtractCall (priority order). The
+// search stops before any arguments key so a nested "name" parameter inside
+// the arguments object can never be mistaken for the tool name. ok is false
+// while no accepted key carries a complete string value yet.
+func agentStreamExtractName(body string) (name string, ok bool) {
+    searchEnd := len(body)
+    for _, k := range agentArgKeys {
+        if i := strings.Index(body, `"`+k+`"`); i >= 0 && i < searchEnd {
+            searchEnd = i
+        }
+    }
+    region := body[:searchEnd]
+    for _, k := range agentNameKeys {
+        keyIdx := strings.Index(region, `"`+k+`"`)
+        if keyIdx < 0 {
+            continue
+        }
+        if v, ok := jsonStringValueAt(region, keyIdx+len(k)+2); ok {
+            return v, true
+        }
+    }
+    return "", false
+}
+
+// Outcomes of agentStreamFindArgs.
+const (
+    argsPending   = iota // no complete arguments value start visible yet
+    argsObject           // value starts with '{' — bracePos is its offset
+    argsNonObject        // value exists but is not an object — cannot stream
+)
+
+// agentStreamFindArgs locates the arguments value in partial block body text
+// using the accepted key spellings (agentArgKeys, priority order).
+func agentStreamFindArgs(body string) (bracePos int, state int) {
+    for _, k := range agentArgKeys {
+        keyIdx := strings.Index(body, `"`+k+`"`)
+        if keyIdx < 0 {
+            continue
+        }
+        pos := keyIdx + len(k) + 2
+        for pos < len(body) && isASCIISpace(body[pos]) {
+            pos++
+        }
+        if pos >= len(body) {
+            return 0, argsPending // key arrived, colon pending
+        }
+        if body[pos] != ':' {
+            return 0, argsNonObject // malformed — buffered parse will judge
+        }
+        pos++
+        for pos < len(body) && isASCIISpace(body[pos]) {
+            pos++
+        }
+        if pos >= len(body) {
+            return 0, argsPending // value start pending
+        }
+        if body[pos] != '{' {
+            return 0, argsNonObject // string/number arguments — buffer mode
+        }
+        return pos, argsObject
+    }
+    return 0, argsPending
+}
+
+// States of agentEndMarkerPrefix.
+const (
+    agentPrefixNo       = 0 // s can never grow into a tolerated marker
+    agentPrefixMaybe    = 1 // s is a strict prefix of some tolerated marker
+    agentPrefixComplete = 2 // s starts with a complete tolerated marker
+)
+
+// agentEndMarkerPrefix classifies s (which starts with '<') against the
+// tolerated END_TOOL_CALL marker spellings (agentMinBrackets..agentMaxBrackets
+// on each side). A "maybe" verdict means the bytes so far are consistent with
+// a marker that is still arriving across upstream chunks — the caller must
+// hold them back rather than stream them as argument content.
+func agentEndMarkerPrefix(s string) (state int, markerLen int) {
+    L := bracketRunForward(s, '<')
+    if L > agentMaxBrackets {
+        return agentPrefixNo, 0
+    }
+    rest := s[L:]
+    word := agentEndWord
+    k := 0
+    for k < len(rest) && k < len(word) && rest[k] == word[k] {
+        k++
+    }
+    if k == 0 {
+        if len(rest) == 0 {
+            return agentPrefixMaybe, 0 // bare '<' run, word may still start
+        }
+        return agentPrefixNo, 0 // '<' followed by a non-'E' byte: ordinary
+    }
+    if L < agentMinBrackets {
+        return agentPrefixNo, 0 // lead run finalized below tolerance
+    }
+    if k < len(word) {
+        if k == len(rest) {
+            return agentPrefixMaybe, 0 // word still arriving
+        }
+        return agentPrefixNo, 0 // word mismatched mid-way
+    }
+    after := rest[len(word):]
+    trail := bracketRunForward(after, '>')
+    if trail > agentMaxBrackets {
+        return agentPrefixNo, 0
+    }
+    if trail < agentMinBrackets && trail == len(after) {
+        return agentPrefixMaybe, 0 // '>' run may still grow to tolerance
+    }
+    if trail < agentMinBrackets {
+        return agentPrefixNo, 0 // non-'>' byte right after the word
+    }
+    return agentPrefixComplete, L + len(word) + trail
+}
+
+// runeSafeCut returns the largest prefix length of s that ends on a rune
+// boundary, holding back at most utf8.UTFMax-1 trailing bytes of an
+// incomplete multi-byte sequence. Argument fragments must be valid UTF-8 on
+// their own: an upstream chunk boundary can split a rune, and forwarding the
+// halves separately would surface as U+FFFD garble on the client (issue #23).
+func runeSafeCut(s string) int {
+    n := len(s)
+    for n > 0 && !utf8.ValidString(s[:n]) && len(s)-n < utf8.UTFMax {
+        n--
+    }
+    return n
 }
 
 func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
@@ -963,6 +1166,13 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
                 break // could still become a fence; wait for more chunks
             }
             in.pendingSep = false
+        }
+
+        if in.inCall {
+            if !in.drainToolCall(final, &content, &toolCalls) {
+                break // block still streaming: wait for more chunks
+            }
+            continue
         }
 
         rest := in.buffer[in.offset:]
@@ -1003,32 +1213,235 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
             }
             in.offset += start
         }
-        bodyStart := in.offset + markerLen
-        idx, endMarkerLen := findAgentMarker(in.buffer[bodyStart:], agentEndWord, final)
-        if idx < 0 {
-            break // incomplete block: wait for more chunks
-        }
-        end := bodyStart + idx
-        raw := strings.TrimSpace(in.buffer[bodyStart:end])
-        if name, args, ok := agentLooseParse(raw); ok && name != "" {
-            toolCalls = append(toolCalls, map[string]interface{}{
-                "index": in.callIndex,
-                "id":    "call_" + agentRandomHex(12),
-                "type":  "function",
-                "function": map[string]interface{}{
-                    "name":      name,
-                    "arguments": agentStreamArguments(args),
-                },
-            })
-            in.callIndex++
-        } else {
-            // invalid model block: leave it as visible text
-            content = append(content, in.buffer[in.offset:end+endMarkerLen])
-        }
-        in.offset = end + endMarkerLen
-        in.pendingSep = true // watch for a ``` fence right after the block
+        // Enter the tool-call block: the opening marker is consumed now and
+        // the body streams incrementally until the closing marker.
+        in.inCall = true
+        in.tcBlockStart = in.offset
+        in.offset += markerLen
     }
     return AgentParsedChunk{Content: strings.Join(content, ""), ToolCalls: toolCalls}
+}
+
+// drainToolCall processes the body of one open tool-call block. It returns
+// false when more upstream bytes are needed, true once the block is fully
+// consumed (drain continues scanning for what follows).
+//
+// Streaming contract (mirrors the OpenAI chunk sequence):
+//   - the header delta carries index, id, type and function.name — emitted
+//     as soon as the name AND an object-valued arguments key have arrived;
+//   - each subsequent delta carries index and a function.arguments fragment;
+//   - when header and the first fragment surface in the same pass they ride
+//     one delta (exactly what OpenAI emits when a chunk covers both).
+// emitArgsFragment forwards argsText[:emitEnd] as the next streamed delta: it
+// merges into the header emitted earlier in the same pass (exactly what
+// OpenAI does when one chunk covers the name and the first argument bytes),
+// or rides its own id-less fragment delta when the header went out earlier.
+func (in *AgentStreamInterceptor) emitArgsFragment(argsText string, emitEnd int, headerIdx int, toolCalls *[]map[string]interface{}) {
+    if emitEnd <= in.tcArgsStreamed {
+        return // nothing new to forward
+    }
+    frag := argsText[in.tcArgsStreamed:emitEnd]
+    in.tcArgsStreamed = emitEnd
+    if headerIdx >= 0 {
+        (*toolCalls)[headerIdx]["function"].(map[string]interface{})["arguments"] = frag
+        return
+    }
+    *toolCalls = append(*toolCalls, map[string]interface{}{
+        "index": in.callIndex,
+        "function": map[string]interface{}{
+            "arguments": frag,
+        },
+    })
+}
+
+func (in *AgentStreamInterceptor) drainToolCall(final bool, content *[]string, toolCalls *[]map[string]interface{}) bool {
+    headerIdx := -1 // toolCalls slot of the header emitted in this pass
+
+    for {
+        body := in.buffer[in.offset:]
+
+        // ── Fallback mode: buffer everything, parse the complete block ──
+        if in.tcFallback {
+            idx, markerLen := findAgentMarker(body, agentEndWord, final)
+            if idx < 0 {
+                if !final {
+                    return false
+                }
+                // Stream ended mid-block: drop the tail (existing policy).
+                in.offset = len(in.buffer)
+                in.finishCall()
+                return true
+            }
+            end := in.offset + idx
+            raw := strings.TrimSpace(in.buffer[in.offset:end])
+            if name, args, ok := agentLooseParse(raw); ok && name != "" {
+                *toolCalls = append(*toolCalls, map[string]interface{}{
+                    "index": in.callIndex,
+                    "id":    "call_" + agentRandomHex(12),
+                    "type":  "function",
+                    "function": map[string]interface{}{
+                        "name":      name,
+                        "arguments": agentStreamArguments(args),
+                    },
+                })
+                in.callIndex++
+            } else {
+                // invalid model block: leave it as visible text
+                *content = append(*content, in.buffer[in.tcBlockStart:end+markerLen])
+            }
+            in.offset = end + markerLen
+            in.finishCall()
+            return true
+        }
+
+        // ── Phase 1: resolve the tool name ──
+        if !in.tcNameFound {
+            if name, ok := agentStreamExtractName(body); ok {
+                in.tcName = name
+                in.tcNameFound = true
+            } else {
+                // No complete name yet: if the block already closed (or the
+                // stream ended) it never will — parse the whole body instead.
+                if idx, _ := findAgentMarker(body, agentEndWord, final); idx >= 0 || final {
+                    in.tcFallback = true
+                    continue
+                }
+                return false
+            }
+        }
+
+        // ── Phase 2: locate the arguments object, then emit the header ──
+        if !in.tcArgsFound {
+            pos, state := agentStreamFindArgs(body)
+            switch state {
+            case argsObject:
+                in.tcArgsFound = true
+                in.tcArgsPos = in.offset + pos
+                *toolCalls = append(*toolCalls, map[string]interface{}{
+                    "index": in.callIndex,
+                    "id":    "call_" + agentRandomHex(12),
+                    "type":  "function",
+                    "function": map[string]interface{}{
+                        "name":      in.tcName,
+                        "arguments": "",
+                    },
+                })
+                headerIdx = len(*toolCalls) - 1
+            case argsNonObject:
+                in.tcFallback = true // e.g. arguments as a JSON-encoded string
+                continue
+            default: // argsPending
+                if idx, _ := findAgentMarker(body, agentEndWord, final); idx >= 0 || final {
+                    in.tcFallback = true // flat payload or name-only block
+                    continue
+                }
+                return false
+            }
+        }
+
+        // ── Phase 3: stream the arguments object byte-by-byte ──
+        if !in.tcArgsDone {
+            argsText := in.buffer[in.tcArgsPos:]
+            i := in.tcArgsStreamed
+            truncatedAt, truncatedLen := -1, 0
+        scan:
+            for i < len(argsText) {
+                c := argsText[i]
+                if in.tcEscapeNext {
+                    in.tcEscapeNext = false
+                    i++
+                    continue
+                }
+                if c == '\\' {
+                    in.tcEscapeNext = true
+                    i++
+                    continue
+                }
+                if c == '"' {
+                    in.tcInString = !in.tcInString
+                    i++
+                    continue
+                }
+                if !in.tcInString {
+                    switch c {
+                    case '<':
+                        // Outside a string this can only be the closing marker
+                        // arriving before the braces balanced (the model bailed
+                        // mid-JSON). Markers INSIDE a string value are content
+                        // and deliberately never match here; a partial marker
+                        // split across upstream chunks is held back, never
+                        // streamed as argument bytes.
+                        state, mLen := agentEndMarkerPrefix(argsText[i:])
+                        switch {
+                        case state == agentPrefixComplete:
+                            truncatedAt, truncatedLen = i, mLen
+                            break scan
+                        case state == agentPrefixMaybe && !final:
+                            in.emitArgsFragment(argsText, i, headerIdx, toolCalls)
+                            return false // marker still arriving: wait for it
+                        default:
+                            i++ // ordinary byte inside malformed JSON
+                            continue
+                        }
+                    case '{':
+                        in.tcBraceDepth++
+                    case '}':
+                        in.tcBraceDepth--
+                        if in.tcBraceDepth == 0 {
+                            i++
+                            in.tcArgsDone = true
+                            break scan
+                        }
+                    }
+                }
+                i++
+            }
+
+            emitEnd := i
+            if !in.tcArgsDone && truncatedAt < 0 {
+                // Also at final: an incomplete trailing rune can never
+                // complete — forwarding it would surface as U+FFFD garble.
+                emitEnd = runeSafeCut(argsText[:i])
+                // Held-back bytes are only the tail of one incomplete rune
+                // (never a quote/backslash/brace), so re-scanning them next
+                // pass cannot corrupt the string/escape/depth state.
+            }
+            in.emitArgsFragment(argsText, emitEnd, headerIdx, toolCalls)
+
+            switch {
+            case in.tcArgsDone:
+                in.offset = in.tcArgsPos + in.tcArgsStreamed
+            case truncatedAt >= 0:
+                // Malformed call (unbalanced JSON): the header already went
+                // out, so close the call at the marker instead of leaking the
+                // marker bytes into the arguments string.
+                in.offset = in.tcArgsPos + truncatedAt + truncatedLen
+                in.callIndex++
+                in.finishCall()
+                return true
+            default:
+                return false // arguments still streaming
+            }
+        }
+
+        // ── Phase 4: arguments complete — consume the closing marker ──
+        rest := in.buffer[in.offset:]
+        idx, markerLen := findAgentMarker(rest, agentEndWord, final)
+        if idx < 0 {
+            if final {
+                // Truncated block: the streamed call stands; drop the tail.
+                in.offset = len(in.buffer)
+                in.callIndex++
+                in.finishCall()
+                return true
+            }
+            return false
+        }
+        in.offset += idx + markerLen
+        in.callIndex++
+        in.finishCall()
+        return true
+    }
 }
 
 func isASCIISpace(b byte) bool {
@@ -1156,4 +1569,24 @@ func newAgentInterceptor() agentInterceptor {
         return &modernAgentInterceptor{in: &AgentStreamInterceptor{}}
     }
     return &legacyAgentInterceptor{in: newAgentStreamInterceptor()}
+}
+
+// rearmAgentInterceptor replaces a stale interceptor (an upstream
+// edit_content rewrite rewound text it had already consumed — issue #23)
+// while preserving the client-visible call-index sequence: a call streamed
+// before the rewind keeps its index, and the re-emitted block takes the
+// next one instead of colliding inside SDK accumulation.
+func rearmAgentInterceptor(old agentInterceptor) agentInterceptor {
+    fresh := newAgentInterceptor()
+    switch o := old.(type) {
+    case *modernAgentInterceptor:
+        if f, ok := fresh.(*modernAgentInterceptor); ok {
+            f.in.callIndex = o.in.callIndex
+        }
+    case *legacyAgentInterceptor:
+        if f, ok := fresh.(*legacyAgentInterceptor); ok {
+            f.in.callIndex = o.in.callIndex
+        }
+    }
+    return fresh
 }

@@ -527,9 +527,9 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
 
     // emitToolCallEvent converts one parsed tool-call (sub)delta into Anthropic
     // content-block events: a delta carrying an id starts a new tool_use block,
-    // an id-less delta only appends partial arguments JSON. The modern shim
-    // emits one complete call (id + full arguments) per delta; the legacy shim
-    // streams a header first, then argument fragments.
+    // an id-less delta only appends partial arguments JSON. Both shims stream
+    // a header first, then argument fragments (a header may already carry the
+    // first fragment when one upstream chunk covered both).
     emitToolCallEvent := func(tc map[string]interface{}) {
         fn, _ := tc["function"].(map[string]interface{})
         argsStr, _ := fn["arguments"].(string)
@@ -618,7 +618,7 @@ func anthropicStreamResponse(w http.ResponseWriter, prompt string, opts SendOpti
             // A deep edit_content rewrite rewound text that was already
             // forwarded: reset the stale agent interceptor (issue #23).
             if interceptor != nil {
-                interceptor = newAgentInterceptor()
+                interceptor = rearmAgentInterceptor(interceptor)
             }
         }
         if result.FullText != "" {

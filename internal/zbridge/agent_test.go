@@ -10,6 +10,7 @@ import (
     "encoding/json"
     "strings"
     "testing"
+    "unicode/utf8"
 )
 
 // ── marker finder ────────────────────────────────────────────────────────────
@@ -237,30 +238,34 @@ var debugFragmentChunks = []string{
     "<<", "<", "END", "_TO", "OL", "_C", "ALL", ">>>",
 }
 
+// feedChunks replays chunks through the streaming interceptor. It counts
+// LOGICAL tool calls (deltas carrying an id open a call; id-less deltas are
+// argument fragments of the open call) and returns the arguments accumulated
+// across all fragments — mirroring how an OpenAI SDK reassembles the stream.
 func feedChunks(t *testing.T, chunks []string, step int) (content string, toolCalls int, args string) {
     t.Helper()
     in := &AgentStreamInterceptor{}
-    var b strings.Builder
+    var b, acc strings.Builder
+    collect := func(parsed AgentParsedChunk) {
+        b.WriteString(parsed.Content)
+        for _, call := range parsed.ToolCalls {
+            if id, _ := call["id"].(string); id != "" {
+                toolCalls++
+            }
+            fn := call["function"].(map[string]interface{})
+            frag, _ := fn["arguments"].(string)
+            acc.WriteString(frag)
+        }
+    }
     for i := 0; i < len(chunks); i += step {
         piece := ""
         for j := i; j < i+step && j < len(chunks); j++ {
             piece += chunks[j]
         }
-        parsed := in.Feed(piece)
-        b.WriteString(parsed.Content)
-        for _, call := range parsed.ToolCalls {
-            fn := call["function"].(map[string]interface{})
-            args, _ = fn["arguments"].(string)
-            toolCalls++
-        }
+        collect(in.Feed(piece))
     }
-    final := in.Finish()
-    for _, call := range final.ToolCalls {
-        fn := call["function"].(map[string]interface{})
-        args, _ = fn["arguments"].(string)
-        toolCalls++
-    }
-    return b.String() + final.Content, toolCalls, args
+    collect(in.Finish())
+    return b.String(), toolCalls, acc.String()
 }
 
 func TestStreamInterceptorReplaysMalformedDebugStream(t *testing.T) {
@@ -321,9 +326,19 @@ func TestStreamTwoSequentialBlocks(t *testing.T) {
     stream := "<<TOOL_CALL>>>\n{\"name\":\"a\",\"arguments\":{}}\n<<<END_TOOL_CALL>>>\n<<TOOL_CALL>>>\n{\"name\":\"b\",\"arguments\":{}}\n<<<END_TOOL_CALL>>>"
     in := &AgentStreamInterceptor{}
     names := []string{}
+    argsByIndex := map[int]string{}
     collect := func(parsed AgentParsedChunk) {
         for _, call := range parsed.ToolCalls {
-            names = append(names, call["function"].(map[string]interface{})["name"].(string))
+            idx, _ := call["index"].(int)
+            fn := call["function"].(map[string]interface{})
+            if id, _ := call["id"].(string); id != "" {
+                // header delta: names ride on headers only
+                name, _ := fn["name"].(string)
+                if name != "" {
+                    names = append(names, name)
+                }
+            }
+            argsByIndex[idx] += fn["arguments"].(string)
         }
     }
     for i := 0; i < len(stream); i += 5 {
@@ -341,6 +356,13 @@ func TestStreamTwoSequentialBlocks(t *testing.T) {
     if len(names) != 2 || names[0] != "a" || names[1] != "b" {
         t.Errorf("names = %v, want [a b]", names)
     }
+    // Arguments reassemble per call index exactly as an OpenAI SDK does.
+    if got := argsByIndex[0]; got != "{}" {
+        t.Errorf("call 0 arguments = %q, want {}", got)
+    }
+    if got := argsByIndex[1]; got != "{}" {
+        t.Errorf("call 1 arguments = %q, want {}", got)
+    }
 }
 
 // splitRunes cuts s into pieces of n bytes (ASCII input assumed).
@@ -354,6 +376,217 @@ func splitRunes(s string, n int) []string {
         out = append(out, s[i:end])
     }
     return out
+}
+
+// ── incremental tool-call streaming (streamable tool calls) ──────────────────
+//
+// The interceptor must emit tool-call deltas WHILE the model is still writing
+// the block — an id/name header as soon as {"name": ...,"arguments": { has
+// arrived, then live argument fragments — not one buffered blob after
+// <<<END_TOOL_CALL>>>. These deltas mirror the OpenAI chunk contract:
+// header deltas carry index/id/type/name, fragment deltas carry index and a
+// function.arguments piece, and an SDK reassembles arguments by index.
+
+func TestStreamHeaderEmittedBeforeBlockCloses(t *testing.T) {
+    in := &AgentStreamInterceptor{}
+    // Opening marker + a name + an arguments object still in flight: the
+    // client must already see the tool-call header SSE.
+    parsed := in.Feed("Sure.\n<<<TOOL_CALL>>>\n{\"name\":\"calculate\",\"arguments\":{\"operation\":\"mult")
+    if len(parsed.ToolCalls) == 0 {
+        t.Fatalf("no tool-call header streamed before block close: %+v", parsed)
+    }
+    header := parsed.ToolCalls[0]
+    if id, _ := header["id"].(string); id == "" || !strings.HasPrefix(id, "call_") {
+        t.Errorf("header id = %v, want call_*", header["id"])
+    }
+    if header["type"] != "function" {
+        t.Errorf("header type = %v, want function", header["type"])
+    }
+    fn, _ := header["function"].(map[string]interface{})
+    if fn["name"] != "calculate" {
+        t.Errorf("header name = %v, want calculate", fn["name"])
+    }
+    if header["index"] != 0 {
+        t.Errorf("header index = %v, want 0", header["index"])
+    }
+    // Prose before the marker streamed as content; the block body did not.
+    if !strings.Contains(parsed.Content, "Sure.") {
+        t.Errorf("prose before marker not streamed: %q", parsed.Content)
+    }
+    if strings.Contains(parsed.Content, "name") || strings.Contains(parsed.Content, "TOOL_CALL") {
+        t.Errorf("block body leaked as content: %q", parsed.Content)
+    }
+    // The fragment that already arrived rides the header delta (OpenAI does
+    // the same when one chunk covers the name and the first argument bytes).
+    headerArgs, _ := fn["arguments"].(string)
+    if headerArgs != `{"operation":"mult` {
+        t.Errorf("header arguments = %q, want the first streamed fragment", headerArgs)
+    }
+
+    // Rest of the arguments stream as id-less fragments referencing the
+    // header's index, then the block closes.
+    parsed = in.Feed("iply\",\"a\": 234, \"b\": 567}}\n<<<END_TOOL_CALL>>>")
+    var args strings.Builder
+    args.WriteString(headerArgs)
+    for _, tc := range parsed.ToolCalls {
+        if id, _ := tc["id"].(string); id != "" {
+            t.Fatalf("unexpected second header mid-call: %+v", tc)
+        }
+        if tc["index"] != 0 {
+            t.Errorf("fragment index = %v, want 0", tc["index"])
+        }
+        fn, _ := tc["function"].(map[string]interface{})
+        args.WriteString(fn["arguments"].(string))
+    }
+    if args.String() != `{"operation":"multiply","a": 234, "b": 567}` {
+        t.Errorf("reassembled arguments = %q", args.String())
+    }
+    if parsed.Content != "" {
+        t.Errorf("content leaked: %q", parsed.Content)
+    }
+
+    // Nothing left after the block.
+    if fin := in.Finish(); fin.Content != "" || len(fin.ToolCalls) != 0 {
+        t.Errorf("finish left residue: %+v", fin)
+    }
+}
+
+func TestStreamArgumentsByteByByte(t *testing.T) {
+    // Worst-case upstream: 1-byte chunks, including the markers and JSON
+    // split at every byte boundary. The reassembled arguments must be exact
+    // and every fragment must ride a consistent index.
+    stream := "<<<TOOL_CALL>>>\n{\"name\":\"search\",\"arguments\":{\"query\":\"what is 234*567\",\"limit\":3}}\n<<<END_TOOL_CALL>>>"
+    in := &AgentStreamInterceptor{}
+    argsByIndex := map[int]string{}
+    headers := 0
+    var name string
+    accumulate := func(tcs []map[string]interface{}) {
+        for _, tc := range tcs {
+            idx, _ := tc["index"].(int)
+            fn, _ := tc["function"].(map[string]interface{})
+            frag, _ := fn["arguments"].(string)
+            argsByIndex[idx] += frag
+            if id, _ := tc["id"].(string); id != "" {
+                headers++
+                name, _ = fn["name"].(string)
+            }
+        }
+    }
+    for _, piece := range splitRunes(stream, 1) {
+        accumulate(in.Feed(piece).ToolCalls)
+    }
+    accumulate(in.Finish().ToolCalls)
+    if headers != 1 || name != "search" {
+        t.Fatalf("headers = %d (%s), want 1 (search)", headers, name)
+    }
+    want := `{"query":"what is 234*567","limit":3}`
+    if argsByIndex[0] != want {
+        t.Errorf("reassembled arguments = %q, want %q", argsByIndex[0], want)
+    }
+}
+
+func TestStreamArgumentFragmentsAreValidUTF8(t *testing.T) {
+    // Argument string values carrying multi-byte runes, byte-cut mid-rune
+    // by the chunker (issue #23): no fragment may surface half a rune.
+    stream := "<<<TOOL_CALL>>>\n{\"name\":\"translate\",\"arguments\":{\"text\":\"你好，世界 🙂 安心\",\"to\":\"en\"}}\n<<<END_TOOL_CALL>>>"
+    in := &AgentStreamInterceptor{}
+    var args strings.Builder
+    for _, piece := range splitRunes(stream, 3) { // lands inside 3-byte runes
+        parsed := in.Feed(piece)
+        for _, tc := range parsed.ToolCalls {
+            fn, _ := tc["function"].(map[string]interface{})
+            frag, _ := fn["arguments"].(string)
+            if !utf8.ValidString(frag) {
+                t.Fatalf("argument fragment is invalid UTF-8 (client garble): %q", frag)
+            }
+            args.WriteString(frag)
+        }
+    }
+    for _, tc := range in.Finish().ToolCalls {
+        fn, _ := tc["function"].(map[string]interface{})
+        args.WriteString(fn["arguments"].(string))
+    }
+    want := `{"text":"你好，世界 🙂 安心","to":"en"}`
+    if args.String() != want {
+        t.Errorf("reassembled arguments = %q, want %q", args.String(), want)
+    }
+}
+
+func TestStreamMarkerTextInsideStringArgument(t *testing.T) {
+    // A string argument whose VALUE contains the closing-marker words: the
+    // scanner tracks JSON strings, so the block still streams and closes at
+    // the real marker instead of truncating at the quoted one.
+    stream := "<<<TOOL_CALL>>>\n{\"name\":\"write\",\"arguments\":{\"content\":\"template: <<<END_TOOL_CALL>>> done\",\"path\":\"/tmp/x\"}}\n<<<END_TOOL_CALL>>>"
+    content, calls, args := feedChunks(t, splitRunes(stream, 4), 1)
+    if calls != 1 {
+        t.Fatalf("%d tool calls, want 1 (content=%q)", calls, content)
+    }
+    if !strings.Contains(args, "<<<END_TOOL_CALL>>> done") {
+        t.Errorf("arguments truncated at quoted marker: %q", args)
+    }
+    if !strings.Contains(args, "/tmp/x") {
+        t.Errorf("arguments missing keys after quoted marker: %q", args)
+    }
+}
+
+func TestStreamStringArgumentsFallsBackToCompleteCall(t *testing.T) {
+    // arguments as a JSON-encoded STRING is not streamable: the interceptor
+    // must buffer the block and emit one complete, unescaped call.
+    stream := "<<<TOOL_CALL>>>\n{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"uname -a\\\"}\"}\n<<<END_TOOL_CALL>>>"
+    content, calls, args := feedChunks(t, splitRunes(stream, 5), 1)
+    if calls != 1 {
+        t.Fatalf("%d tool calls, want 1 (content=%q)", calls, content)
+    }
+    if args != `{"command":"uname -a"}` {
+        t.Errorf("arguments = %q, want unwrapped JSON object", args)
+    }
+}
+
+func TestStreamFlatPayloadFallsBackToCompleteCall(t *testing.T) {
+    // Flat payload ({"tool": ..., <parameters>}): no arguments key is ever
+    // found, so the buffered path folds the stray keys into one complete
+    // call — same result as the finished-text parser.
+    stream := "<<<TOOL_CALL>>>\n{\"tool\":\"bash\",\"command\":\"uname -a\",\"timeout\":10}\n<<<END_TOOL_CALL>>>"
+    content, calls, args := feedChunks(t, splitRunes(stream, 3), 1)
+    if calls != 1 {
+        t.Fatalf("%d tool calls, want 1 (content=%q)", calls, content)
+    }
+    if !strings.Contains(args, `"command":"uname -a"`) || !strings.Contains(args, `"timeout":10`) {
+        t.Errorf("arguments = %q, want flat keys folded in", args)
+    }
+}
+
+func TestStreamAlternateKeySpellingsStillStream(t *testing.T) {
+    // Tolerated spellings stream too: the name resolves from "tool" and the
+    // arguments object from "parameters".
+    stream := "<<<TOOL_CALL>>>\n{\"tool\":\"lookup\",\"parameters\":{\"city\":\"Berlin\"}}\n<<<END_TOOL_CALL>>>"
+    content, calls, args := feedChunks(t, splitRunes(stream, 3), 1)
+    if calls != 1 {
+        t.Fatalf("%d tool calls, want 1 (content=%q)", calls, content)
+    }
+    if args != `{"city":"Berlin"}` {
+        t.Errorf("arguments = %q, want streamed parameters object", args)
+    }
+    if strings.Contains(content, "TOOL_CALL") || strings.TrimSpace(content) != "" {
+        t.Errorf("markers or junk leaked as content: %q", content)
+    }
+}
+
+func TestStreamUnbalancedJSONClosesAtMarker(t *testing.T) {
+    // The model bails mid-JSON and closes the block anyway: the streamed
+    // call must close at the marker (no marker bytes inside the arguments)
+    // and no marker text may leak as content.
+    stream := "<<<TOOL_CALL>>>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"echo\"\n<<<END_TOOL_CALL>>>"
+    content, calls, args := feedChunks(t, splitRunes(stream, 4), 1)
+    if calls != 1 {
+        t.Fatalf("%d tool calls, want 1 (content=%q)", calls, content)
+    }
+    if strings.Contains(args, "TOOL_CALL") || strings.Contains(args, "<") {
+        t.Errorf("end-marker bytes leaked into streamed arguments: %q", args)
+    }
+    if strings.Contains(content, "TOOL_CALL") {
+        t.Errorf("marker leaked as content: %q", content)
+    }
 }
 
 // ── fence helpers ────────────────────────────────────────────────────────────
@@ -392,21 +625,31 @@ func TestInterceptorSwallowsFencesAcrossChunks(t *testing.T) {
     in := &AgentStreamInterceptor{}
     var content strings.Builder
     var calls int
+    var args strings.Builder
+    collect := func(parsed AgentParsedChunk) {
+        content.WriteString(parsed.Content)
+        for _, call := range parsed.ToolCalls {
+            fn := call["function"].(map[string]interface{})
+            args.WriteString(fn["arguments"].(string))
+            if id, _ := call["id"].(string); id != "" {
+                calls++ // header delta; id-less deltas are argument fragments
+            }
+        }
+    }
     for i := 0; i < len(stream); i += 3 { // nasty 3-byte chunking
         end := i + 3
         if end > len(stream) {
             end = len(stream)
         }
-        parsed := in.Feed(stream[i:end])
-        content.WriteString(parsed.Content)
-        calls += len(parsed.ToolCalls)
+        collect(in.Feed(stream[i:end]))
     }
-    final := in.Finish()
-    content.WriteString(final.Content)
-    calls += len(final.ToolCalls)
+    collect(in.Finish())
     out := content.String()
     if calls != 1 {
         t.Errorf("expected 1 tool call, got %d", calls)
+    }
+    if args.String() != `{"command":"uname -m"}` {
+        t.Errorf("reassembled arguments = %q", args.String())
     }
     if strings.Contains(out, "```") || strings.Contains(out, "json\n<<<") {
         t.Errorf("fence leaked into content: %q", out)
@@ -1063,11 +1306,11 @@ func TestAgentTransformMessagesLegacyStillWorks(t *testing.T) {
 func TestAgentInterceptorAdapters(t *testing.T) {
     stream := "Sure thing.\n<<<TOOL_CALL>>>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"id\"}}\n<<<END_TOOL_CALL>>>"
 
-    // countCalls counts logical tool calls: deltas carrying an id start a
-    // new call (the legacy adapter additionally streams id-less argument
-    // fragments for the same call; the modern adapter emits one complete
-    // delta per call).
-    run := func(in agentInterceptor) (content string, calls int, argFrags int) {
+    // run feeds the stream and counts logical tool calls: deltas carrying an
+    // id open a new call (id-less argument fragments belong to the open
+    // call), and accumulates the streamed arguments like an SDK does.
+    run := func(in agentInterceptor) (content string, calls int, argFrags int, args string) {
+        var acc strings.Builder
         for i := 0; i < len(stream); i += 4 {
             end := i + 4
             if end > len(stream) {
@@ -1076,6 +1319,9 @@ func TestAgentInterceptorAdapters(t *testing.T) {
             c, tcs := in.feed(stream[i:end])
             content += c
             for _, tc := range tcs {
+                fn, _ := tc["function"].(map[string]interface{})
+                frag, _ := fn["arguments"].(string)
+                acc.WriteString(frag)
                 if id, _ := tc["id"].(string); id != "" {
                     calls++
                 } else {
@@ -1086,22 +1332,26 @@ func TestAgentInterceptorAdapters(t *testing.T) {
         c, tcs := in.finish()
         content += c
         for _, tc := range tcs {
+            fn, _ := tc["function"].(map[string]interface{})
+            frag, _ := fn["arguments"].(string)
+            acc.WriteString(frag)
             if id, _ := tc["id"].(string); id != "" {
                 calls++
             } else {
                 argFrags++
             }
         }
-        return
+        return content, calls, argFrags, acc.String()
     }
 
-    // Modern adapter: one complete call, no marker leakage.
-    content, calls, argFrags := run(&modernAgentInterceptor{in: &AgentStreamInterceptor{}})
+    // Modern adapter: one streamed call, arguments reassemble exactly, no
+    // marker leakage.
+    content, calls, _, args := run(&modernAgentInterceptor{in: &AgentStreamInterceptor{}})
     if calls != 1 {
         t.Errorf("modern adapter: %d calls, want 1", calls)
     }
-    if argFrags != 0 {
-        t.Errorf("modern adapter: %d id-less argument fragments, want 0 (complete-call emission)", argFrags)
+    if args != `{"command":"id"}` {
+        t.Errorf("modern adapter: streamed arguments = %q, want %q", args, `{"command":"id"}`)
     }
     if strings.Contains(content, "TOOL_CALL") {
         t.Errorf("modern adapter leaked markers: %q", content)
@@ -1112,9 +1362,12 @@ func TestAgentInterceptorAdapters(t *testing.T) {
 
     // Legacy adapter: same input (canonical markers) also yields one call,
     // streamed incrementally (header delta + argument fragments).
-    content, calls, _ = run(&legacyAgentInterceptor{in: newAgentStreamInterceptor()})
+    content, calls, _, args = run(&legacyAgentInterceptor{in: newAgentStreamInterceptor()})
     if calls != 1 {
         t.Errorf("legacy adapter: %d calls, want 1", calls)
+    }
+    if args != `{"command":"id"}` {
+        t.Errorf("legacy adapter: streamed arguments = %q, want %q", args, `{"command":"id"}`)
     }
     if strings.Contains(content, "TOOL_CALL") {
         t.Errorf("legacy adapter leaked markers: %q", content)
@@ -1157,4 +1410,84 @@ func TestAgentExtractStripDispatch(t *testing.T) {
     if got := agentStripToolCalls(canonical); strings.TrimSpace(got) != "" {
         t.Errorf("legacy strip left residue: %q", got)
     }
+}
+
+// TestAgentEndMarkerPrefixMatrix pins the partial-marker classifier used by
+// the streaming arguments scanner: "maybe" verdicts hold bytes back (a
+// marker split across upstream chunks), "complete" closes the call, "no"
+// streams the byte as ordinary (malformed) JSON.
+func TestAgentEndMarkerPrefixMatrix(t *testing.T) {
+    cases := []struct {
+        in    string
+        state int
+        mLen  int
+    }{
+        {"<<<END_TOOL_CALL>>>", agentPrefixComplete, 19}, // canonical
+        {"<<<<END_TOOL_CALL>>>>", agentPrefixComplete, 21},
+        {"<<END_TOOL_CALL>>", agentPrefixComplete, 17},   // short tolerated
+        {"<<<END_TOOL_CALL>>", agentPrefixComplete, 18},  // asymmetric 3/2 — tolerated
+        {"<<<END_TOOL_CALL>", agentPrefixMaybe, 0},       // 1 '>' so far
+        {"<<<END_TOOL_CAL", agentPrefixMaybe, 0},         // word still arriving
+        {"<<<END_TOOL", agentPrefixMaybe, 0},
+        {"<<<END_", agentPrefixMaybe, 0},
+        {"<<<", agentPrefixMaybe, 0}, // bare bracket run, word may still start
+        {"<", agentPrefixMaybe, 0},
+        {"<<<<<", agentPrefixNo, 0}, // 5 brackets: never tolerated
+        {"<<<<<END_TOOL_CALL>>>", agentPrefixNo, 0},
+        {"<abc", agentPrefixNo, 0},
+        {"<<x", agentPrefixNo, 0},
+        {"<<<END_TOOL_CALL>x", agentPrefixNo, 0},
+        {"<<<NOT_TOOL_CALL>>>", agentPrefixNo, 0},
+        {"<<<END_TOOL_CALLL>>>", agentPrefixNo, 0},
+    }
+    for _, c := range cases {
+        st, ml := agentEndMarkerPrefix(c.in)
+        if st != c.state || ml != c.mLen {
+            t.Errorf("agentEndMarkerPrefix(%q) = (%d,%d), want (%d,%d)", c.in, st, ml, c.state, c.mLen)
+        }
+    }
+}
+
+func TestStreamTwoCallsWithProseBetween(t *testing.T) {
+    stream := "<<<TOOL_CALL>>>\n{\"name\":\"a\",\"arguments\":{\"x\":1}}\n<<<END_TOOL_CALL>>>\nfirst done\n<<<TOOL_CALL>>>\n{\"name\":\"b\",\"arguments\":{\"y\":2}}\n<<<END_TOOL_CALL>>>\ntrailing"
+    in := &AgentStreamInterceptor{}
+    var content strings.Builder
+    argsByIndex := map[int]string{}
+    headers := 0
+    var names []string
+    collect := func(parsed AgentParsedChunk) {
+        content.WriteString(parsed.Content)
+        for _, tc := range parsed.ToolCalls {
+            idx, _ := tc["index"].(int)
+            fn := callFn(tc)
+            argsByIndex[idx] += fn["arguments"].(string)
+            if id, _ := tc["id"].(string); id != "" {
+                headers++
+                names = append(names, fn["name"].(string))
+            }
+        }
+    }
+    for _, piece := range splitRunes(stream, 6) {
+        collect(in.Feed(piece))
+    }
+    collect(in.Finish())
+
+    if headers != 2 || len(names) != 2 || names[0] != "a" || names[1] != "b" {
+        t.Fatalf("headers = %d names = %v, want 2 [a b]", headers, names)
+    }
+    if argsByIndex[0] != `{"x":1}` || argsByIndex[1] != `{"y":2}` {
+        t.Errorf("arguments by index = %v", argsByIndex)
+    }
+    if !strings.Contains(content.String(), "first done") || !strings.Contains(content.String(), "trailing") {
+        t.Errorf("prose between/after calls lost: %q", content.String())
+    }
+    if strings.Contains(content.String(), "TOOL_CALL") || strings.Contains(content.String(), `"x"`) {
+        t.Errorf("block bytes leaked as content: %q", content.String())
+    }
+}
+
+// callFn extracts the function map from a tool-call delta map.
+func callFn(tc map[string]interface{}) map[string]interface{} {
+    fn, _ := tc["function"].(map[string]interface{})
+    return fn
 }

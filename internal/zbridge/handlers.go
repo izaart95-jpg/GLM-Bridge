@@ -184,7 +184,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                 "choices": []map[string]interface{}{
                     {
                         "index":         0,
-                        "delta":         map[string]interface{}{"tool_calls": []map[string]interface{}{tc}},
+                        "delta":         map[string]interface{}{"role": "assistant", "tool_calls": []map[string]interface{}{tc}},
                         "finish_reason": nil,
                     },
                 },
@@ -250,7 +250,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
                     // already forwarded: the agent interceptor's view of
                     // the stream is stale, reset it (issue #23).
                     if interceptor != nil {
-                        interceptor = newAgentInterceptor()
+                        interceptor = rearmAgentInterceptor(interceptor)
                     }
                 }
                 if result.FullText != "" {
