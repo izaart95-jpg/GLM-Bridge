@@ -157,9 +157,14 @@ func initializeSession() error {
         session.mu.Unlock()
     }()
 
-    if config.ZaiToken != "" {
-        log.Println("[Session] Using hardcoded ZAI_TOKEN, skipping guest init.")
-        session.Token = config.ZaiToken
+    if len(config.ZaiTokens) > 0 {
+        if len(config.ZaiTokens) > 1 {
+            log.Printf("[Session] Using ZAI_TOKEN account pool (%d accounts), skipping guest init.",
+                len(config.ZaiTokens))
+        } else {
+            log.Println("[Session] Using hardcoded ZAI_TOKEN, skipping guest init.")
+        }
+        session.Token = config.NextZaiToken()
         id, name := decodeJWT(session.Token)
         session.UserID = id
         if name != "" {

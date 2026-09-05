@@ -4,6 +4,7 @@ import (
     "os"
     "strconv"
     "strings"
+    "sync/atomic"
     "time"
 )
 
@@ -43,7 +44,14 @@ type Config struct {
         Default int
     }
     ZaiToken  string
-    AgentMode bool
+    // ZaiTokens holds every account token ZAI_TOKEN carried. One account is
+    // one entry; sessions cycle through them so several free accounts share
+    // the load and a per-account quota no longer stops the bridge.
+    // ZaiToken stays the first entry, so single-account setups and anything
+    // reading that field behave exactly as before.
+    ZaiTokens   []string
+    zaiTokenIdx atomic.Uint64
+    AgentMode   bool
     // AgentModeVariant selects the agent-mode compatibility shim:
     //   "modern" (default) — XML-sectioned prompt shim ported from
     //                        DeepseekFreeAPI (see agent.go)
@@ -110,7 +118,10 @@ func loadConfig() *Config {
         }
     }
     if t := os.Getenv("ZAI_TOKEN"); t != "" {
-        c.ZaiToken = t
+        c.ZaiTokens = parseZaiTokens(t)
+        if len(c.ZaiTokens) > 0 {
+            c.ZaiToken = c.ZaiTokens[0]
+        }
     }
     if am := os.Getenv("AGENT_MODE"); am != "" {
         switch strings.ToLower(am) {
@@ -166,6 +177,42 @@ func loadConfig() *Config {
         }
     }
     return c
+}
+
+// parseZaiTokens splits ZAI_TOKEN into individual account tokens. Commas,
+// whitespace and newlines all separate, so a list pasted from a file or an
+// .env one-liner both work; empty fragments are dropped.
+func parseZaiTokens(raw string) []string {
+    fields := strings.FieldsFunc(raw, func(r rune) bool {
+        return r == ',' || r == ';' || r == '\n' || r == '\r' || r == '\t' || r == ' '
+    })
+    tokens := make([]string, 0, len(fields))
+    for _, f := range fields {
+        if f = strings.TrimSpace(f); f != "" {
+            tokens = append(tokens, f)
+        }
+    }
+    return tokens
+}
+
+// NextZaiToken returns the account token for the next session, cycling
+// round-robin when several are configured. It returns "" when none is set,
+// which is what puts the bridge into guest mode.
+//
+// Rotation happens per session, and every stateless request runs on its own
+// throwaway session (see session_pool.go), so consecutive requests land on
+// different accounts. Each session keeps the token it was minted with for
+// its whole lifetime, including the upstream DELETE that retires it.
+func (c *Config) NextZaiToken() string {
+    switch len(c.ZaiTokens) {
+    case 0:
+        return ""
+    case 1:
+        return c.ZaiTokens[0]
+    default:
+        i := c.zaiTokenIdx.Add(1) - 1
+        return c.ZaiTokens[i%uint64(len(c.ZaiTokens))]
+    }
 }
 
 var config = loadConfig()
