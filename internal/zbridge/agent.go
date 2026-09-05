@@ -670,6 +670,10 @@ const agentStreamKeep = agentWorstMarkerLen + len("```json\n") + 5
 // NormalizeAgentFences removes fence lines adjacent to tool-call markers from
 // finished text (non-streaming path).
 func NormalizeAgentFences(text string) string {
+    // Zhipu models sometimes emit their native <tool_call>/<arg_key> syntax
+    // instead of the marker form the prompt asks for; fold it in first so the
+    // rest of the pipeline sees a single shape.
+    text = TranslateNativeToolCalls(text)
     for {
         t := agentFenceAfterEndRe.ReplaceAllString(text, "${1}${2}")
         t = agentFenceBeforeCallRe.ReplaceAllString(t, "$1")
@@ -1177,6 +1181,14 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
 
         rest := in.buffer[in.offset:]
         start, markerLen := findAgentMarker(rest, agentStartWord, final)
+        // Zhipu's native <tool_call> syntax streams as plain text and would
+        // otherwise reach the client verbatim.
+        if handled, done := in.drainNativeBlock(rest, start, final, &content, &toolCalls); handled {
+            if done {
+                continue
+            }
+            break
+        }
         if start < 0 {
             if final {
                 // End of data: everything left is ordinary content.
