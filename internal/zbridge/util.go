@@ -86,7 +86,7 @@ var zlibWriterPool = sync.Pool{
 
 // Optimised client for Aliyun captcha API calls
 var aliyunHTTPClient = &http.Client{
-    Transport: &http.Transport{
+    Transport: newPacedTransport(&http.Transport{
         MaxIdleConns:          100,
         MaxIdleConnsPerHost:   20,
         MaxConnsPerHost:       20,
@@ -95,7 +95,7 @@ var aliyunHTTPClient = &http.Client{
         ExpectContinueTimeout: 1 * time.Second,
         ResponseHeaderTimeout: 15 * time.Second,
         ForceAttemptHTTP2:     true,
-    },
+    }),
     Timeout: 30 * time.Second,
 }
 
@@ -237,7 +237,7 @@ func (c *concatConn) Read(b []byte) (int, error) {
 var zaiJar = &cookieJar{}
 
 var zaiHTTPClient = &http.Client{
-    Transport: &http.Transport{
+    Transport: newPacedTransport(&http.Transport{
         DialTLSContext:        dialUTLS,
         MaxIdleConns:          100,
         MaxIdleConnsPerHost:   20,
@@ -246,7 +246,7 @@ var zaiHTTPClient = &http.Client{
         TLSHandshakeTimeout:   15 * time.Second,
         ExpectContinueTimeout: 1 * time.Second,
         ForceAttemptHTTP2:     false,
-    },
+    }),
     Jar: zaiJar,
 }
 
