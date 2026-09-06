@@ -131,6 +131,7 @@ On startup a banner shows the health URL, endpoints, and auth token. The Z.AI se
 | `SYNC_MODE` | `false` | Legacy synchronous session flow (no pre-warmed pool) |
 | `SESSION_POOL_SIZE` | `5` | Standing batch of ready chat sessions |
 | `SESSION_ACQUIRE_TIMEOUT` | `10` | Seconds to wait for a pooled session before creating one directly (`0` = wait forever) |
+| `UPSTREAM_MIN_INTERVAL_MS` | *(random 200–500)* | Minimum gap between consecutive requests to Z.AI / Aliyun — paces bursts so the Aliyun WAF doesn't block the egress IP (issue #20). Default is drawn randomly in `[200, 500]` ms per transport (a fixed gap is a fingerprint); `0` disables pacing |
 
 ---
 

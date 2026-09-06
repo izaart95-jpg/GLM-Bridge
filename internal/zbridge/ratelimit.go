@@ -1,6 +1,8 @@
 package zbridge
 
 import (
+    "crypto/rand"
+    "math/big"
     "net/http"
     "os"
     "strconv"
@@ -22,17 +24,36 @@ import (
 // a token bucket: a bucket lets a burst through as long as the average holds,
 // which is exactly the shape that trips the WAF.
 //
-// UPSTREAM_MIN_INTERVAL_MS tunes it; 0 disables pacing entirely.
-const defaultUpstreamMinIntervalMS = 200
+// UPSTREAM_MIN_INTERVAL_MS pins the interval explicitly; 0 disables pacing
+// entirely. Unset, the interval is drawn once per transport from a
+// cryptographically random 200–500 ms — a fixed gap is itself a fingerprint,
+// and crypto/rand (not math/rand) so the draw is not guessable from the
+// process's seed.
+const (
+    minUpstreamIntervalMS = 200
+    maxUpstreamIntervalMS = 500
+)
+
+// randomUpstreamInterval returns a cryptographically random duration in
+// [200ms, 500ms]. Falls back to the midpoint if the entropy source is
+// exhausted (crypto/rand never returns an error here, but a dead source
+// must not take pacing down with it).
+func randomUpstreamInterval() time.Duration {
+    n, err := rand.Int(rand.Reader, big.NewInt(maxUpstreamIntervalMS-minUpstreamIntervalMS+1))
+    if err != nil {
+        return time.Duration((minUpstreamIntervalMS+maxUpstreamIntervalMS)/2) * time.Millisecond
+    }
+    return time.Duration(minUpstreamIntervalMS+n.Int64()) * time.Millisecond
+}
 
 func upstreamMinInterval() time.Duration {
     raw := os.Getenv("UPSTREAM_MIN_INTERVAL_MS")
     if raw == "" {
-        return defaultUpstreamMinIntervalMS * time.Millisecond
+        return randomUpstreamInterval()
     }
     ms, err := strconv.Atoi(raw)
     if err != nil || ms < 0 {
-        return defaultUpstreamMinIntervalMS * time.Millisecond
+        return randomUpstreamInterval()
     }
     return time.Duration(ms) * time.Millisecond
 }
