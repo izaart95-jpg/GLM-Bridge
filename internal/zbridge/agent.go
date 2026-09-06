@@ -198,6 +198,9 @@ const agentSystemPrefix = "<system>\n" +
     "- Never wrap tool-call markers in code fences.\n" +
     "- Never invent results. Stop at <<<END_TOOL_CALL>>> and wait for tool output.\n" +
     "- Never call a tool not listed in <tools>.\n" +
+    "- PROGRESS: every turn must move the task forward. If the last tool result already answers the current step, do NOT call the same tool again \u2014 either advance to the next step or give the final answer.\n" +
+    "- NEVER REPEAT: do not re-issue any tool call already listed in <already_called>. If its result was insufficient, change the call (different arguments or different tool), never resend it as-is.\n" +
+    "- If the task is fully done, answer with the result in plain text \u2014 do not start another tool call.\n" +
     "</system>"
 
 // agentFinalReminder is appended at the very end of the prompt. Models weight
@@ -208,6 +211,7 @@ RESPOND WITH EXACTLY ONE OF:
 1. <<<TOOL_CALL>>>{"name":"<tool_name>","arguments":{...}}<<<END_TOOL_CALL>>> (no fences, no other text)
 2. Plain text final answer (only if no tool applies to this step)
 The tool-call JSON uses EXACTLY the keys "name" and "arguments" — never a "tool" key, never bare top-level parameters.
+NO REPEATS: a call already listed in <already_called> must not be re-issued. Same step answered? Move on or answer in plain text.
 </output_rules>`
 
 // ── OpenAI wire types ────────────────────────────────────────────────────────
@@ -513,10 +517,11 @@ func extractToolExchanges(messages []agentMessage) (old []toolExchange, recent [
 //
 // Structure:
 //
-//	<system>             — compact output contract
+//	<system>             — compact output contract (incl. anti-loop rules)
 //	<tools>              — available tool definitions
 //	<history_summary>    — summarized older turns (if conversation is long)
 //	<recent>             — recent turns in full detail with grouped tool exchanges
+//	<already_called>     — deduplicated list of calls already made (anti-loop)
 //	<current_task>       — the latest user message (recency anchor)
 //	<output_rules>       — final reminder at the very end (heaviest weight)
 func buildAgentPrompt(messages []agentMessage, tools []openAITool) string {
@@ -546,7 +551,15 @@ func buildAgentPrompt(messages []agentMessage, tools []openAITool) string {
         b.WriteString("</recent>\n\n")
     }
 
-    // 5. Extract the LAST user message as the explicit current task.
+    // 5. Anti-loop state: the deduplicated list of calls already made. Placed
+    //    late in the prompt (recency) so the model checks it against the
+    //    current task before emitting anything.
+    if already := agentAlreadyCalledList(messages); already != "" {
+        b.WriteString(already)
+        b.WriteString("\n\n")
+    }
+
+    // 6. Extract the LAST user message as the explicit current task.
     //    This is the most important change: the model knows exactly which
     //    message to respond to.
     lastUserIdx := -1
@@ -565,7 +578,7 @@ func buildAgentPrompt(messages []agentMessage, tools []openAITool) string {
         }
     }
 
-    // 6. Final output contract reminder (recency anchor).
+    // 7. Final output contract reminder (recency anchor).
     b.WriteString(agentFinalReminder)
 
     return b.String()
@@ -620,6 +633,43 @@ func renderRecentConversation(b *strings.Builder, messages []agentMessage) {
         }
         i++
     }
+}
+
+// agentAlreadyCalledList renders the <already_called> section: a deduplicated,
+// order-preserving list of every tool call the model already issued in this
+// conversation. Anti-loop anchor (issue #31): long agent sessions drift into
+// re-issuing identical calls (or endless thinking) because the flat replay
+// never tells the model what is already done; an explicit, compact list plus
+// the no-repeat rules above gives it a hard, current state to check against.
+// Returns "" when no calls have been made yet (section omitted).
+func agentAlreadyCalledList(messages []agentMessage) string {
+    var lines []string
+    seen := make(map[string]bool)
+    for _, m := range messages {
+        if m.Role != "assistant" {
+            continue
+        }
+        for _, call := range m.ToolCalls {
+            key := call.Function.Name + "\n" + agentParseArguments(call.Function.Arguments)
+            if seen[key] {
+                continue
+            }
+            seen[key] = true
+            lines = append(lines, fmt.Sprintf("- %s %s", call.Function.Name, agentParseArguments(call.Function.Arguments)))
+        }
+    }
+    if len(lines) == 0 {
+        return ""
+    }
+    var b strings.Builder
+    b.WriteString("<already_called>\n")
+    b.WriteString("Calls already made in this conversation (do NOT re-issue any of them):\n")
+    for _, line := range lines {
+        b.WriteString(line)
+        b.WriteString("\n")
+    }
+    b.WriteString("</already_called>")
+    return b.String()
 }
 
 // wrapAgentPromptAsMessages wraps the built agent prompt as a Z.AI messages
