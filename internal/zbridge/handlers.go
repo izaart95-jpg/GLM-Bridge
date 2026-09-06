@@ -172,7 +172,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
         var interceptor agentInterceptor
         if config.AgentMode {
-            interceptor = newAgentInterceptor()
+            interceptor = newAgentInterceptor(agentToolNames(body.Tools))
         }
         toolCallEmitted := false
 
@@ -300,7 +300,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
                 // Safety net: fallback tool call extraction at stream end
                 if !toolCallEmitted {
-                    fallbackCalls := agentExtractToolCalls(fullContent)
+                    fallbackCalls := agentExtractToolCalls(fullContent, agentToolNames(body.Tools)...)
                     if len(fallbackCalls) > 0 {
                         for _, tc := range fallbackCalls {
                             emitToolCallDelta(tc)
@@ -367,9 +367,9 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
         // Agent-mode: parse out tool-call blocks for non-stream response
         if config.AgentMode {
-            toolCalls := agentExtractToolCalls(fullContent)
+            toolCalls := agentExtractToolCalls(fullContent, agentToolNames(body.Tools)...)
             if len(toolCalls) > 0 {
-                stripped := agentStripToolCalls(fullContent)
+                stripped := agentStripToolCalls(fullContent, agentToolNames(body.Tools)...)
                 writeJSON(w, 200, map[string]interface{}{
                     "id":      "chatcmpl-" + requestId,
                     "object":  "chat.completion",
