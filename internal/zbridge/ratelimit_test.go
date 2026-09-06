@@ -140,17 +140,26 @@ func TestPacedTransportReadsIntervalLazily(t *testing.T) {
 
 func TestUpstreamMinIntervalFromEnv(t *testing.T) {
     cases := map[string]time.Duration{
-        "":       defaultUpstreamMinIntervalMS * time.Millisecond,
         "0":      0,
         "750":    750 * time.Millisecond,
-        "-5":     defaultUpstreamMinIntervalMS * time.Millisecond,
-        "nonsen": defaultUpstreamMinIntervalMS * time.Millisecond,
+        "100":    100 * time.Millisecond,
     }
     for raw, want := range cases {
-        // An empty value reads back as "" from os.Getenv, same as unset.
         t.Setenv("UPSTREAM_MIN_INTERVAL_MS", raw)
         if got := upstreamMinInterval(); got != want {
             t.Fatalf("UPSTREAM_MIN_INTERVAL_MS=%q: got %v, want %v", raw, got, want)
+        }
+    }
+
+    // Unset / unparsable / negative values fall back to a random draw in
+    // [200ms, 500ms] — asserted below, not a single expected value.
+    for _, raw := range []string{"", "nonsen", "-5"} {
+        t.Setenv("UPSTREAM_MIN_INTERVAL_MS", raw)
+        for i := 0; i < 50; i++ {
+            got := upstreamMinInterval()
+            if got < minUpstreamIntervalMS*time.Millisecond || got > maxUpstreamIntervalMS*time.Millisecond {
+                t.Fatalf("UPSTREAM_MIN_INTERVAL_MS=%q: got %v, want within [%dms, %dms]", raw, got, minUpstreamIntervalMS, maxUpstreamIntervalMS)
+            }
         }
     }
 }
@@ -159,4 +168,24 @@ func TestUpstreamMinIntervalFromEnv(t *testing.T) {
 // environment lookup.
 func pacedWithGap(base http.RoundTripper, gap time.Duration) http.RoundTripper {
     return &pacedTransport{base: base, gapFor: func() time.Duration { return gap }}
+}
+
+// The default draw must be crypto-random in [200ms, 500ms]. This cannot assert
+// unpredictability (that is the point of crypto/rand), but it can assert the
+// range and that repeated draws are not all identical — a pinned constant or a
+// broken rand would fail the latter, since 200 draws of a uniform [200,500]
+// draw colliding entirely is astronomically unlikely.
+func TestUpstreamIntervalRandomDraw(t *testing.T) {
+    t.Setenv("UPSTREAM_MIN_INTERVAL_MS", "")
+    seen := make(map[time.Duration]bool)
+    for i := 0; i < 200; i++ {
+        got := upstreamMinInterval()
+        if got < minUpstreamIntervalMS*time.Millisecond || got > maxUpstreamIntervalMS*time.Millisecond {
+            t.Fatalf("draw %d out of range: %v", i, got)
+        }
+        seen[got] = true
+    }
+    if len(seen) < 2 {
+        t.Fatalf("all %d draws identical — the interval is not random", len(seen))
+    }
 }
