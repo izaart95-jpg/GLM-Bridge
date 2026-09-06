@@ -207,8 +207,11 @@ func dialUTLS(ctx context.Context, network, addr string) (net.Conn, error) {
         InsecureSkipVerify: false,
     }
 
-    // Chrome 120 fingerprint
-    uConn := utls.UClient(rawConn, config, utls.HelloChrome_120)
+    // HelloChrome_Auto tracks the newest Chrome profile the uTLS version
+    // implements. Pinning an explicit release (this was HelloChrome_120, from
+    // late 2023) turns into a fingerprint no real visitor sends any more, and
+    // Aliyun's WAF answers those with the 405 block page.
+    uConn := utls.UClient(rawConn, config, utls.HelloChrome_Auto)
 
     if err := uConn.HandshakeContext(ctx); err != nil {
         rawConn.Close()
