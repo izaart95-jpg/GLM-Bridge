@@ -393,8 +393,8 @@ func sendToZAIStream(prompt string, opts struct {
         feVersion := session.FeVersion
         session.mu.Unlock()
 
-        signature, _, _ := generateZaSignature(prompt, token, userID)
-        urlStr := BASE_URL + "/api/v2/chat/completions"
+		signature, _, urlParams := generateZaSignature(prompt, token, userID)
+		urlStr := BASE_URL + "/api/v2/chat/completions?" + urlParams
 
         var messagesField interface{}
         if len(opts.ClientMessagesRaw) > 0 {
@@ -464,13 +464,14 @@ func sendToZAIStream(prompt string, opts struct {
             cancel()
             return fmt.Errorf("Z.AI connection error: %s", err.Error())
         }
-        req.Header.Set("authorization", "Bearer "+token)
-        req.Header.Set("User-Agent", zaiUserAgent)
-        req.Header.Set("content-type", "application/json")
-        req.Header.Set("x-fe-Version", feVersion)
-        req.Header.Set("x-region", "overseas")
-        req.Header.Set("x-signature", signature)
-
+		req.Header.Set("authorization", "Bearer "+token)
+		req.Header.Set("User-Agent", zaiUserAgent)
+		req.Header.Set("content-type", "application/json")
+		req.Header.Set("Origin", BASE_URL)
+		req.Header.Set("Referer", BASE_URL+"/")
+		req.Header.Set("x-fe-Version", feVersion)
+		req.Header.Set("x-region", "overseas")
+		req.Header.Set("x-signature", signature)
         resp, err := zaiHTTPClient.Do(req)
         if err != nil {
             cancel()
