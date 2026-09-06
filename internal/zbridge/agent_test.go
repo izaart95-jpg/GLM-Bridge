@@ -1146,6 +1146,87 @@ func TestHistorySummarization(t *testing.T) {
     }
 }
 
+// TestAlreadyCalledAntiLoop verifies the <already_called> anti-loop section
+// (issue #31): every distinct call already made is listed once — duplicates
+// are collapsed — and the section appears late in the prompt (after
+// <recent>, before <current_task>) where recency weight is highest.
+func TestAlreadyCalledAntiLoop(t *testing.T) {
+    mkCall := func(id, name, args string) agentMessage {
+        return agentMessage{
+            Role:    "assistant",
+            Content: json.RawMessage(`""`),
+            ToolCalls: []assistantToolCall{{
+                ID:   id,
+                Type: "function",
+                Function: struct {
+                    Name      string          `json:"name"`
+                    Arguments json.RawMessage `json:"arguments"`
+                }{
+                    Name:      name,
+                    Arguments: json.RawMessage(args),
+                },
+            }},
+        }
+    }
+
+    messages := []agentMessage{
+        {Role: "user", Content: json.RawMessage(`"find my ip"`)},
+        mkCall("call_1", "bash", `{"command":"curl -s https://api.ipify.org"}`),
+        {Role: "tool", Content: json.RawMessage(`"203.0.113.7"`), ToolCallID: "call_1"},
+        // Same call re-issued by the client (a prior loop) — must dedup.
+        mkCall("call_2", "bash", `{"command":"curl -s https://api.ipify.org"}`),
+        {Role: "tool", Content: json.RawMessage(`"203.0.113.7"`), ToolCallID: "call_2"},
+        // A different call — must be kept.
+        mkCall("call_3", "bash", `{"command":"uname -a"}`),
+        {Role: "tool", Content: json.RawMessage(`"Linux arm64"`), ToolCallID: "call_3"},
+        {Role: "user", Content: json.RawMessage(`"now get the os arch"`)},
+    }
+
+    prompt := buildAgentPrompt(messages, []openAITool{{Type: "function", Function: &openAIFnSpec{Name: "bash"}}})
+
+    // Locate the actual section (the tag is also *mentioned* in <system>
+    // and <output_rules>, so anchor on the section header line).
+    hdr := strings.Index(prompt, "<already_called>\n")
+    if hdr < 0 {
+        t.Fatal("prompt missing <already_called> section")
+    }
+    end := strings.Index(prompt[hdr:], "</already_called>")
+    if end < 0 {
+        t.Fatal("<already_called> section not closed")
+    }
+    section := prompt[hdr : hdr+end+len("</already_called>")]
+
+    if !strings.Contains(section, "Calls already made in this conversation") {
+        t.Error("<already_called> missing its no-repeat header")
+    }
+    if got := strings.Count(section, "curl -s https://api.ipify.org"); got != 1 {
+        t.Errorf("identical repeat call should be listed exactly once in <already_called>, found %d", got)
+    }
+    if !strings.Contains(section, "- bash {\"command\":\"uname -a\"}") {
+        t.Error("distinct call missing from <already_called>")
+    }
+
+    // Section order: <recent> … <already_called> … <current_task>.
+    iRecent := strings.Index(prompt, "<recent>")
+    iTask := strings.Index(prompt, "<current_task>")
+    if iRecent < 0 || iTask < 0 || !(iRecent < hdr && hdr < iTask) {
+        t.Errorf("<already_called> should sit between <recent> and <current_task> (recent=%d already=%d task=%d)", iRecent, hdr, iTask)
+    }
+}
+
+// TestAlreadyCalledEmptyWhenNoCalls verifies the <already_called> section is
+// omitted entirely when the conversation contains no tool calls (the tag may
+// still be *mentioned* by the rules, but the section header must be absent).
+func TestAlreadyCalledEmptyWhenNoCalls(t *testing.T) {
+    messages := []agentMessage{
+        {Role: "user", Content: json.RawMessage(`"hi"`)},
+    }
+    prompt := buildAgentPrompt(messages, []openAITool{{Type: "function", Function: &openAIFnSpec{Name: "bash"}}})
+    if strings.Contains(prompt, "<already_called>\nCalls already made") {
+        t.Error("<already_called> section should be omitted when no calls were made")
+    }
+}
+
 // ── GLM-Free-API integration: variant dispatch ───────────────────────────────
 
 // withAgentVariant swaps the configured agent variant for the duration of a
