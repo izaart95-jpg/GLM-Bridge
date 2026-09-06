@@ -63,7 +63,7 @@ func sseToolCallStream(t *testing.T, upstreamText string, chunkEvery int) (
     // 3. Replay the exact chatCompletionsHandler stream logic (agent-mode
     //    branch): fullContent accumulation + interceptor feed + tool-call
     //    delta emission.
-    interceptor := newAgentInterceptor()
+    interceptor := newAgentInterceptor(nil)
     fullContent := ""
     sawEndMarker := false
     for _, result := range results {
