@@ -20,8 +20,8 @@ const (
 
     // Z.AI direct config
     SALT_KEY           = "key-@@@@)))()((9))-xxxx&&&%%%%%"
-    DEFAULT_FE_VERSION = "prod-fe-1.1.88"
-    zaiUserAgent       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    DEFAULT_FE_VERSION = "prod-fe-1.1.93"
+    zaiUserAgent       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 )
 
 // BASE_URL is a var (not const) only so tests can point the bridge at a
