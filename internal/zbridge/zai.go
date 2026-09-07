@@ -358,6 +358,7 @@ func sendToZAI(prompt string, opts SendOptions) (<-chan ZAIResult, error) {
         Messages          []Message
         ClientMessagesRaw json.RawMessage
         Files             []map[string]interface{}
+        RequestID         string
     }{
         Model:             model,
         ChatID:            chatID,
@@ -365,6 +366,7 @@ func sendToZAI(prompt string, opts SendOptions) (<-chan ZAIResult, error) {
         Messages:          messages,
         ClientMessagesRaw: opts.ClientMessagesRaw,
         Files:             opts.Files,
+        RequestID:         opts.RequestID,
     }
 
     ch := make(chan ZAIResult, 100)
@@ -384,6 +386,7 @@ func sendToZAIStream(prompt string, opts struct {
     Messages          []Message
     ClientMessagesRaw json.RawMessage
     Files             []map[string]interface{}
+    RequestID         string
 }, ch chan<- ZAIResult) error {
 
     for attempt := 0; attempt < 2; attempt++ {
@@ -510,7 +513,7 @@ func sendToZAIStream(prompt string, opts struct {
             return fmt.Errorf("Z.AI error %d: %s", resp.StatusCode, string(errBody))
         }
 
-        err = streamSSEResponse(resp.Body, ch)
+        err = streamSSEResponse(resp.Body, ch, opts.RequestID)
         resp.Body.Close()
         cancel()
         return err
@@ -761,9 +764,19 @@ func splitDetails(raw string) (reasoning, content string) {
     return rb.String(), cb.String()
 }
 
-func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
+// streamSSEResponse parses Z.AI's upstream SSE stream into ZAIResult chunks.
+// requestId, when non-empty, prefixes every debug log line emitted here so
+// concurrent streams can be attributed (issue #36).
+func streamSSEResponse(body io.Reader, ch chan<- ZAIResult, requestId string) error {
     scanner := bufio.NewScanner(body)
     scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+
+    // logPrefix labels debug output for this request. The client-visible id
+    // already exists, so the label is exactly what a log reader greps for.
+    logPrefix := "[DEBUG]"
+    if requestId != "" {
+        logPrefix = "[DEBUG] [" + requestId + "]"
+    }
 
     // ── Accumulated state across SSE lines ──
     var fullText strings.Builder      // raw upstream content, verbatim
@@ -844,7 +857,7 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
         trimmed := strings.TrimSpace(line)
 
         if config.Logging.Level == "debug" && trimmed != "" {
-            log.Println("[DEBUG] Z.AI SSE line:", trimmed)
+            log.Println(logPrefix, "Z.AI SSE line:", trimmed)
         }
 
         if !strings.HasPrefix(trimmed, "data: ") {
@@ -859,7 +872,7 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
         var j map[string]interface{}
         if err := json.Unmarshal([]byte(dataStr), &j); err != nil {
             if config.Logging.Level == "debug" {
-                log.Println("[DEBUG] Z.AI failed to parse SSE:", dataStr)
+                log.Println(logPrefix, "Z.AI failed to parse SSE:", dataStr)
             }
             continue
         }
@@ -867,7 +880,7 @@ func streamSSEResponse(body io.Reader, ch chan<- ZAIResult) error {
         // ── Detect inline errors (HTTP 200 with error in body) ──
         if errDetail := extractZAIError(j); errDetail != "" {
             if config.Logging.Level == "debug" {
-                log.Println("[DEBUG] Z.AI inline SSE error:", errDetail)
+                log.Println(logPrefix, "Z.AI inline SSE error:", errDetail)
             }
             return fmt.Errorf("Z.AI error: %s", errDetail)
         }

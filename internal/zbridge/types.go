@@ -63,6 +63,11 @@ type SendOptions struct {
     // attach to the upstream completion request as the top-level "files"
     // array. Empty for text-only requests (field then stays out of the body).
     Files []map[string]interface{}
+    // RequestID carries the handler-generated client-visible request id, so
+    // debug log lines emitted while the upstream SSE stream is parsed can be
+    // attributed to their request when several are in flight (issue #36).
+    // Purely local: never reaches the upstream payload.
+    RequestID string
 }
 
 type ResponseResult struct {

@@ -122,6 +122,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
         ClientMessagesRaw: transformedMessages,
         ReasoningEffort:   body.ReasoningEffort,
         Files:             files,
+        RequestID:         requestId,
     }
 
     // Parse thinking configuration:

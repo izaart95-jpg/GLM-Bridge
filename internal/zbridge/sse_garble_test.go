@@ -49,7 +49,7 @@ func runSSEParser(t *testing.T, body string) []ZAIResult {
 	go func() {
 		// sendToZAI closes the channel after sendToZAIStream returns;
 		// mirror that here so the drain loop terminates.
-		errCh <- streamSSEResponse(strings.NewReader(body), ch)
+		errCh <- streamSSEResponse(strings.NewReader(body), ch, "")
 		close(ch)
 	}()
 	var results []ZAIResult

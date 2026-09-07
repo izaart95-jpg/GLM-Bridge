@@ -419,6 +419,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
         ClientMessagesRaw: transformedMessages,
         ReasoningEffort:   body.ReasoningEffort,
         Files:             files,
+        RequestID:         requestId,
     }
 
     if body.Reasoning != nil {
