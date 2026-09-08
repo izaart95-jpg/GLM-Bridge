@@ -988,6 +988,22 @@ type AgentStreamInterceptor struct {
     toolNames []string
     bareKeep  int // hold-back floor covering the longest name plus its bracket
 
+    // bareFenceOpen tracks, for the bare-call recognizer only, whether the
+    // model's output is currently inside an open ``` markdown fence: a
+    // declared-tool invocation that is merely a documentation example inside
+    // a fence must not be mistaken for a real call (see agent_bare.go).
+    //
+    // This is state about the stream as a whole, not a value re-derived from
+    // whatever is left in the buffer: a fence opened in text already
+    // committed to the client (or consumed as part of an earlier bare call)
+    // is invisible to any scan that only looks at what has not yet been
+    // sent, so it must be threaded forward explicitly. It is updated in
+    // exactly two places — commitContent, for ordinary text, and the
+    // successful branch of drainBareCall, for a recognised call's own span —
+    // and must be carried across rearmAgentInterceptor (see there) or a
+    // mid-stream rewind silently forgets it.
+    bareFenceOpen bool
+
     // ── incremental tool-call streaming state ──
     inCall         bool   // between the opening and closing markers
     tcBlockStart   int    // offset of the opening marker (for leak-as-content)
@@ -1259,7 +1275,7 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
             if final {
                 // End of data: everything left is ordinary content.
                 if rest != "" {
-                    content = append(content, rest)
+                    in.commitContent(rest, &content)
                     in.offset = len(in.buffer)
                 }
                 break
@@ -1281,7 +1297,7 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
                     cut--
                 }
                 if cut > 0 {
-                    content = append(content, rest[:cut])
+                    in.commitContent(rest[:cut], &content)
                     in.offset += cut
                 }
             }
@@ -1290,7 +1306,7 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
         if start > 0 {
             piece := TrimTrailingAgentFence(rest[:start])
             if piece != "" {
-                content = append(content, piece)
+                in.commitContent(piece, &content)
             }
             in.offset += start
         }
@@ -1368,7 +1384,7 @@ func (in *AgentStreamInterceptor) drainToolCall(final bool, content *[]string, t
                 in.callIndex++
             } else {
                 // invalid model block: leave it as visible text
-                *content = append(*content, in.buffer[in.tcBlockStart:end+markerLen])
+                in.commitContent(in.buffer[in.tcBlockStart:end+markerLen], content)
             }
             in.offset = end + markerLen
             in.finishCall()
@@ -1674,16 +1690,27 @@ func (in *AgentStreamInterceptor) setToolNames(names []string) {
 // while preserving the client-visible call-index sequence: a call streamed
 // before the rewind keeps its index, and the re-emitted block takes the
 // next one instead of colliding inside SDK accumulation.
+//
+// It also preserves bareFenceOpen. Without this, a rewind landing while the
+// model's output is mid-way through a ``` fence resets the fresh
+// interceptor to "not in a fence", and a bare-call example inside that same
+// fence — the exact false positive the fence check exists to catch — is
+// misread as a real call again, only now intermittently and after the
+// stream has already been rewound once, which is harder to reproduce than
+// the original report.
 func rearmAgentInterceptor(old agentInterceptor) agentInterceptor {
     var names []string
+    var fenceOpen bool
     if o, ok := old.(*modernAgentInterceptor); ok {
         names = o.in.toolNames
+        fenceOpen = o.in.bareFenceOpen
     }
     fresh := newAgentInterceptor(names)
     switch o := old.(type) {
     case *modernAgentInterceptor:
         if f, ok := fresh.(*modernAgentInterceptor); ok {
             f.in.callIndex = o.in.callIndex
+            f.in.bareFenceOpen = fenceOpen
         }
     case *legacyAgentInterceptor:
         if f, ok := fresh.(*legacyAgentInterceptor); ok {
