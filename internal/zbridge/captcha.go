@@ -4,7 +4,6 @@
 package zbridge
 
 import (
-    _ "modernc.org/sqlite" // pure-Go SQLite driver registration (no CGO)
     "io"
     "os"
     "sort"
@@ -22,34 +21,24 @@ import (
 )
 
 // ============================================================================
-// DATABASE — SQLite, pure-Go driver (no CGO)
+// DATABASE — hot-swappable holder lives in db.go; the helpers below are the
+// only call sites the captcha path needs.
 // ============================================================================
 
-func initDB() error {
-    var err error
-    globalDB, err = sql.Open("sqlite", dbPath)
-    if err != nil {
-        return err
-    }
-    globalDB.SetMaxOpenConns(1)
-    globalDB.SetMaxIdleConns(1)
-    return nil
-}
-
 func getNextToken() (string, bool) {
-    dbMu.Lock()
-    defer dbMu.Unlock()
-
-    if _, err := os.Stat(dbPath); err != nil {
-        logError("Database file not found: " + dbPath)
-        return "", false
-    }
-
     var token string
-    err := globalDB.QueryRow("SELECT token FROM tokens ORDER BY id LIMIT 1;").Scan(&token)
+    err := withTokenDB(func(h dbHandle) error {
+        if _, err := os.Stat(h.path); err != nil {
+            logError("Database file not found: " + h.path)
+            return err
+        }
+        return h.db.QueryRow("SELECT token FROM tokens ORDER BY id LIMIT 1;").Scan(&token)
+    })
     if err != nil {
         if errors.Is(err, sql.ErrNoRows) {
             logError("No device tokens available in table 'tokens'")
+        } else if err == ErrDBUnavailable {
+            logError(err.Error())
         } else {
             logError("Failed to query token: " + err.Error())
         }
@@ -59,10 +48,10 @@ func getNextToken() (string, bool) {
 }
 
 func removeToken(token string) {
-    dbMu.Lock()
-    defer dbMu.Unlock()
-
-    _, err := globalDB.Exec("DELETE FROM tokens WHERE token = ?;", token)
+    err := withTokenDB(func(h dbHandle) error {
+        _, err := h.db.Exec("DELETE FROM tokens WHERE token = ?;", token)
+        return err
+    })
     if err != nil {
         logError("Failed to delete consumed token: " + err.Error())
     }

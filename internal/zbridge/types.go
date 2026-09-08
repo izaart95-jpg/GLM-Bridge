@@ -1,7 +1,6 @@
 package zbridge
 
 import (
-    "database/sql"
     "encoding/json"
     "regexp"
     "sync"
@@ -131,14 +130,15 @@ type Track struct {
 // ============================================================================
 
 // ---------- Captcha globals ----------
+//
+// The active SQLite database (formerly globalDB) lives in db.go behind the
+// hot-swappable dbState holder: see globalDBState / withTokenDB / swapDB.
 
 var (
     dbPath   string
     verbose  bool
     gRunning atomic.Bool
-    dbMu     sync.Mutex
     logMu    sync.Mutex
-    globalDB *sql.DB
 )
 
 // ---------- Z.AI globals ----------

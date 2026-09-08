@@ -47,6 +47,9 @@ func NewHandler() http.Handler {
     mux.HandleFunc("/admin/clients", clientsHandler)
     mux.HandleFunc("/inject.js", injectHandler)
     mux.HandleFunc("/stop", authMiddleware(stopHandler))
+    // Hot-swap the active tokens.sqlite without restarting the server.
+    // Auth-protected like every other mutating endpoint.
+    mux.HandleFunc("/sqlite", authMiddleware(sqliteSwapHandler))
 
     return corsMiddleware(mux)
 }
@@ -72,7 +75,7 @@ func Run() {
         fmt.Fprintf(os.Stderr, "Failed to open database: %v\n", err)
         os.Exit(1)
     }
-    defer globalDB.Close()
+    defer closeDB()
 
     gRunning.Store(true)
 

@@ -132,6 +132,7 @@ On startup a banner shows the health URL, endpoints, and auth token. The Z.AI se
 | `SESSION_POOL_SIZE` | `5` | Standing batch of ready chat sessions |
 | `SESSION_ACQUIRE_TIMEOUT` | `10` | Seconds to wait for a pooled session before creating one directly (`0` = wait forever) |
 | `UPSTREAM_MIN_INTERVAL_MS` | *(random 200–500)* | Minimum gap between consecutive requests to Z.AI / Aliyun — paces bursts so the Aliyun WAF doesn't block the egress IP (issue #20). Default is drawn randomly in `[200, 500]` ms per transport (a fixed gap is a fingerprint); `0` disables pacing |
+| `TOKEN_COUNT_TTL_MS` | `5000` | How long the `/health` token count stays cached before the next probe re-queries the active database (`TOKEN_COUNT_TTL_MS <= 0` keeps the default) |
 
 ---
 
@@ -225,14 +226,58 @@ Standard Anthropic fields: `model`, `messages`, `system`, `max_tokens`, `tempera
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | `GET`  | `/` | ❌ | Redirects to `/health` |
-| `GET`  | `/health` | ❌ | `200` if initialised, else `503` |
+| `GET`  | `/health` | ❌ | `200` if initialised, else `503` — now also carries a real-time `tokenCount` from the active token DB (below) |
 | `GET`  | `/status` | ❌ | Live session status (connected, userName, userId, feVersion, features, mode, sessionPool) |
 | `GET`  | `/admin/health` | ❌ | Same as `/health` |
 | `GET`  | `/admin/stats` | ❌ | Mode, totalClients, totalRequests |
 | `GET`  | `/admin/clients` | ❌ | Client list |
 | `POST` | `/features` | ✅ | Per-model feature overrides (below) |
 | `GET`  | `/features` | ✅ | Inspect resolved features / stored states |
+| `POST` | `/sqlite` | ✅ | **Hot-swap the active token database** without restarting (below) |
 | `POST` | `/stop` | ✅ | Acknowledged no-op |
+
+---
+
+## `/health` — Real-Time Token Count
+
+The health response includes the number of device tokens left in the active `tokens.sqlite`:
+
+```json
+{ "healthy": true, "mode": "direct", "tokenCount": 1500 }
+```
+
+- The count is served from a small TTL cache (`TOKEN_COUNT_TTL_MS`, default **5000** ms) so frequent health probes don't turn into per-probe `SELECT COUNT(*)` queries.
+- `-1` means "unknown": no database attached, or the count query failed (e.g. the file vanished).
+- Swapping the database (`POST /sqlite`) invalidates the cache immediately — the next probe reflects the new file, not a stale value.
+
+## `/sqlite` — Hot-Swap the Token Database
+
+Point the running bridge at a freshly harvested `tokens.sqlite` **without restarting** (restart would drop every in-flight request and the session pool):
+
+```bash
+curl -X POST http://localhost:3001/sqlite \
+  -H "Authorization: Bearer $AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"db_path": "/new/path/tokens.sqlite"}'
+```
+
+Response:
+
+```json
+{ "success": true, "message": "database swapped", "db_path": "/new/path/tokens.sqlite",
+  "swapped_in": "35ms", "token_count": 1500 }
+```
+
+**Validation happens before anything live is touched.** A candidate file is rejected with `400` + a precise error if it: doesn't exist, is a directory, isn't readable, isn't a valid SQLite database, or lacks the expected `tokens` (id, token, batch) schema. A rejected candidate never disturbs the active database.
+
+**The swap is graceful by construction:**
+
+1. The candidate is validated and opened via its own private connection first — the live swap itself is a single pointer exchange (tens of ms end-to-end including open + ping).
+2. In-flight requests keep the database handle they captured and finish normally against the old file; the retired handle is closed only after its in-flight count drains to zero.
+3. Requests arriving *during* the swap are **throttled** (they wait for the microseconds the write lock is held) and then see the new database — nothing is denied or failed mid-swap.
+4. Concurrent `POST /sqlite` calls are serialised; the second gets an explicit "swap already in progress — retry shortly" error.
+
+Repeated swaps to the same path are supported (the collector may have rewritten the file in place).
 
 ---
 
@@ -367,6 +412,7 @@ zai-api/
 │   ├── types.go                   # Shared types + global state
 │   ├── features.go                # Per-model feature resolution
 │   ├── util.go                    # Logging, HTTP clients, cookie jar, helpers
+│   ├── db.go                      # Hot-swappable token DB holder + count cache
 │   ├── captcha.go                 # Aliyun captcha machinery + cache
 │   ├── zai.go                     # Signature, session init, streaming, SSE parse
 │   ├── format.go                  # OpenAI response/error formatting
@@ -380,12 +426,14 @@ zai-api/
 │   ├── session_pool.go            # Throwaway sessions + async pool + GC
 │   ├── testhooks.go               # Exported seams for tests/
 │   ├── agent_test.go              # Whitebox: modern agent shim
+│   ├── db_test.go                 # Whitebox: DB holder, count TTL, graceful swap
 │   ├── sse_garble_test.go         # Whitebox: SSE parser (issue #23)
 │   └── vision_test.go             # Whitebox: url->file-id rewrite
 ├── cmd/token-collector/           # Standalone binary: seeds tokens.sqlite (TUI)
 ├── tests/                         # Blackbox tests (package tests)
 │   ├── session_pool_test.go       # Pool mechanics, chat-delete client, GC wiring
 │   ├── integration_test.go        # E2E HTTP garble regression (issue #23)
+│   ├── db_hotswap_test.go         # E2E /health tokenCount + /sqlite hot-swap
 │   └── vision_test.go             # Vision e2e (upload + files), /v1/models, limits
 └── README.md
 ```

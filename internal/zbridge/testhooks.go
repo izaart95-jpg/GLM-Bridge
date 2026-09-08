@@ -6,7 +6,10 @@
 
 package zbridge
 
-import "time"
+import (
+    "database/sql"
+    "time"
+)
 
 // GetConfig returns the live bridge configuration (env/flag parsed).
 // Callers may read it or toggle fields (e.g. AgentMode) and should restore
@@ -50,3 +53,32 @@ func FlushModelsCache() {
     modelsCacheTime = time.Time{}
     modelsCacheMu.Unlock()
 }
+
+// ActiveDBPath returns the file path of the currently attached SQLite
+// database, or "" when none is attached. Tests use it to assert swap effects.
+func ActiveDBPath() string {
+    globalDBState.mu.RLock()
+    h := globalDBState.active
+    globalDBState.mu.RUnlock()
+    if h.db == nil {
+        return ""
+    }
+    return h.path
+}
+
+// AttachDatabase installs an already-open database (opened by the caller,
+// e.g. a test fixture) as the active one. Operational callers should prefer
+// SwapDatabase, which validates the file first.
+func AttachDatabase(db *sql.DB, path string) { attachDB(db, path) }
+
+// DetachDatabase removes the active database (closing it after any in-flight
+// query drains), leaving the bridge in the "no database" state.
+func DetachDatabase() { closeDB() }
+
+// SwapDatabase exposes the hot-swap primitive (POST /sqlite's core) for
+// direct use by tests and operational scripting.
+func SwapDatabase(newPath string) error { return swapDB(newPath) }
+
+// TokenCount exposes the TTL-cached token count (the /health value) for
+// tests and operational scripting. -1 means "unavailable".
+func TokenCount() int64 { return globalDBState.tokenCount() }

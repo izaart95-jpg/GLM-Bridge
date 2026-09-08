@@ -591,11 +591,75 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
     healthy := session.Initialized
     session.mu.Unlock()
 
+    // Real-time device-token count from the active tokens.sqlite, served
+    // from a TTL cache (TOKEN_COUNT_TTL_MS, default 5 s) so a health probe
+    // never becomes a per-request DB query. -1 means "unavailable" — no
+    // database attached or the count query failed.
+    tokenCount := globalDBState.tokenCount()
+
     status := 200
     if !healthy {
         status = 503
     }
-    writeJSON(w, status, map[string]interface{}{"healthy": healthy, "mode": "direct"})
+    writeJSON(w, status, map[string]interface{}{
+        "healthy":    healthy,
+        "mode":       "direct",
+        "tokenCount": tokenCount,
+    })
+}
+
+// sqliteSwapHandler hot-swaps the active tokens.sqlite database.
+//
+//	POST /sqlite  {"db_path": "/new/path/to/tokens.sqlite"}
+//
+// The candidate file is validated (exists, readable, real SQLite, expected
+// `tokens` schema) before anything live is touched, then attached atomically.
+// In-flight requests keep their captured database handle and complete
+// normally; requests arriving mid-swap are briefly throttled, never denied.
+func sqliteSwapHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != "POST" {
+        writeJSON(w, http.StatusMethodNotAllowed, map[string]interface{}{
+            "success": false,
+            "error":   "method not allowed — use POST /sqlite with {\"db_path\": \"...\"}",
+        })
+        return
+    }
+
+    var body struct {
+        DBPath string `json:"db_path"`
+    }
+    if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+        writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+            "success": false,
+            "error":   "invalid JSON body: " + err.Error(),
+        })
+        return
+    }
+    if body.DBPath == "" {
+        writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+            "success": false,
+            "error":   "missing required field 'db_path'",
+        })
+        return
+    }
+
+    started := time.Now()
+    if err := swapDB(body.DBPath); err != nil {
+        writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+            "success": false,
+            "error":   err.Error(),
+            "db_path": body.DBPath,
+        })
+        return
+    }
+
+    writeJSON(w, http.StatusOK, map[string]interface{}{
+        "success":     true,
+        "message":     "database swapped",
+        "db_path":     body.DBPath,
+        "swapped_in":  fmt.Sprintf("%dms", time.Since(started).Milliseconds()),
+        "token_count": globalDBState.tokenCount(),
+    })
 }
 
 func clientsHandler(w http.ResponseWriter, r *http.Request) {
