@@ -9,12 +9,16 @@
 // This file replaces that global with a small holder that can atomically
 // swap the live database under load:
 //
-//   - mu (RWMutex): readers take RLock just long enough to capture the
-//     active handle and register it as "in flight", then run their query
-//     outside the lock. swapDB takes the write lock, installs the new
-//     handle, then WAITS for the captured in-flight count on the retired
-//     handle to fall to zero before closing it. In-flight queries are
-//     never interrupted, never denied, and never see a closed handle.
+//   - mu (RWMutex): readers take the FULL write lock just long enough to
+//     capture the active handle AND register it as "in flight" — the
+//     registration is a map write, so a read lock would let two readers
+//     write the map at once ("fatal error: concurrent map writes", the
+//     agent-mode startup crash in issue #40) — then they run their query
+//     outside the lock. swapDB takes the same write lock, installs the
+//     new handle, then WAITS for the captured in-flight count on the
+//     retired handle to fall to zero before closing it. In-flight
+//     queries are never interrupted, never denied, and never see a
+//     closed handle.
 //   - swapGate: a buffered(1) semaphore serialising swaps themselves, so
 //     two concurrent POST /sqlite requests cannot interleave.
 //   - token-count cache: /health reads the count through a TTL cache
@@ -82,16 +86,22 @@ type dbHandle struct {
 // dbState is the single source of truth for the active database.
 type dbState struct {
     // mu guards `active` and the per-handle in-flight counters. Readers
-    // (withTokenDB, tokenCount) hold RLock only while capturing the handle
-    // + bumping its counter; the query itself runs lock-free. swapDB
-    // holds the write lock for the pointer swap, then drains the retired
-    // handle outside mu.
+    // (withTokenDB, tokenCount) take the full write lock only while
+    // capturing the handle + bumping its in-flight counter — the bump is
+    // a map write, so it cannot share a read lock with another reader
+    // (issue #40) — and the query itself runs lock-free. swapDB holds the
+    // write lock for the pointer swap, then drains the retired handle
+    // outside mu.
     mu     sync.RWMutex
     active dbHandle
 
-    inflight    map[*sql.DB]int // in-flight query count per sql.DB
-    drained     *sync.Cond      // signalled when a handle's inflight hits 0
-    inflightRev uint64          // bumped on every handle swap
+    // inflight counts in-flight queries per live handle. EVERY access —
+    // read or write — happens under the full write lock: acquires are map
+    // writes, and a write lock is required to serialize them (issue #40).
+    inflight map[*sql.DB]int
+    // drained is signalled when a handle's inflight count hits 0 so
+    // drainAndClose can wake up and retire the handle.
+    drained *sync.Cond
 
     swapGate chan struct{} // buffered(1): only one swap at a time
 
@@ -217,15 +227,22 @@ func attachDB(db *sql.DB, path string) {
 // acquireDB captures the active handle and registers the caller as in
 // flight on it. The returned release function MUST be called when the
 // query is done.
+//
+// The registration (s.inflight[h.db]++) is a MAP WRITE, so it must hold
+// the full write lock — under a read lock two concurrent readers (the
+// parallel captcha generators agent mode spawns at startup) both write
+// the map and the process dies with "fatal error: concurrent map writes"
+// (issue #40). The critical section is a pointer read + map bump, so the
+// write lock costs nothing; the query itself still runs lock-free.
 func (s *dbState) acquireDB() (dbHandle, func(), error) {
-    s.mu.RLock()
+    s.mu.Lock()
     h := s.active
     if h.db == nil {
-        s.mu.RUnlock()
+        s.mu.Unlock()
         return dbHandle{}, nil, ErrDBUnavailable
     }
     s.inflight[h.db]++
-    s.mu.RUnlock()
+    s.mu.Unlock()
 
     release := func() {
         s.mu.Lock()
@@ -255,11 +272,13 @@ func drainAndClose(s *dbState, db *sql.DB) {
 }
 
 // withTokenDB runs fn against the currently active database. The handle is
-// captured and registered as in flight under RLock, then fn runs without
-// any lock held — so a concurrent swap cannot pull the database out from
-// under it, and the query completes against the file that was active when
-// it started. This is the throttle point required by the swap notes:
-// during a swap, callers briefly wait on the mutex instead of failing.
+// captured and registered as in flight under the write lock (capture and
+// registration are one atomic step, so a concurrent swap can never retire a
+// handle between them), then fn runs without any lock held — so a swap
+// cannot pull the database out from under it, and the query completes
+// against the file that was active when it started. This is the throttle
+// point required by the swap notes: during a swap, callers briefly wait on
+// the mutex instead of failing.
 func withTokenDB(fn func(h dbHandle) error) error {
     h, release, err := globalDBState.acquireDB()
     if err != nil {
@@ -302,7 +321,8 @@ func (s *dbState) tokenCount() int64 {
     }
 
     var n int64
-    if err := withHandleForCount(s, h, &n); err != nil {
+    h, err := withHandleForCount(s, &n)
+    if err != nil {
         return -1
     }
 
@@ -314,16 +334,21 @@ func (s *dbState) tokenCount() int64 {
     return n
 }
 
-// withHandleForCount queries through the in-flight registry so a concurrent
-// swap drains (rather than closes) the handle this count is running on.
-func withHandleForCount(s *dbState, h dbHandle, out *int64) error {
-    s.mu.RLock()
-    if s.active.db == nil {
-        s.mu.RUnlock()
-        return ErrDBUnavailable
+// withHandleForCount captures the active handle, registers it in flight,
+// and runs the COUNT query on it. Capture + registration are one atomic
+// step under the write lock — a concurrent swap may retire (but never
+// close) the handle this count runs on, and the handle actually queried
+// is returned so the caller caches the count under the right path. Same
+// map-write-under-write-lock rule as acquireDB (issue #40).
+func withHandleForCount(s *dbState, out *int64) (dbHandle, error) {
+    s.mu.Lock()
+    h := s.active
+    if h.db == nil {
+        s.mu.Unlock()
+        return dbHandle{}, ErrDBUnavailable
     }
     s.inflight[h.db]++
-    s.mu.RUnlock()
+    s.mu.Unlock()
 
     defer func() {
         s.mu.Lock()
@@ -338,7 +363,7 @@ func withHandleForCount(s *dbState, h dbHandle, out *int64) error {
         s.mu.Unlock()
     }()
 
-    return h.db.QueryRow("SELECT COUNT(*) FROM tokens;").Scan(out)
+    return h, h.db.QueryRow("SELECT COUNT(*) FROM tokens;").Scan(out)
 }
 
 // invalidateTokenCount drops the cached count so the next reader queries the
