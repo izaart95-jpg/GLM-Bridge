@@ -284,3 +284,133 @@ func TestBareCallThroughSSEPipeline(t *testing.T) {
 }
 
 func itoa(n int) string { return strconv.Itoa(n) }
+
+// ── fence-awareness (security boundary: doc examples must not fire) ─────────
+
+// A declared-tool invocation written purely as a documentation example
+// inside a fenced code block must stay text, in both argument forms. Without
+// fence-awareness, atLineStart + a declared name + complete arguments is
+// indistinguishable from a real call, so a model explaining its own tool
+// syntax could trigger a real invocation.
+func TestBareCallInsideFencedDocExample(t *testing.T) {
+    cases := []string{
+        "Example:\n```text\nweb_search{\"query\":\"hello\"}\n```\n",
+        "Example:\n```text\nweb_search(query=\"test\", limit=1)\n```\n",
+    }
+    names := []string{"web_search"}
+    for _, in := range cases {
+        if calls := bareCalls(t, in, names); len(calls) != 0 {
+            t.Fatalf("fenced example fired as a call: %q -> %d calls", in, len(calls))
+        }
+        if got := TranslateBareToolCalls(in, names); got != in {
+            t.Fatalf("fenced example rewritten: %q -> %q", in, got)
+        }
+    }
+}
+
+// A fenced example must not blind the parser to a real call in the same
+// message once the fence closes — skip the fenced candidate, keep scanning.
+func TestBareCallSkipsFencedThenFindsReal(t *testing.T) {
+    in := "Example:\n```text\nweb_search(query=\"documentation\")\n```\n" +
+        "\nweb_search(query=\"real\")"
+    names := []string{"web_search"}
+    calls := bareCalls(t, in, names)
+    if len(calls) != 1 {
+        t.Fatalf("want 1 call (the one after the fence), got %d", len(calls))
+    }
+    if args := bareArgs(t, calls[0]); args["query"] != "real" {
+        t.Fatalf("wrong call fired: %#v", args)
+    }
+}
+
+// ── quoted-argument isolation (``` inside call data is not a fence) ─────────
+
+// A ``` sequence that is argument data — e.g. a heredoc payload for a real
+// shell call — must not be mistaken for a markdown fence. If it were, it
+// would flip in.bareFenceOpen and could make the genuinely real call right
+// after it register as "inside a fence" and get skipped.
+func TestBareCallBacktickInQuotedArgDoesNotToggleFence(t *testing.T) {
+    in := "bash(command=\"cat <<'EOF'\n```python\nprint('hi')\n```\nEOF\")\n" +
+        "\nweb_search(query=\"hello\")"
+    names := []string{"bash", "web_search"}
+    calls := bareCalls(t, in, names)
+    if len(calls) != 2 {
+        t.Fatalf("want 2 calls (bash and web_search), got %d: %#v", len(calls), calls)
+    }
+    if fn := calls[0]["function"].(map[string]interface{}); fn["name"] != "bash" {
+        t.Fatalf("first call = %v, want bash", fn["name"])
+    }
+    if cmd := bareArgs(t, calls[0])["command"]; !strings.Contains(cmd.(string), "```python") {
+        t.Fatalf("heredoc payload truncated: %q", cmd)
+    }
+    if fn := calls[1]["function"].(map[string]interface{}); fn["name"] != "web_search" {
+        t.Fatalf("second call = %v, want web_search — the heredoc's ``` wrongly toggled fence state", fn["name"])
+    }
+}
+
+// Mirror image: a real fence around a documentation example must still be
+// caught even when the fenced text itself looks like a call with a quoted
+// argument, so quote-awareness cannot be used to suppress fence detection
+// generally.
+func TestBareCallRealFenceStillCaughtNearQuotedExample(t *testing.T) {
+    in := "```text\nbash(command=\"echo hello\")\n```\n" +
+        "\nweb_search(query=\"hello\")"
+    names := []string{"bash", "web_search"}
+    calls := bareCalls(t, in, names)
+    if len(calls) != 1 {
+        t.Fatalf("want 1 call (web_search only), got %d: %#v", len(calls), calls)
+    }
+    if calls[0]["function"].(map[string]interface{})["name"] != "web_search" {
+        t.Fatalf("fenced bash example fired as a call")
+    }
+}
+
+// ── fence state across a mid-stream rearm (issue #23 interaction) ───────────
+
+// A ``` fence opened before an upstream deep edit_content rewind must still
+// be open after rearmAgentInterceptor rebuilds the interceptor, or a
+// documentation example split across the rewind boundary fires as a real
+// call. This is the scenario that made the bug hard to pin down in the
+// field (a long capture full of edit_content events): the fence check alone
+// is not sufficient without this.
+func TestBareCallFenceStatePreservedAcrossRearm(t *testing.T) {
+    withAgentVariant(t, "modern")
+
+    names := []string{"bash"}
+    live := newAgentInterceptor(names)
+
+    // Open a fence and pad well past the streaming hold-back window so the
+    // fence line itself is safely committed, not sitting in the tail this
+    // Feed call keeps buffered for the next one.
+    content1, calls1 := live.feed(
+        "Here is the syntax:\n```\n" +
+            strings.Repeat("padding so the fence line clears the hold-back window. ", 3) + "\n")
+    if len(calls1) != 0 {
+        t.Fatalf("part 1 produced %d calls before any rewind", len(calls1))
+    }
+
+    // Simulate the upstream deep rewind (issue #23): the caller detects
+    // FullText no longer extends what was already forwarded and swaps in a
+    // fresh interceptor.
+    live = rearmAgentInterceptor(live)
+
+    // The model restates the example after the rewind, still inside the
+    // fence opened in part 1. If bareFenceOpen was lost on rearm, this
+    // reads as a real, complete call and fires — with a destructive
+    // argument, so a false fire here is not a subtle test failure.
+    content2, calls2 := live.feed("bash(command=\"rm -rf /\")\n```\n")
+    if len(calls2) != 0 {
+        t.Fatalf("documentation example fired as a call after rearm: %d calls (content so far: %q)",
+            len(calls2), content1+content2)
+    }
+
+    // Once the fence actually closes and a real, unfenced call follows, it
+    // must still be recognised — the fix must not simply wedge fenceOpen at
+    // true forever.
+    content3, calls3 := live.feed("\nbash(command=\"ls\")")
+    finalContent, finalCalls := live.finish()
+    if len(calls3)+len(finalCalls) != 1 {
+        t.Fatalf("want exactly 1 real call after the fence closed, got %d+%d (content so far: %q)",
+            len(calls3), len(finalCalls), content1+content2+content3+finalContent)
+    }
+}
