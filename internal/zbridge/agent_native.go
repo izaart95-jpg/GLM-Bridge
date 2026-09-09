@@ -529,7 +529,7 @@ func (in *AgentStreamInterceptor) drainNativeBlock(rest string, canonicalStart i
                 return false, false
             }
             if nStart > 0 {
-                *content = append(*content, rest[:nStart])
+                in.commitContent(rest[:nStart], content)
             }
             *toolCalls = append(*toolCalls, ParseAgentToolCalls(rest[nStart:])...)
             in.offset += len(rest)
@@ -539,14 +539,14 @@ func (in *AgentStreamInterceptor) drainNativeBlock(rest string, canonicalStart i
         // Emit what precedes the block and hold the rest until it closes, so
         // half a block never reaches the client as text.
         if nStart > 0 {
-            *content = append(*content, rest[:nStart])
+            in.commitContent(rest[:nStart], content)
             in.offset += nStart
         }
         return true, false
     }
     blockEnd := nStart + endIdx + len(nativeToolClose)
     if nStart > 0 {
-        *content = append(*content, rest[:nStart])
+        in.commitContent(rest[:nStart], content)
     }
     *toolCalls = append(*toolCalls, ParseAgentToolCalls(rest[nStart:blockEnd])...)
     in.offset += blockEnd
